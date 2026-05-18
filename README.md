@@ -74,10 +74,15 @@ cd bridge
 pnpm start
 ```
 
+<p align="center">
+  <img src="scripts/demo/bridge.gif" alt="Bridge startup: pnpm start prints a QR code with the connection URL and token" />
+</p>
+
 That's it. The bridge:
 
 - Raises its own file-descriptor limit.
 - Auto-detects your Tailscale device-owner email and restricts access to you.
+- Requests a Let's Encrypt cert for your `.ts.net` hostname so the phone can connect over real HTTPS.
 - Detects whether `tailscale serve` is running and prints a QR code with the right URL.
 
 For TLS + zero-token setup, run this once on the same machine (persists across reboots):
