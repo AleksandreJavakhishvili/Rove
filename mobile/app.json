@@ -13,7 +13,10 @@
       "bundleIdentifier": "dev.rove.mobile",
       "appleTeamId": "F79CTCG466",
       "infoPlist": {
-        "NSLocalNetworkUsageDescription": "Rove connects to your local bridge running on your desktop over Tailscale."
+        "NSLocalNetworkUsageDescription": "Rove connects to your local bridge running on your desktop over Tailscale.",
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoadsInWebContent": true
+        }
       }
     },
     "android": {

@@ -43,8 +43,8 @@ export default function SettingsScreen() {
       if (!health.ok) throw new Error('bridge returned not-ok');
       await settings.setBaseUrl(rawUrl);
       await settings.setToken(rawToken);
-      // Best-effort: register for push so the bridge can wake us on turn completion.
-      // Failure (sim, denied perms, no project id) is silent — connection still works.
+      // Best-effort push registration. Currently stubbed (no-op) until we
+      // re-enable expo-notifications with a paid Apple Developer account.
       void registerWithBridge({ baseUrl: rawUrl, token: rawToken });
       Alert.alert('Connected', `Authenticated as ${health.user ?? 'unknown'}`);
       router.back();
