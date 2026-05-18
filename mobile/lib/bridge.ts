@@ -1,4 +1,11 @@
-import type { AgentKind, ClientToServer, HistoryEntry, ServerToClient, SessionListItem } from './types';
+import type {
+  AgentKind,
+  ClientToServer,
+  HistoryEntry,
+  PreviewResponse,
+  ServerToClient,
+  SessionListItem,
+} from './types';
 
 interface BridgeConfig {
   baseUrl: string;
@@ -114,6 +121,20 @@ export interface SessionDiff {
   cwd: string;
   baseline: string | null;
   files: DiffFile[];
+}
+
+export async function fetchPreview(
+  cfg: BridgeConfig,
+  agent: AgentKind,
+  id: string,
+): Promise<PreviewResponse> {
+  const res = await fetchWithTimeout(
+    `${cfg.baseUrl}/sessions/${encodeURIComponent(agent)}/${id}/preview`,
+    { headers: authHeaders(cfg) },
+    5000,
+  );
+  if (!res.ok) throw new Error(`/preview → ${res.status}`);
+  return res.json();
 }
 
 export async function fetchDiff(

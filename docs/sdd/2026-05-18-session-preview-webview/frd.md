@@ -23,6 +23,7 @@ Today, when a user is iterating on a UI from their phone, they can drive the age
 5. **Swipe to access.** As a user, I should reach the preview pane by swiping right from the chat (without fighting the iOS back-swipe gesture).
 6. **State preservation.** As a user, swiping between chat and preview should preserve the WebView's loaded page so HMR state survives.
 7. **Disappearance handling.** As a user, when the dev server stops, I should see a "server stopped" state, not a frozen WebView.
+8. **Custom names.** As a user, when the auto-detected label is unhelpful (e.g., three generic `node` entries for custom-built servers), I should be able to rename each candidate to something meaningful — "Admin FE", "Storefront", "API" — and have that name persist for this session across app restarts.
 
 ## Functional requirements
 
@@ -36,6 +37,7 @@ Today, when a user is iterating on a UI from their phone, they can drive the age
 | F6 | Chat and preview panes stay mounted simultaneously; swiping between them does not unmount the WebView. |
 | F7 | When zero candidates are detected, the preview pane shows an empty state with a framework-aware hint when possible. |
 | F8 | Framework heuristic identifies common dev servers from the process command line: Vite, Next.js, Astro, generic Node. |
+| F9 | Mobile lets the user assign a custom label per `(session, port)` pair. Custom labels override auto-detected labels in the picker. Labels persist across app restarts. |
 
 ## Non-goals (v1)
 

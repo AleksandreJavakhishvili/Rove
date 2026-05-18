@@ -7,6 +7,8 @@
  *
  * Spawned by claude itself (not by the bridge directly) via --mcp-config.
  */
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -18,6 +20,54 @@ const BRIDGE_URL = process.env.BRIDGE_INTERNAL_URL;
 const TOKEN = process.env.BRIDGE_INTERNAL_TOKEN;
 const AGENT = process.env.ROVE_SESSION_AGENT ?? 'claude-code';
 const SESSION_ID = process.env.ROVE_SESSION_ID ?? '';
+
+/**
+ * Call the bridge over loopback. We use node:http / node:https directly rather
+ * than global fetch because:
+ *  - The bridge's TLS cert is bound to its .ts.net hostname, not 127.0.0.1, so
+ *    we need `rejectUnauthorized: false` for the loopback HTTPS connection.
+ *  - Node's global fetch (undici) does NOT honor NODE_TLS_REJECT_UNAUTHORIZED;
+ *    only an undici Agent's connect.rejectUnauthorized does. Going through
+ *    node:https is simpler than wiring up an undici dispatcher.
+ *
+ * Loopback + one-time internal token make the disabled hostname check safe:
+ * the only thing reaching this endpoint is our own process on this machine.
+ */
+async function postToBridge(
+  url: string,
+  body: unknown,
+  headers: Record<string, string>,
+): Promise<{ ok: boolean; status: number; body: string }> {
+  const u = new URL(url);
+  const isHttps = u.protocol === 'https:';
+  const req = isHttps ? httpsRequest : httpRequest;
+  const payload = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const r = req(
+      {
+        hostname: u.hostname,
+        port: u.port || (isHttps ? 443 : 80),
+        path: u.pathname + u.search,
+        method: 'POST',
+        rejectUnauthorized: false,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(payload).toString(),
+          ...headers,
+        },
+      },
+      (res) => {
+        let buf = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => (buf += chunk));
+        res.on('end', () => resolve({ ok: (res.statusCode ?? 500) < 400, status: res.statusCode ?? 0, body: buf }));
+      },
+    );
+    r.on('error', reject);
+    r.write(payload);
+    r.end();
+  });
+}
 
 if (!BRIDGE_URL || !TOKEN || !SESSION_ID) {
   console.error('[mcp permission-server] missing BRIDGE_INTERNAL_URL / BRIDGE_INTERNAL_TOKEN / ROVE_SESSION_ID');
@@ -57,34 +107,30 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     tool_use_id?: string;
   };
   try {
-    const res = await fetch(`${BRIDGE_URL}/internal/permission`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-bridge-internal-token': TOKEN!,
-      },
-      body: JSON.stringify({
+    const res = await postToBridge(
+      `${BRIDGE_URL}/internal/permission`,
+      {
         agent: AGENT,
         sessionId: SESSION_ID,
         toolUseId: args.tool_use_id ?? '',
         tool: args.tool_name,
         input: args.input ?? {},
-      }),
-    });
+      },
+      { 'x-bridge-internal-token': TOKEN! },
+    );
     if (!res.ok) {
-      const body = await res.text();
       // Claude expects a JSON string in the content. Returning a deny payload
       // signals refusal without crashing the session.
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ behavior: 'deny', message: `bridge ${res.status}: ${body.slice(0, 200)}` }),
+            text: JSON.stringify({ behavior: 'deny', message: `bridge ${res.status}: ${res.body.slice(0, 200)}` }),
           },
         ],
       };
     }
-    const decision = await res.json();
+    const decision = JSON.parse(res.body);
     return { content: [{ type: 'text', text: JSON.stringify(decision) }] };
   } catch (err) {
     return {

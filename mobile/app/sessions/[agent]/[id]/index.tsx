@@ -1,5 +1,7 @@
 import { ApprovalSheet, type PendingApproval } from '@/components/chat/ApprovalSheet';
+import { ChatPreviewPager } from '@/components/chat/ChatPreviewPager';
 import { Markdown } from '@/components/chat/Markdown';
+import { PreviewPane } from '@/components/chat/PreviewPane';
 import { ToolResultCard, ToolUseCard } from '@/components/chat/ToolCard';
 import {
   fetchHistory,
@@ -190,6 +192,11 @@ export default function ChatScreen() {
   const listRef = useRef<FlatList<ChatItem>>(null);
   const sending = pendingTurns > 0;
   const stickToBottomRef = useRef(true);
+  // Only believe onScroll's "user moved up" verdict after the user has actually
+  // touched the list. Otherwise the initial layout pass (scroll at top while
+  // content is much taller than the viewport) gets misread as a manual scroll
+  // and disables auto-stick before the first message ever renders.
+  const userScrolledRef = useRef(false);
 
   const sendRef = useRef<((m: any) => void) | null>(null);
   const replayDoneRef = useRef(false);
@@ -346,6 +353,15 @@ export default function ChatScreen() {
                 hasMore: historyCount >= 50,
               });
               replayDoneRef.current = true;
+              // After all history rows have been appended, force scroll to the
+              // latest message. Retry a few times: the first call lands before
+              // layout has settled the new content height; the later ones catch
+              // the final stable height. cheap, and only runs once per open.
+              stickToBottomRef.current = true;
+              listRef.current?.scrollToEnd({ animated: false });
+              requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: false }));
+              setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 60);
+              setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 200);
               break;
             case 'status':
               setStatus(msg.status);
@@ -401,15 +417,23 @@ export default function ChatScreen() {
           if (ev.role === 'user') return;
           if (liveAssistantBuffer) {
             const buf = liveAssistantBuffer;
+            // If the finalized text is empty, keep what deltas already produced
+            // and just mark the bubble non-live. Otherwise replace with the
+            // canonical final text.
+            const finalText = ev.text.trim() ? ev.text : buf.text;
             setItems((prev) =>
               prev.map((it) =>
                 it.id === buf.id && it.kind === 'assistant'
-                  ? { ...it, text: ev.text, live: false, parentToolUseId: ev.parentToolUseId }
+                  ? { ...it, text: finalText, live: false, parentToolUseId: ev.parentToolUseId }
                   : it,
               ),
             );
             liveAssistantBuffer = null;
           } else {
+            // Drop empty assistant text blocks (e.g. turns that are just a
+            // tool_use); rendering them creates a blank bubble. Replay path
+            // already filters these the same way.
+            if (!ev.text.trim()) return;
             const newId = `live-a-${ev.messageId ?? Date.now()}-${Math.random()}`;
             setItems((prev) => [
               ...prev,
@@ -433,6 +457,8 @@ export default function ChatScreen() {
               ),
             );
           } else {
+            // Avoid seeding a buffer (and bubble) from an empty leading delta.
+            if (!ev.delta) return;
             const newId = `live-d-${Date.now()}-${Math.random()}`;
             liveAssistantBuffer = { id: newId, text: ev.delta };
             setItems((prev) => [
@@ -698,7 +724,7 @@ export default function ChatScreen() {
     );
   }
 
-  return (
+  const chatBody = (
     <KeyboardAvoidingView
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={headerHeight}
@@ -830,7 +856,11 @@ export default function ChatScreen() {
             </View>
           ) : null
         }
+        onScrollBeginDrag={() => {
+          userScrolledRef.current = true;
+        }}
         onScroll={(e) => {
+          if (!userScrolledRef.current) return;
           const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
           const fromBottom = contentSize.height - contentOffset.y - layoutMeasurement.height;
           stickToBottomRef.current = fromBottom < 80;
@@ -937,6 +967,13 @@ export default function ChatScreen() {
       </View>
       <ApprovalSheet approval={approval} onDecision={onApprovalDecision} />
     </KeyboardAvoidingView>
+  );
+
+  return (
+    <ChatPreviewPager
+      chat={chatBody}
+      preview={(active) => <PreviewPane agent={agent} id={id} active={active} />}
+    />
   );
 }
 
