@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 540 160" fill="none" role="img" aria-label="Rove">
+  <title>Rove</title>
+  <!-- Mark on the left -->
+  <g transform="translate(20, 30)">
+    <path d="M 22 80 Q 60 24, 98 80" stroke="currentColor" stroke-width="9" stroke-linecap="round" fill="none"/>
+    <circle cx="22" cy="80" r="13" fill="currentColor"/>
+    <circle cx="98" cy="80" r="13" fill="currentColor"/>
+  </g>
+  <!-- Wordmark — kept as text so it inherits the host's font; SVG <text> rendering varies a bit by viewer, but reads cleanly in GitHub and most browsers. -->
+  <text x="160" y="108" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', system-ui, sans-serif" font-size="96" font-weight="700" letter-spacing="-2" fill="currentColor">rove</text>
+</svg>

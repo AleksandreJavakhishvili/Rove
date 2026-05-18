@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Rove app icon">
+  <title>Rove</title>
+  <!-- Solid rounded-square background. -->
+  <rect width="1024" height="1024" rx="224" ry="224" fill="#0a7ea4"/>
+  <!-- Connection arc + two nodes, scaled for app-icon proportions. -->
+  <path d="M 240 640 Q 512 280, 784 640" stroke="#ffffff" stroke-width="56" stroke-linecap="round" fill="none"/>
+  <circle cx="240" cy="640" r="92" fill="#ffffff"/>
+  <circle cx="784" cy="640" r="92" fill="#ffffff"/>
+</svg>

@@ -1,0 +1,41 @@
+{
+  "name": "rove-bridge",
+  "version": "0.1.0",
+  "description": "Rove — control your local coding agents from your phone over Tailscale. Bridge daemon that runs alongside the agent CLI on your desktop.",
+  "keywords": ["claude", "claude-code", "tailscale", "mobile", "agent", "rove"],
+  "author": "Ako Javakhishvili",
+  "license": "MIT",
+  "homepage": "https://github.com/<your-handle>/rove",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/<your-handle>/rove.git",
+    "directory": "bridge"
+  },
+  "type": "module",
+  "bin": {
+    "rove-bridge": "./bin/rove-bridge.mjs"
+  },
+  "scripts": {
+    "dev": "ulimit -n 8192 && tsx watch src/server.ts",
+    "start": "ulimit -n 8192 && tsx src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "@hono/node-ws": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "chokidar": "^4.0.0",
+    "hono": "^4.6.0",
+    "qrcode-terminal": "^0.12.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "packageManager": "pnpm@10.33.2+sha256.7a7bcf13d7f6ceb3946c03978373d99be9fde1cafc3000bdfed4c4f791167610"
+}

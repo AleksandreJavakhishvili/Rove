@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Rove foreground">
+  <title>Rove</title>
+  <!--
+    Android adaptive-icon foreground. Transparent background. Arc + nodes are
+    drawn into the safe zone (center 66%) so they survive the system's crop.
+  -->
+  <path d="M 320 600 Q 512 360, 704 600" stroke="#ffffff" stroke-width="56" stroke-linecap="round" fill="none"/>
+  <circle cx="320" cy="600" r="80" fill="#ffffff"/>
+  <circle cx="704" cy="600" r="80" fill="#ffffff"/>
+</svg>
