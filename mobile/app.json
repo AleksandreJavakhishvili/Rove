@@ -55,13 +55,6 @@
         {
           "cameraPermission": "Allow Rove to scan the bridge connection QR code."
         }
-      ],
-      [
-        "expo-notifications",
-        {
-          "icon": "./assets/images/android-icon-monochrome.png",
-          "color": "#0a7ea4"
-        }
       ]
     ],
     "experiments": {
