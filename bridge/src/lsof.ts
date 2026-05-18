@@ -92,7 +92,7 @@ export async function inspectPid(pid: number): Promise<ProcessInfo | null> {
   }
 }
 
-async function getProcessCwd(pid: number): Promise<string | null> {
+export async function getProcessCwd(pid: number): Promise<string | null> {
   if (process.platform === 'darwin') {
     try {
       const { stdout } = await execP(`/usr/sbin/lsof -a -d cwd -p ${pid} -Fn`, { timeout: 1000 });

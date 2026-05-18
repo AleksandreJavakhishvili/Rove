@@ -76,7 +76,7 @@ Wires together: session lookup → `scanDevServers` → JSON response. Returns 4
 - `mobile/components/chat/PreviewPane.tsx` (new): polling, picker, WebView, empty/warning states.
 - `mobile/lib/bridge.ts`: add `getPreviewCandidates(agent, id)`.
 - `mobile/lib/types.ts`: mirror `DevServerCandidate`.
-- `mobile/lib/store.ts`: persist `selectedPreviewPort: Record<sessionId, number>`.
+- `mobile/lib/store.ts`: persist `selectedPreviewPort: Record<sessionId, number>` and `previewLabels: Record<sessionId, Record<port, string>>`.
 
 ### New dependency
 
@@ -121,6 +121,18 @@ Sequential pattern-matching on command line, first match wins:
 | (anything else) | `null` |
 
 The framework label is cosmetic — discovery doesn't depend on it. If we mislabel, the candidate still works, just looks generic.
+
+### Custom labels (mobile-only)
+
+The bridge always returns the auto-detected `framework` label. On top of that, the mobile app maintains a per-session map of user-assigned names:
+
+```ts
+previewLabels: Record<sessionId, Record<port, string>>
+```
+
+The picker renders each entry as: `customLabel || frameworkLabel || "Port ${port}"`. Labels are stored on the phone only — the bridge has no knowledge of them. This keeps the bridge stateless and matches the rest of the mobile-side persistence model.
+
+Trade-off: when a dev server's port shifts (e.g., Vite bumps `5173` → `5174` because the original port is taken), the custom label doesn't follow. This is accepted; port shifts are rare and renaming is cheap.
 
 ## Reachability
 

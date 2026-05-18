@@ -10,6 +10,7 @@ import { authMiddleware } from './auth.ts';
 import { config, runtimeState } from './config.ts';
 import { getDriver, listAgents, listAllSessions } from './agents/registry.ts';
 import { devices } from './devices.ts';
+import { scanDevServers } from './devServers.ts';
 import { readScopedFile, relToCwd } from './files.ts';
 import { getDiff } from './git.ts';
 import { inspectPid } from './lsof.ts';
@@ -358,6 +359,26 @@ app.get('/sessions/:agent/:id/file', async (c) => {
   } catch (err) {
     return c.json({ error: (err as Error).message }, 400);
   }
+});
+
+// Auto-detected dev servers running inside this session's cwd. The mobile app
+// polls this while the chat is open to render a per-session preview pane.
+//
+// Hostname strategy: use whatever the phone used to reach us. This lets the
+// WebView open `http://<same-host>:<dev-port>` without us having to know
+// whether the phone is on the tailnet, the LAN, or talking through
+// `tailscale serve`.
+app.get('/sessions/:agent/:id/preview', async (c) => {
+  const agent = c.req.param('agent') as AgentKind;
+  const id = c.req.param('id') ?? '';
+  const driver = getDriver(agent);
+  if (!driver) return c.json({ error: 'unknown agent' }, 404);
+  const located = await driver.findSession(id);
+  if (!located) return c.json({ error: 'session not found' }, 404);
+  const reqUrl = new URL(c.req.url);
+  const hostname = reqUrl.hostname;
+  const candidates = await scanDevServers({ sessionCwd: located.cwd, hostname });
+  return c.json({ hostname, candidates });
 });
 
 app.get('/sessions/:agent/:id/diff', async (c) => {

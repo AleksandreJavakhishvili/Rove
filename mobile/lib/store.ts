@@ -62,3 +62,86 @@ export function useHydratedSettings(): SettingsStore {
   }, [store]);
   return store;
 }
+
+// ─── Preview prefs (per-session selected port + custom labels) ─────────────
+
+interface PreviewPrefsState {
+  hydrated: boolean;
+  /** sessionId → port */
+  selectedPort: Record<string, number>;
+  /** sessionId → port → custom label */
+  customLabels: Record<string, Record<number, string>>;
+}
+
+interface PreviewPrefsActions {
+  load(): Promise<void>;
+  setSelectedPort(sessionId: string, port: number): Promise<void>;
+  setLabel(sessionId: string, port: number, label: string): Promise<void>;
+  clearLabel(sessionId: string, port: number): Promise<void>;
+}
+
+type PreviewPrefsStore = PreviewPrefsState & PreviewPrefsActions;
+
+const PREVIEW_PREFS_KEY = 'rove:preview-prefs:v1';
+
+async function persistPreview(state: Pick<PreviewPrefsState, 'selectedPort' | 'customLabels'>): Promise<void> {
+  await KV.setItemAsync(
+    PREVIEW_PREFS_KEY,
+    JSON.stringify({ selectedPort: state.selectedPort, customLabels: state.customLabels }),
+  );
+}
+
+export const usePreviewPrefs = create<PreviewPrefsStore>((set, get) => ({
+  hydrated: false,
+  selectedPort: {},
+  customLabels: {},
+  async load() {
+    try {
+      const raw = await KV.getItemAsync(PREVIEW_PREFS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        set({
+          selectedPort: parsed.selectedPort ?? {},
+          customLabels: parsed.customLabels ?? {},
+          hydrated: true,
+        });
+        return;
+      }
+    } catch (err) {
+      console.warn('preview prefs load failed', err);
+    }
+    set({ hydrated: true });
+  },
+  async setSelectedPort(sessionId, port) {
+    const selectedPort = { ...get().selectedPort, [sessionId]: port };
+    set({ selectedPort });
+    await persistPreview({ selectedPort, customLabels: get().customLabels });
+  },
+  async setLabel(sessionId, port, label) {
+    const trimmed = label.trim().slice(0, 60);
+    if (!trimmed) return get().clearLabel(sessionId, port);
+    const per = { ...(get().customLabels[sessionId] ?? {}), [port]: trimmed };
+    const customLabels = { ...get().customLabels, [sessionId]: per };
+    set({ customLabels });
+    await persistPreview({ selectedPort: get().selectedPort, customLabels });
+  },
+  async clearLabel(sessionId, port) {
+    const existing = get().customLabels[sessionId];
+    if (!existing || !(port in existing)) return;
+    const per = { ...existing };
+    delete per[port];
+    const customLabels = { ...get().customLabels };
+    if (Object.keys(per).length === 0) delete customLabels[sessionId];
+    else customLabels[sessionId] = per;
+    set({ customLabels });
+    await persistPreview({ selectedPort: get().selectedPort, customLabels });
+  },
+}));
+
+export function useHydratedPreviewPrefs(): PreviewPrefsStore {
+  const store = usePreviewPrefs();
+  useEffect(() => {
+    if (!store.hydrated) void store.load();
+  }, [store]);
+  return store;
+}

@@ -92,3 +92,19 @@ export interface ClientToServer {
   toolUseId?: string;
   decision?: 'allow' | 'allow_always' | 'deny';
 }
+
+export interface DevServerCandidate {
+  port: number;
+  pid: number;
+  bindAddress: string;
+  framework: string | null;
+  command: string;
+  reachable: boolean;
+  url: string | null;
+  note?: string;
+}
+
+export interface PreviewResponse {
+  hostname: string;
+  candidates: DevServerCandidate[];
+}
