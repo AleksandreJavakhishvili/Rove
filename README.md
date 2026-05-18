@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="assets/logo/wordmark.svg" alt="rove" height="80" />
+  <strong>Control your local coding agents from your phone, over your own Tailscale.</strong><br/>
+  No central server. No cloud relay. Your code never leaves your machine.
 </p>
 
 <p align="center">
-  <strong>Control your local coding agents from your phone, over your own Tailscale.</strong><br/>
-  No central server. No cloud relay. Your code never leaves your machine.
+  <img src="assets/logo/wordmark.svg" alt="Rove" height="180" />
 </p>
 
 ---
