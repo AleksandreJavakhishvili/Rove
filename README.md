@@ -12,7 +12,7 @@
 `rove` is two things:
 
 1. A **bridge** — a tiny Node.js server you run on your desktop next to `claude` (or, soon, other CLI agents). It talks to the agent through its headless mode and exposes the session over a private network as HTTP + WebSocket.
-2. A **mobile app** (Expo / React Native) that connects to the bridge from your phone, lets you read history, send prompts, watch tool calls execute on your machine, approve risky operations, and review file diffs — all over Tailscale, end-to-end-tunnelled through WireGuard.
+2. A **mobile app** (Expo / React Native) that connects to the bridge from your phone, lets you read history, send prompts, watch tool calls execute on your machine, approve risky operations, review file diffs, and **preview the dev server your agent is editing — live, in the same screen** — all over Tailscale, end-to-end-tunnelled through WireGuard.
 
 The whole architecture is peer-to-peer between your devices. No third-party server holds your session, your API key, or your code.
 
@@ -144,6 +144,16 @@ ALLOWED_USERS=you@example.com,friend@example.com pnpm start
 ```
 
 Each friend joins your tailnet (you invite them via the Tailscale admin UI) and installs the mobile app on their phone. Their Tailscale identity is validated against `ALLOWED_USERS` on every request.
+
+## Live preview
+
+Swipe left from the chat in any session to see a WebView of the dev server running for that project — no configuration. The bridge scans listening TCP ports on your desktop and matches any process whose working directory sits inside the session's cwd. Vite, Next.js, Astro, webpack, Parcel, Bun and plain `node` servers are auto-labeled; multiple candidates (e.g. backend + frontend in a monorepo) appear in a picker. Rename any entry to whatever's meaningful ("Admin FE", "Storefront API", …) — labels persist per session.
+
+Caveats:
+
+- The dev server must bind to `0.0.0.0` (or `::`), not `127.0.0.1`. If it's localhost-only the pane shows a framework-specific hint instead of a broken WebView (`vite --host`, `next dev -H 0.0.0.0`, etc.).
+- The bridge sees what your user can see — don't run dev servers under `sudo`, they'll be invisible to `lsof`. Port 3000 etc. never needs root.
+- Requires `react-native-webview`, a native module — use a dev build (`npx expo run:ios` / `run:android`) or an EAS build. Expo Go can't load it.
 
 ## Adding a new agent
 
