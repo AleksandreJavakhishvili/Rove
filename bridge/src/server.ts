@@ -11,7 +11,9 @@ import { config, runtimeState } from './config.ts';
 import { getDriver, listAgents, listAllSessions } from './agents/registry.ts';
 import { devices } from './devices.ts';
 import { scanDevServers } from './devServers.ts';
+import { entryFromRaw } from './agents/claudeCode.ts';
 import { readScopedFile, relToCwd } from './files.ts';
+import { JsonlTail } from './jsonlTail.ts';
 import { getDiff } from './git.ts';
 import { inspectPid } from './lsof.ts';
 import { permissions } from './permissions.ts';
@@ -423,6 +425,7 @@ app.get(
     let watcherEmitter: ReturnType<typeof watchers.acquire> | null = null;
     let onWatcherChange: ((info: FileChange) => void) | null = null;
     let watchedCwd: string | null = null;
+    let jsonlTail: JsonlTail | null = null;
 
     const attach = async (ws: WSContext) => {
       session = await runtime.getOrCreate(agent, id);
@@ -432,6 +435,13 @@ app.get(
       onEvent = (e: AgentEvent) => {
         eventCount += 1;
         if (eventCount <= 30) console.log(`[bridge ws] → event #${eventCount} type=${e.type}`);
+        // If the bridge is producing events, the desktop isn't writing — stop
+        // any JSONL tail to avoid duplicate rendering.
+        if (jsonlTail) {
+          jsonlTail.stop();
+          jsonlTail = null;
+          console.log(`[bridge] jsonl-tail stopped (bridge took over)`);
+        }
         send(ws, { type: 'event', event: e });
       };
       onExit = (info) => send(ws, { type: 'process_exit', code: info.code, signal: info.signal });
@@ -462,6 +472,39 @@ app.get(
           for (const entry of entries) send(ws, { type: 'history_entry', entry });
           send(ws, { type: 'history_replay_end' });
           await attach(ws);
+
+          // If the desktop owns the session right now, tail its JSONL so the
+          // phone sees the desktop user's new turns in real time. Stops as soon
+          // as the bridge spawns its own claude (see onEvent) or the socket
+          // closes. Only meaningful for claude-code (the other drivers don't
+          // have a JSONL on disk yet).
+          if (agent === 'claude-code' && !session?.alive) {
+            const foreign = await runtime.checkDesktopConflict(agent, id);
+            const located = await driver.findSession(id);
+            if (foreign && foreign.length > 0 && located?.path) {
+              console.log(
+                `[bridge] starting jsonl-tail for ${id.slice(0, 8)} (desktop pids: ${foreign.join(',')})`,
+              );
+              jsonlTail = new JsonlTail({
+                path: located.path,
+                onLine: (line) => {
+                  let obj: unknown;
+                  try {
+                    obj = JSON.parse(line);
+                  } catch {
+                    return;
+                  }
+                  const parsed = entryFromRaw(obj);
+                  if (!parsed) return;
+                  for (const entry of parsed) {
+                    send(ws, { type: 'history_entry', entry });
+                  }
+                },
+                onError: (err) => console.log(`[bridge] jsonl-tail error: ${err.message}`),
+              });
+              await jsonlTail.start();
+            }
+          }
         } catch (err) {
           send(ws, { type: 'error', message: (err as Error).message });
           ws.close(1011, 'init failed');
@@ -531,6 +574,10 @@ app.get(
         }
         if (watchedCwd) {
           watchers.release(watchedCwd);
+        }
+        if (jsonlTail) {
+          jsonlTail.stop();
+          jsonlTail = null;
         }
       },
       onError: (err) => {

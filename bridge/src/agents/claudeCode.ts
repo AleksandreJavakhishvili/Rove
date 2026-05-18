@@ -61,7 +61,7 @@ function decodeProjectDir(encoded: string): string {
   return encoded.replaceAll('-', '/');
 }
 
-function entryFromRaw(obj: any): HistoryEntry[] | null {
+export function entryFromRaw(obj: any): HistoryEntry[] | null {
   const ts = obj.timestamp ?? new Date(0).toISOString();
   const uuid = obj.uuid ?? `${ts}-${Math.random()}`;
   const parentUuid = obj.parentUuid ?? null;
