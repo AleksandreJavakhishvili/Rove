@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config, runtimeState } from './config.ts';
 
@@ -32,6 +33,70 @@ interface Pending {
   timer: NodeJS.Timeout;
   /** Original tool input — echoed back as `updatedInput` when the user allows. */
   input: unknown;
+  /** Tool name + session cwd — captured so an `allow_always` decision can persist
+   *  a rule to that session's `.claude/settings.local.json`. */
+  tool: string;
+  cwd: string | null;
+}
+
+/**
+ * Derive a `.claude/settings.local.json` permission rule from a tool invocation.
+ * Mirrors Claude Code's own conventions (Bash(cmd), Read(path/**), WebFetch(domain:host),
+ * mcp__<server>__<tool>, bare tool name as fallback) so rules saved by us are
+ * indistinguishable from rules Claude writes itself.
+ */
+function deriveAllowRule(tool: string, input: unknown): string {
+  const obj = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
+  if (tool === 'Bash') {
+    const command = typeof obj.command === 'string' ? obj.command.trim() : '';
+    if (!command) return 'Bash';
+    return `Bash(${command})`;
+  }
+  if (tool === 'Read' || tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
+    const path = typeof obj.file_path === 'string' ? obj.file_path : '';
+    if (!path) return tool;
+    // Glob the file's directory rather than the file alone — covers neighboring
+    // files the user will plausibly also touch, matching how Claude broadens
+    // path rules in its own UI.
+    const dir = path.replace(/[^/]*$/, '');
+    return `${tool}(${dir}**)`;
+  }
+  if (tool === 'WebFetch') {
+    const url = typeof obj.url === 'string' ? obj.url : '';
+    try {
+      const host = new URL(url).host;
+      if (host) return `WebFetch(domain:${host})`;
+    } catch {
+      // fall through to bare tool name
+    }
+    return 'WebFetch';
+  }
+  // WebSearch, Glob, Grep, TodoWrite, Task, mcp__* — bare tool name matches.
+  return tool;
+}
+
+async function appendAllowRule(cwd: string, rule: string): Promise<void> {
+  const dir = join(cwd, '.claude');
+  const file = join(dir, 'settings.local.json');
+  await mkdir(dir, { recursive: true });
+  let data: { permissions?: { allow?: unknown; deny?: unknown; ask?: unknown } } = {};
+  try {
+    const text = await readFile(file, 'utf8');
+    data = JSON.parse(text);
+  } catch (err: unknown) {
+    // File missing → start fresh. Malformed JSON → log and start fresh (don't
+    // silently overwrite — surface it).
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.error(`[permissions] settings.local.json unreadable at ${file}:`, err);
+    }
+  }
+  const perms = (data.permissions ??= {});
+  const allow = Array.isArray(perms.allow) ? (perms.allow as string[]) : [];
+  if (!allow.includes(rule)) allow.push(rule);
+  perms.allow = allow;
+  if (!Array.isArray(perms.deny)) perms.deny = [];
+  if (!Array.isArray(perms.ask)) perms.ask = [];
+  await writeFile(file, JSON.stringify(data, null, 2) + '\n', 'utf8');
 }
 
 class PermissionRegistry {
@@ -55,14 +120,20 @@ class PermissionRegistry {
    * Called from the bridge's /internal/permission endpoint when the MCP server
    * forwards a request. Returns a promise that resolves when the phone responds.
    */
-  await(agent: string, sessionId: string, req: PermissionRequest, timeoutMs = 120_000): Promise<PermissionResponse> {
+  await(
+    agent: string,
+    sessionId: string,
+    req: PermissionRequest,
+    cwd: string | null,
+    timeoutMs = 120_000,
+  ): Promise<PermissionResponse> {
     return new Promise<PermissionResponse>((resolve, reject) => {
       const k = this.key(agent, sessionId, req.toolUseId);
       const timer = setTimeout(() => {
         this.pendingByKey.delete(k);
         reject(new Error(`permission_prompt timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pendingByKey.set(k, { resolve, reject, timer, input: req.input });
+      this.pendingByKey.set(k, { resolve, reject, timer, input: req.input, tool: req.tool, cwd });
     });
   }
 
@@ -83,6 +154,15 @@ class PermissionRegistry {
           ? (pending.input as Record<string, unknown>)
           : {};
       pending.resolve({ behavior: 'allow', updatedInput });
+      if (decision === 'allow_always' && pending.cwd) {
+        // Fire-and-forget — don't block the response back to Claude. Claude reads
+        // settings.local.json at the start of each turn, so the rule takes effect
+        // on the next prompt regardless of how long the write takes.
+        const rule = deriveAllowRule(pending.tool, pending.input);
+        appendAllowRule(pending.cwd, rule).catch((err) => {
+          console.error(`[permissions] failed to persist rule "${rule}" in ${pending.cwd}:`, err);
+        });
+      }
     }
     return true;
   }

@@ -62,11 +62,12 @@ app.post('/internal/permission', async (c) => {
     });
   }
   try {
-    const decision = await permissions.await(agent, sessionId, {
-      toolUseId: toolUseId ?? '',
-      tool,
-      input,
-    });
+    const decision = await permissions.await(
+      agent,
+      sessionId,
+      { toolUseId: toolUseId ?? '', tool, input },
+      session?.cwd ?? null,
+    );
     console.log(`[bridge] permission decision: ${decision.behavior}`);
     return c.json(decision);
   } catch (err) {
