@@ -27,6 +27,7 @@ import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Image,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -887,7 +888,11 @@ export default function ChatScreen() {
           contentContainerStyle={{ gap: space[2], paddingHorizontal: space[2] + 2, alignItems: 'center' }}>
           {attachments.map((a, i) => (
             <View key={`${a.rel}-${i}`} style={[styles.attachChip, { backgroundColor: t.surface.raised, borderColor: t.border.subtle }]}>
-              <Text style={{ fontSize: fontSize.sm }}>{a.isImage ? '🖼' : '📎'}</Text>
+              {a.isImage && a.localUri ? (
+                <Image source={{ uri: a.localUri }} style={styles.attachThumb} />
+              ) : (
+                <Text style={{ fontSize: fontSize.sm }}>{a.isImage ? '🖼' : '📎'}</Text>
+              )}
               <Text style={{ color: t.text.primary, fontSize: fontSize.sm, maxWidth: 180 }} numberOfLines={1}>
                 {a.rel.split('/').pop()}
               </Text>
@@ -1248,16 +1253,22 @@ const styles = StyleSheet.create({
   attachBar: {
     borderTopWidth: StyleSheet.hairlineWidth,
     paddingVertical: space[1.5],
-    maxHeight: 56,
+    maxHeight: 72,
   },
   attachChip: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: space[1.5],
-    paddingHorizontal: space[2] + 2,
-    paddingVertical: space[1.5],
+    paddingLeft: space[1],
+    paddingRight: space[2] + 2,
+    paddingVertical: space[1],
     borderRadius: radius['2xl'] - 2,
     borderWidth: 1,
+  },
+  attachThumb: {
+    width: 40,
+    height: 40,
+    borderRadius: radius.md,
   },
   attachMenu: {
     flexDirection: 'row',

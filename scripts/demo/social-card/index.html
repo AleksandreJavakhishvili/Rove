@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Rove · social card</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #08090d;
+        --surface: #11141c;
+        --fg: #f4f4f5;
+        --muted: #8b93a3;
+        --accent: #0a7ea4;     /* Rove brand teal */
+        --accent-2: #14d3a3;   /* mint highlight */
+      }
+
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+
+      body {
+        /* Open Graph standard. 2x for crisp rendering, then we screenshot
+           at 1200x630. */
+        width: 1200px;
+        height: 630px;
+        font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        color: var(--fg);
+        background:
+          radial-gradient(60% 80% at 12% 0%, color-mix(in oklab, var(--accent) 35%, transparent), transparent 60%),
+          radial-gradient(50% 60% at 92% 100%, color-mix(in oklab, var(--accent-2) 22%, transparent), transparent 60%),
+          linear-gradient(180deg, #0d1018 0%, #06070b 100%);
+        overflow: hidden;
+        position: relative;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /* Subtle grain texture — keeps gradients from looking flat. */
+      body::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background-image:
+          radial-gradient(rgba(255,255,255,0.02) 1px, transparent 1px);
+        background-size: 3px 3px;
+        pointer-events: none;
+      }
+
+      .card {
+        display: grid;
+        grid-template-columns: 1fr 280px;
+        gap: 48px;
+        height: 100%;
+        padding: 56px 64px;
+        position: relative;
+        z-index: 1;
+      }
+
+      /* ── left column ──────────────────────────────────────────────── */
+      .left {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+      .brand-mark {
+        width: 56px;
+        height: 56px;
+        border-radius: 14px;
+        display: block;
+        /* The SVG already paints its own teal rounded-square + white mark,
+           we just add a soft outer glow so it sits on the dark canvas. */
+        box-shadow:
+          0 8px 22px -4px color-mix(in oklab, var(--accent) 70%, transparent),
+          0 0 0 1px rgba(255,255,255,0.06);
+      }
+      .brand-name {
+        font-weight: 700;
+        font-size: 30px;
+        letter-spacing: -0.02em;
+      }
+
+      .headline {
+        font-size: 62px;
+        line-height: 1.0;
+        letter-spacing: -0.035em;
+        font-weight: 800;
+        margin-top: 8px;
+        max-width: 14ch;
+      }
+      .headline em {
+        font-style: normal;
+        background: linear-gradient(120deg, var(--accent-2), #6db8ff);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+
+      .tagline {
+        font-size: 19px;
+        line-height: 1.4;
+        color: var(--muted);
+        max-width: 38ch;
+        margin-top: 18px;
+        font-weight: 500;
+      }
+
+      .pills {
+        display: flex;
+        gap: 8px;
+        margin-top: 20px;
+        flex-wrap: wrap;
+      }
+      .pill {
+        font-size: 13px;
+        font-weight: 600;
+        padding: 6px 11px;
+        border-radius: 999px;
+        background: color-mix(in oklab, var(--surface) 70%, transparent);
+        border: 1px solid color-mix(in oklab, var(--fg) 10%, transparent);
+        color: color-mix(in oklab, var(--fg) 85%, transparent);
+        backdrop-filter: blur(8px);
+      }
+
+      .footer {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 17px;
+        color: var(--muted);
+        font-weight: 500;
+      }
+      .footer .url {
+        font-family: 'Inter', monospace;
+        color: var(--fg);
+        font-weight: 600;
+      }
+
+      /* ── right column (phone) ─────────────────────────────────────── */
+      .right {
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .phone {
+        /* Constrained to fit within the 630px card height (minus 112px
+           padding = 518px). Phone is portrait, so height drives the size. */
+        width: 248px;
+        height: 504px;
+        border-radius: 38px;
+        background: #000;
+        padding: 6px;
+        box-shadow:
+          0 50px 90px -20px rgba(0,0,0,0.7),
+          0 25px 50px -15px rgba(0,0,0,0.5),
+          0 0 0 1px rgba(255,255,255,0.08),
+          inset 0 0 0 1px rgba(255,255,255,0.06);
+        transform: rotate(4deg);
+      }
+      .phone img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: top center;
+        border-radius: 32px;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="left">
+        <div class="brand">
+          <img class="brand-mark" src="../../../assets/logo/icon-app.svg" alt="Rove" />
+          <div class="brand-name">Rove</div>
+        </div>
+
+        <div>
+          <h1 class="headline">
+            Your coding agent.<br/><em>In your pocket.</em>
+          </h1>
+          <p class="tagline">
+            Drive Claude Code on your desktop from your phone — peer-to-peer over your own Tailscale. No cloud relay.
+          </p>
+          <div class="pills">
+            <span class="pill">🔒 P2P over Tailscale</span>
+            <span class="pill">🧠 Real diffs &amp; approvals</span>
+            <span class="pill">👁 Live dev-server preview</span>
+          </div>
+        </div>
+
+        <div class="footer">
+          <span class="url">github.com/AleksandreJavakhishvili/Rove</span>
+        </div>
+      </div>
+
+      <div class="right">
+        <div class="phone">
+          <img src="../../../assets/social/medium-hero.png" alt="Phone showing Rove" />
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

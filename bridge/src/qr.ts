@@ -51,6 +51,15 @@ export async function printConnectionQR(): Promise<void> {
   if (runtimeState.bearerToken) deepParams.set('token', runtimeState.bearerToken);
   const deepLink = `rove://settings?${deepParams.toString()}`;
 
+  // Web deep link — clicking opens the deployed web client with credentials
+  // pre-filled via URL fragment (browsers never send fragments to the server,
+  // so the token is not in GitHub Pages access logs). Only printed when the
+  // operator has pointed at a deployed instance.
+  const webBase = process.env.ROVE_WEB_CLIENT_URL?.replace(/\/+$/, '');
+  const webLink = webBase
+    ? `${webBase}/#connect=${Buffer.from(qrPayload, 'utf8').toString('base64url')}`
+    : null;
+
   console.log('');
   console.log('━'.repeat(60));
   console.log(`Scan this QR in the mobile app's Settings to connect:`);
@@ -61,6 +70,7 @@ export async function printConnectionQR(): Promise<void> {
   console.log(`URL:   ${info.url}`);
   if (runtimeState.bearerToken) console.log(`Token: ${runtimeState.bearerToken}`);
   console.log(`Link:  ${deepLink}`);
+  if (webLink) console.log(`Web:   ${webLink}`);
   switch (info.source) {
     case 'tailscale-serve':
       console.log('Mode:  Tailscale serve (HTTPS, identity headers — no token needed)');

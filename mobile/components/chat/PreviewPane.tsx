@@ -13,7 +13,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { WebView } from 'react-native-webview';
+import { PreviewFrame } from './PreviewFrame';
 
 const POLL_MS = 3000;
 
@@ -133,12 +133,7 @@ export function PreviewPane({ agent, id, active }: Props) {
       <View style={styles.body}>
         {selected ? (
           selected.reachable && selected.url ? (
-            <WebView
-              source={{ uri: selected.url }}
-              style={{ flex: 1, backgroundColor: t.surface.base }}
-              startInLoadingState
-              originWhitelist={['http://*', 'https://*']}
-            />
+            <PreviewFrame url={selected.url} backgroundColor={t.surface.base} />
           ) : (
             <LocalhostWarning candidate={selected} theme={t} />
           )

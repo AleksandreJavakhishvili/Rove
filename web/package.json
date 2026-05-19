@@ -1,0 +1,11 @@
+{
+  "name": "rove-web",
+  "version": "0.1.0",
+  "description": "Rove — landing page + GitHub Pages build that wraps the mobile package's React Native Web export.",
+  "private": true,
+  "scripts": {
+    "build": "rm -rf dist && (cd ../mobile && pnpm exec expo export -p web --output-dir ../web/dist/app) && cp dist/app/index.html dist/app/404.html && cp -R landing/. dist/",
+    "build:debug": "rm -rf dist && (cd ../mobile && pnpm exec expo export -p web --output-dir ../web/dist/app --source-maps --no-minify) && cp dist/app/index.html dist/app/404.html && cp -R landing/. dist/"
+  },
+  "packageManager": "pnpm@10.33.2+sha256.7a7bcf13d7f6ceb3946c03978373d99be9fde1cafc3000bdfed4c4f791167610"
+}

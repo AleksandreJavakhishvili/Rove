@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none" role="img" aria-label="Rove mark">
+  <title>Rove</title>
+  <!-- Two nodes connected by a curve — your phone and your machine, roving apart but tethered. -->
+  <path d="M 56 156 Q 128 64, 200 156" stroke="currentColor" stroke-width="14" stroke-linecap="round" fill="none"/>
+  <circle cx="56" cy="156" r="22" fill="currentColor"/>
+  <circle cx="200" cy="156" r="22" fill="currentColor"/>
+</svg>

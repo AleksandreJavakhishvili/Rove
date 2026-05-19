@@ -1,4 +1,4 @@
-import KV from 'expo-sqlite/kv-store';
+import KV from './kv';
 import { useEffect } from 'react';
 import { create } from 'zustand';
 
