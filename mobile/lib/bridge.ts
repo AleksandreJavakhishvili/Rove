@@ -32,7 +32,7 @@ async function fetchWithTimeout(url: string, opts: RequestInit, timeoutMs = 7000
       'Your browser blocked the connection: the bridge URL is HTTP but this page is HTTPS. ' +
         'Expose your bridge over HTTPS via `tailscale serve --bg --https=443 http://localhost:<port>` ' +
         'and use the resulting `https://<host>.<tailnet>.ts.net` URL. ' +
-        'Full guide: github.com/akojavakhishvili/remoteagent/blob/main/docs/web-client-setup.md',
+        'Full guide: github.com/aleksandrejavakhishvili/Rove/blob/main/docs/web-client-setup.md',
     );
   }
   const ac = new AbortController();

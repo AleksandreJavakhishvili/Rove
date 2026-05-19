@@ -19,7 +19,7 @@ import {
 } from 'react-native';
 
 const WEB_SETUP_DOCS_URL =
-  'https://github.com/akojavakhishvili/remoteagent/blob/main/docs/web-client-setup.md';
+  'https://github.com/aleksandrejavakhishvili/Rove/blob/main/docs/web-client-setup.md';
 
 export default function SettingsScreen() {
   const t = useTheme();

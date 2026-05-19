@@ -1,6 +1,6 @@
 # Web client setup
 
-The rove web client ([live demo](https://akojavakhishvili.github.io/remoteagent/)) is a
+The rove web client ([live demo](https://aleksandrejavakhishvili.github.io/Rove/)) is a
 browser build of the same React Native app that ships on iOS and Android. To connect it
 to your bridge, the bridge needs to be reachable over **HTTPS** — because GitHub Pages
 serves the site over HTTPS, and modern browsers refuse to talk from an HTTPS page to a
@@ -64,8 +64,8 @@ If you'd rather not expose your bridge to your tailnet at all, you can run the w
 client over HTTP locally:
 
 ```sh
-git clone https://github.com/akojavakhishvili/remoteagent
-cd remoteagent/mobile
+git clone https://github.com/aleksandrejavakhishvili/Rove
+cd Rove/mobile
 pnpm install
 pnpm web
 ```
