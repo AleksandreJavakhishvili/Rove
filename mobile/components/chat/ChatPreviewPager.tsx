@@ -15,6 +15,8 @@ interface Props {
   chat: ReactNode;
   /** Right page receives a flag so it can pause work when offscreen. */
   preview: (active: boolean) => ReactNode;
+  /** Notified when the visible page changes (0 = chat, 1 = preview). */
+  onIndexChange?: (index: number) => void;
 }
 
 /**
@@ -26,12 +28,16 @@ interface Props {
  * and a horizontal threshold prevents the FlatList's vertical scroll from
  * being hijacked.
  */
-export function ChatPreviewPager({ chat, preview }: Props) {
+export function ChatPreviewPager({ chat, preview, onIndexChange }: Props) {
   const { width } = useWindowDimensions();
   const t = useTheme();
   const translateX = useSharedValue(0);
   const [activeIndex, setActiveIndex] = useState(0);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
+
+  useEffect(() => {
+    onIndexChange?.(activeIndex);
+  }, [activeIndex, onIndexChange]);
 
   useEffect(() => {
     const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';

@@ -189,6 +189,10 @@ export default function ChatScreen() {
     hasMore: false,
   });
   const [loadingOlder, setLoadingOlder] = useState(false);
+  // Which page of the pager is visible. When the preview page is active we
+  // suppress the navigator's back-swipe, otherwise iOS' edge gesture captures
+  // a right-swipe and pops to /sessions instead of returning to chat.
+  const [pagerIndex, setPagerIndex] = useState(0);
   const listRef = useRef<FlatList<ChatItem>>(null);
   const sending = pendingTurns > 0;
   const stickToBottomRef = useRef(true);
@@ -732,6 +736,7 @@ export default function ChatScreen() {
       <Stack.Screen
         options={{
           title: sessionLabel ?? sessionProject ?? 'Chat',
+          gestureEnabled: pagerIndex === 0,
           headerTitle: () => (
             <Pressable onPress={onRename} hitSlop={8} style={{ alignItems: 'center' }}>
               <Text
@@ -973,6 +978,7 @@ export default function ChatScreen() {
     <ChatPreviewPager
       chat={chatBody}
       preview={(active) => <PreviewPane agent={agent} id={id} active={active} />}
+      onIndexChange={setPagerIndex}
     />
   );
 }

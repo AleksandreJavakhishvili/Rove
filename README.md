@@ -1,24 +1,48 @@
 <p align="center">
-  <strong>Control your local coding agents from your phone, over your own Tailscale.</strong><br/>
-  No central server. No cloud relay. Your code never leaves your machine.
+  <img src="assets/logo/wordmark.svg" alt="Rove" height="160" />
+</p>
+
+<h1 align="center">Your coding agent. In your pocket.</h1>
+
+<p align="center">
+  Drive Claude Code (and friends) on your desktop from your phone.<br/>
+  No cloud relay. No third-party server. Just your tailnet.
 </p>
 
 <p align="center">
-  <img src="assets/logo/wordmark.svg" alt="Rove" height="180" />
+  <img src="scripts/demo/preview.gif" alt="Type a prompt on your phone. Watch the dev server reload — live, in the same app." width="320" />
+</p>
+
+<p align="center">
+  <a href="#quickstart"><strong>Quickstart →</strong></a> &nbsp;·&nbsp;
+  <a href="#why"><strong>Why</strong></a> &nbsp;·&nbsp;
+  <a href="#live-preview"><strong>Live preview</strong></a> &nbsp;·&nbsp;
+  <a href="#comparison-with-similar-projects"><strong>vs. Happy</strong></a>
+</p>
+
+<p align="center">
+  <sub>
+    🔒 Peer-to-peer over Tailscale &nbsp;·&nbsp;
+    🧠 Real diffs, real tool cards, real approvals &nbsp;·&nbsp;
+    👁 Live dev-server preview, one swipe away &nbsp;·&nbsp;
+    🪶 ~3 MB bridge, no DB, no daemon
+  </sub>
 </p>
 
 ---
 
-`rove` is two things:
+## What it is
 
-1. A **bridge** — a tiny Node.js server you run on your desktop next to `claude` (or, soon, other CLI agents). It talks to the agent through its headless mode and exposes the session over a private network as HTTP + WebSocket.
-2. A **mobile app** (Expo / React Native) that connects to the bridge from your phone, lets you read history, send prompts, watch tool calls execute on your machine, approve risky operations, review file diffs, and **preview the dev server your agent is editing — live, in the same screen** — all over Tailscale, end-to-end-tunnelled through WireGuard.
+`rove` is two pieces you self-host on your own machines:
 
-The whole architecture is peer-to-peer between your devices. No third-party server holds your session, your API key, or your code.
+1. A **bridge** — tiny Node.js server you run alongside `claude` on your desktop. Speaks the CLI's headless protocol and exposes each session over HTTP + WebSocket on your tailnet.
+2. A **mobile app** (Expo / React Native) — reads session history, sends prompts, streams tool calls + diffs as they happen, surfaces approval prompts as bottom sheets, and previews the dev server your agent is editing in a WebView right next to the chat.
+
+Your laptop runs the agent. Your phone is the editor surface. Tailscale is the network. Nothing in between.
 
 ## Why
 
-Existing mobile clients for coding agents (Happy, etc.) work, but they route through their own infrastructure even with end-to-end encryption. `rove` is for the case where you want zero third-party touch: your laptop runs the agent, your phone runs the client, Tailscale is the network. That's it.
+Existing mobile clients (Happy, etc.) work — but they route your turns through their own infrastructure, even with end-to-end encryption. `rove` is for the case where you want **zero third-party touch**: your laptop runs the agent, your phone runs the client, Tailscale tunnels the bytes, and nobody else is in the path.
 
 ## Status
 
@@ -147,7 +171,7 @@ Each friend joins your tailnet (you invite them via the Tailscale admin UI) and 
 
 ## Live preview
 
-Swipe left from the chat in any session to see a WebView of the dev server running for that project — no configuration. The bridge scans listening TCP ports on your desktop and matches any process whose working directory sits inside the session's cwd. Vite, Next.js, Astro, webpack, Parcel, Bun and plain `node` servers are auto-labeled; multiple candidates (e.g. backend + frontend in a monorepo) appear in a picker. Rename any entry to whatever's meaningful ("Admin FE", "Storefront API", …) — labels persist per session.
+Swipe left from the chat in any session to see a WebView of the dev server running for that project — no configuration. ([See it in action at the top of this README.](#)) The bridge scans listening TCP ports on your desktop and matches any process whose working directory sits inside the session's cwd. Vite, Next.js, Astro, webpack, Parcel, Bun and plain `node` servers are auto-labeled; multiple candidates (e.g. backend + frontend in a monorepo) appear in a picker. Rename any entry to whatever's meaningful ("Admin FE", "Storefront API", …) — labels persist per session.
 
 Caveats:
 
