@@ -16,7 +16,25 @@ function authHeaders(cfg: BridgeConfig): Record<string, string> {
   return cfg.token ? { Authorization: `Bearer ${cfg.token}` } : {};
 }
 
+function isMixedContentBlocked(url: string): boolean {
+  // Browsers block any HTTP fetch from an HTTPS page (mixed active content)
+  // with a generic network error. Detect the condition up front so we can
+  // surface a useful message instead.
+  if (typeof window === 'undefined' || typeof document === 'undefined') return false;
+  const pageProtocol = window.location?.protocol;
+  if (pageProtocol !== 'https:') return false;
+  return /^http:\/\//i.test(url);
+}
+
 async function fetchWithTimeout(url: string, opts: RequestInit, timeoutMs = 7000): Promise<Response> {
+  if (isMixedContentBlocked(url)) {
+    throw new Error(
+      'Your browser blocked the connection: the bridge URL is HTTP but this page is HTTPS. ' +
+        'Expose your bridge over HTTPS via `tailscale serve --bg --https=443 http://localhost:<port>` ' +
+        'and use the resulting `https://<host>.<tailnet>.ts.net` URL. ' +
+        'Full guide: github.com/akojavakhishvili/remoteagent/blob/main/docs/web-client-setup.md',
+    );
+  }
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   const started = Date.now();

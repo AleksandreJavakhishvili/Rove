@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
   Alert,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
   StyleSheet,
@@ -16,6 +17,9 @@ import {
   TextInput,
   View,
 } from 'react-native';
+
+const WEB_SETUP_DOCS_URL =
+  'https://github.com/akojavakhishvili/remoteagent/blob/main/docs/web-client-setup.md';
 
 export default function SettingsScreen() {
   const t = useTheme();
@@ -145,9 +149,18 @@ export default function SettingsScreen() {
         )}
       </Pressable>
       <Text style={[styles.hint, { color: t.text.muted }]}>
-        Make sure your phone and the bridge are on the same Tailscale network. URL must be reachable from
-        the device you&apos;re running this app on.
+        Make sure this device and the bridge are on the same Tailscale network. URL must be reachable from
+        the browser/phone you&apos;re running this app on.
+        {Platform.OS === 'web' ? ' Browsers require an HTTPS bridge URL.' : ''}
       </Text>
+      <Pressable
+        onPress={() => void Linking.openURL(WEB_SETUP_DOCS_URL)}
+        hitSlop={8}
+        style={({ pressed }) => [styles.docsLink, { opacity: pressed ? 0.6 : 1 }]}>
+        <Text style={[styles.docsLinkLabel, { color: t.accent.primary }]}>
+          Where do I get this URL? →
+        </Text>
+      </Pressable>
 
       <QRScanner visible={scannerOpen} onClose={() => setScannerOpen(false)} onScan={onScan} />
     </KeyboardAvoidingView>
@@ -188,4 +201,6 @@ const styles = StyleSheet.create({
   },
   buttonLabel: { fontWeight: '600', fontSize: fontSize.xl },
   hint: { fontSize: fontSize.sm, lineHeight: 18, marginTop: space[2] },
+  docsLink: { alignSelf: 'flex-start', marginTop: 2 },
+  docsLinkLabel: { fontSize: fontSize.sm, fontWeight: '600' },
 });

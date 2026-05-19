@@ -2,7 +2,7 @@ import { fetchSessions, renameSession } from '@/lib/bridge';
 import { useHydratedSettings } from '@/lib/store';
 import type { SessionListItem } from '@/lib/types';
 import { fontSize, radius, space, useTheme, type Theme } from '@/theme';
-import { Link, router } from 'expo-router';
+import { router } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
@@ -72,11 +72,11 @@ export default function SessionsScreen() {
         <Text style={[styles.welcomeBody, { color: t.text.secondary }]}>
           Point this app at the bridge running on your desktop over Tailscale.
         </Text>
-        <Link href="/settings" asChild>
-          <Pressable style={[styles.primaryButton, { backgroundColor: t.accent.primary }]}>
-            <Text style={[styles.primaryButtonLabel, { color: t.accent.fg }]}>Open settings</Text>
-          </Pressable>
-        </Link>
+        <Pressable
+          onPress={() => router.push('/settings')}
+          style={[styles.primaryButton, { backgroundColor: t.accent.primary }]}>
+          <Text style={[styles.primaryButtonLabel, { color: t.accent.fg }]}>Open settings</Text>
+        </Pressable>
       </View>
     );
   }

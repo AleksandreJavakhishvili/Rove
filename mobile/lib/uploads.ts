@@ -18,6 +18,9 @@ export interface UploadResult {
   sizeBytes: number;
   isImage: boolean;
   mimeType: string;
+  /** Local file URI on the phone (e.g. `file://…`) — only set by image pickers
+   *  so the attachment chip can render a real thumbnail. Not sent to the bridge. */
+  localUri?: string;
 }
 
 async function readAsBase64(uri: string): Promise<string> {
@@ -66,7 +69,8 @@ export async function pickAndUploadImage(
   const asset = result.assets[0]!;
   const dataBase64 = asset.base64 ?? (await readAsBase64(asset.uri));
   const fileName = asset.fileName ?? `image-${Date.now()}.jpg`;
-  return postUpload(cfg, agent, id, { fileName, mimeType: asset.mimeType, dataBase64 });
+  const uploaded = await postUpload(cfg, agent, id, { fileName, mimeType: asset.mimeType, dataBase64 });
+  return { ...uploaded, localUri: asset.uri };
 }
 
 /**
@@ -108,5 +112,6 @@ export async function captureAndUploadPhoto(
   const asset = result.assets[0]!;
   const dataBase64 = asset.base64 ?? (await readAsBase64(asset.uri));
   const fileName = asset.fileName ?? `photo-${Date.now()}.jpg`;
-  return postUpload(cfg, agent, id, { fileName, mimeType: asset.mimeType, dataBase64 });
+  const uploaded = await postUpload(cfg, agent, id, { fileName, mimeType: asset.mimeType, dataBase64 });
+  return { ...uploaded, localUri: asset.uri };
 }
