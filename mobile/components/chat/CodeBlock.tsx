@@ -41,7 +41,10 @@ export function CodeBlock({ text, lang }: CodeBlockProps) {
           </Text>
         </Pressable>
       </View>
-      <ScrollView horizontal showsHorizontalScrollIndicator>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator
+        style={styles.scroll}>
         <Text selectable style={[styles.code, { color: t.code.fg }]}>
           {visibleText}
         </Text>
@@ -74,6 +77,12 @@ const styles = StyleSheet.create({
   },
   lang: { fontSize: fontSize.xs, fontWeight: '600', textTransform: 'lowercase', letterSpacing: 0.3 },
   copy: { fontSize: fontSize.sm, fontWeight: '600' },
+  // React Native's ScrollView has `flexGrow: 1` baked into its base style for
+  // both vertical and horizontal variants. Inside a column-flex parent that
+  // means the horizontal scroller will stretch to fill any available vertical
+  // space — which made our code block consume the entire bubble height once
+  // it landed in a wide chat bubble. Force it back to content-sized.
+  scroll: { flexGrow: 0, flexShrink: 0 },
   code: {
     fontFamily: fontFamily.mono,
     fontSize: fontSize.base,

@@ -60,39 +60,22 @@ export function Markdown({ text, color }: MarkdownProps) {
           paddingHorizontal: 4,
           borderRadius: radius.sm - 1,
         },
-        code_block: {
-          color,
-          backgroundColor: t.code.inlineBg,
-          fontFamily: fontFamily.mono,
-          fontSize: fontSize.base,
-          padding: 8,
-          borderRadius: radius.md,
-        },
-        fence: {
-          color,
-          backgroundColor: t.code.inlineBg,
-          fontFamily: fontFamily.mono,
-          fontSize: fontSize.base,
-          padding: 8,
-          borderRadius: radius.md,
-        },
-        table: { borderColor: muted, borderWidth: StyleSheet.hairlineWidth, marginVertical: 6 },
-        thead: { backgroundColor: t.surface.raised },
-        tbody: { backgroundColor: 'transparent' },
-        th: { color, padding: 6, fontWeight: '700' },
-        td: { color, padding: 6 },
-        tr: { borderBottomColor: muted, borderBottomWidth: StyleSheet.hairlineWidth },
       }),
-    [color, muted, t.accent.primary, t.code.inlineBg, t.surface.raised],
+    [color, muted, t.accent.primary, t.code.inlineBg],
   );
 
+  // Replace the library's fence/code_block renderers with our own CodeBlock so
+  // code stays consistent across the app. Everything else uses the library's
+  // defaults.
   const rules = useMemo(
     () => ({
       fence: (node: ASTNode) => {
-        const info = (node as { sourceInfo?: string }).sourceInfo;
-        const lang = typeof info === 'string' && info.length > 0 ? info.split(/\s+/)[0] ?? null : null;
-        return <CodeBlock key={node.key} text={node.content ?? ''} lang={lang} />;
+        const lang = (node as unknown as { sourceInfo?: string }).sourceInfo ?? null;
+        return <CodeBlock key={node.key} text={String(node.content ?? '')} lang={lang || null} />;
       },
+      code_block: (node: ASTNode) => (
+        <CodeBlock key={node.key} text={String(node.content ?? '')} lang={null} />
+      ),
     }),
     [],
   );

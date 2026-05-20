@@ -82,13 +82,13 @@ type ChatItem =
 function entryToChatItem(e: HistoryEntry, index: number): ChatItem | null {
   switch (e.kind) {
     case 'user': {
-      const text = extractText(e.content);
-      if (!text.trim()) return null;
+      const text = extractText(e.content).trim();
+      if (!text) return null;
       return { id: `h-${index}-${e.uuid}`, kind: 'user', text, parentToolUseId: e.parentToolUseId };
     }
     case 'assistant': {
-      const text = extractText(e.content);
-      if (!text.trim()) return null;
+      const text = extractText(e.content).trim();
+      if (!text) return null;
       return { id: `h-${index}-${e.uuid}`, kind: 'assistant', text, parentToolUseId: e.parentToolUseId };
     }
     case 'tool_use':
@@ -143,22 +143,6 @@ function readBashId(input: unknown): string | null {
   return typeof v === 'string' ? v : null;
 }
 
-// Tools where the success tool_result is just "ok"/"file modified"/etc. and
-// adds no signal beyond the tool_use card. We always render errors regardless.
-const QUIET_RESULT_TOOLS = new Set([
-  'Read',
-  'Grep',
-  'Glob',
-  'Ls',
-  'LS',
-  'WebSearch',
-  'WebFetch',
-  'Edit',
-  'MultiEdit',
-  'Write',
-  'TodoWrite',
-  'Task',
-]);
 
 function opStyle(op: 'add' | 'change' | 'unlink', t: Theme): { color: string; symbol: string } {
   if (op === 'add') return { color: t.op.add, symbol: 'A' };
@@ -307,13 +291,12 @@ export default function ChatScreen() {
     if (item.kind === 'tool_use') toolNamesRef.current.set(item.toolUseId, item.name);
   }
 
-  // True when we should drop a tool_result from the chat (success result for a
-  // tool whose output adds no signal beyond the request itself).
+  // We render only error tool_results — successful ones are dropped because
+  // the originating tool_use card already shows what was requested, and the
+  // result content is rarely informative for the user.
   function isQuietResult(item: ChatItem): boolean {
     if (item.kind !== 'tool_result') return false;
-    if (item.isError) return false;
-    const name = toolNamesRef.current.get(item.toolUseId);
-    return name ? QUIET_RESULT_TOOLS.has(name) : false;
+    return !item.isError;
   }
 
   useEffect(() => {
@@ -425,7 +408,8 @@ export default function ChatScreen() {
             // If the finalized text is empty, keep what deltas already produced
             // and just mark the bubble non-live. Otherwise replace with the
             // canonical final text.
-            const finalText = ev.text.trim() ? ev.text : buf.text;
+            const trimmed = ev.text.trim();
+            const finalText = trimmed || buf.text;
             setItems((prev) =>
               prev.map((it) =>
                 it.id === buf.id && it.kind === 'assistant'
@@ -438,14 +422,15 @@ export default function ChatScreen() {
             // Drop empty assistant text blocks (e.g. turns that are just a
             // tool_use); rendering them creates a blank bubble. Replay path
             // already filters these the same way.
-            if (!ev.text.trim()) return;
+            const trimmed = ev.text.trim();
+            if (!trimmed) return;
             const newId = `live-a-${ev.messageId ?? Date.now()}-${Math.random()}`;
             setItems((prev) => [
               ...prev,
               {
                 id: newId,
                 kind: 'assistant',
-                text: ev.text,
+                text: trimmed,
                 live: true,
                 parentToolUseId: ev.parentToolUseId,
               },
@@ -806,12 +791,11 @@ export default function ChatScreen() {
         ref={listRef}
         data={items}
         keyExtractor={(it) => it.id}
+        style={{ flex: 1 }}
         contentContainerStyle={{
           paddingVertical: space[2],
           paddingHorizontal: space[3],
           gap: space[2] + 2,
-          flexGrow: 1,
-          justifyContent: 'flex-end',
         }}
         renderItem={({ item }) => {
           const indented = 'parentToolUseId' in item && Boolean(item.parentToolUseId);
@@ -1037,14 +1021,14 @@ const ChatRow = memo(
     if (item.kind === 'user') {
       return (
         <View style={[styles.bubbleUser, { backgroundColor: t.bubble.userBg }]}>
-          <Markdown text={item.text} color={t.bubble.userFg} />
+          <Markdown text={item.text.trim()} color={t.bubble.userFg} />
         </View>
       );
     }
     if (item.kind === 'assistant') {
       return (
         <View style={[styles.bubbleAssistant, { backgroundColor: t.bubble.assistantBg }]}>
-          <Markdown text={item.text} color={t.bubble.assistantFg} />
+          <Markdown text={item.text.trim()} color={t.bubble.assistantFg} />
         </View>
       );
     }

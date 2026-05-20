@@ -311,9 +311,20 @@ class ClaudeCodeSession extends EventEmitter implements AgentSession {
     if (child.pid !== undefined) this.emit('spawn', { pid: child.pid });
 
     const rlOut = createInterface({ input: child.stdout, crlfDelay: Infinity });
+    // Tags we already route into AgentEvents. Anything outside this set is
+    // dumped raw so new event shapes from claude surface in the logs — e.g.
+    // internal sed/awk safety prompts, which historically went to TTY but a
+    // future claude version may emit as a stream event we haven't wired up.
+    const KNOWN_TAGS = new Set([
+      'assistant',
+      'user',
+      'stream_event',
+      'result',
+      'permission_request',
+      'permission_prompt',
+    ]);
     rlOut.on('line', (line) => {
       if (!line.trim()) return;
-      let lineCount = 0;
       let obj: any;
       try {
         obj = JSON.parse(line);
@@ -321,15 +332,12 @@ class ClaudeCodeSession extends EventEmitter implements AgentSession {
         return;
       }
       this.lastActivity = Date.now();
-      lineCount += 1;
       const tag = obj?.type ?? 'unknown';
       const subtype = obj?.subtype ?? '';
       console.log(`[claude ${this.sessionId.slice(0, 8)}] ← ${tag}${subtype ? '/' + subtype : ''}`);
-      // First 2 unknown / system payloads: dump shape so we can spot
-      // anything we're misrouting (e.g., permission prompts hidden inside).
-      if (tag === 'system' && lineCount <= 2) {
-        const dump = JSON.stringify(obj).slice(0, 500);
-        console.log(`[claude ${this.sessionId.slice(0, 8)}]   payload: ${dump}`);
+      if (!KNOWN_TAGS.has(tag)) {
+        const dump = JSON.stringify(obj).slice(0, 800);
+        console.log(`[claude ${this.sessionId.slice(0, 8)}]   unknown payload: ${dump}`);
       }
       for (const ev of streamLineToEvents(obj)) this.emit('event', ev);
     });

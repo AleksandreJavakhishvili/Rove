@@ -118,7 +118,10 @@ export function ToolUseCard({ name, input, running }: ToolUseCardProps) {
           {timeoutMs ? (
             <Text style={[styles.dimmed, { color: t.text.secondary }]}>timeout {Math.round(timeoutMs / 1000)}s</Text>
           ) : null}
-          <ScrollView horizontal showsHorizontalScrollIndicator style={{ marginTop: 4 }}>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator
+            style={{ marginTop: 4, flexGrow: 0, flexShrink: 0 }}>
             <Text style={[styles.cmd, { color: t.text.primary }]} selectable>
               $ {cmd}
             </Text>
@@ -190,7 +193,8 @@ export function ToolUseCard({ name, input, running }: ToolUseCardProps) {
         </Card>
       );
     }
-    case 'Task': {
+    case 'Task':
+    case 'Agent': {
       const subagent = typeof o.subagent_type === 'string' ? o.subagent_type : 'general-purpose';
       const description = typeof o.description === 'string' ? o.description : '';
       const prompt = typeof o.prompt === 'string' ? o.prompt : '';
@@ -198,7 +202,7 @@ export function ToolUseCard({ name, input, running }: ToolUseCardProps) {
         <Card t={t}>
           <View style={styles.header}>
             <Text style={[styles.tag, { color: t.text.secondary, borderColor: t.border.subtle }]}>
-              Task · {subagent}
+              {name} · {subagent}
             </Text>
             {running ? <Text style={[styles.running, { color: t.text.secondary }]}>running…</Text> : null}
           </View>
@@ -207,7 +211,7 @@ export function ToolUseCard({ name, input, running }: ToolUseCardProps) {
               {description}
             </Text>
           ) : null}
-          {prompt ? <CollapsibleMono text={prompt} max={240} t={t} /> : null}
+          {prompt ? <PromptToggle text={prompt} t={t} /> : null}
         </Card>
       );
     }
@@ -257,7 +261,7 @@ export function ToolResultCard({ content, isError }: ToolResultCardProps) {
         ]}>
         {label}
       </Text>
-      <CollapsibleMono text={asText(content) || '(no output)'} max={400} t={t} />
+      <CollapsibleMono text={asText(content) || '(no output)'} max={200} t={t} />
     </View>
   );
 }
@@ -287,13 +291,46 @@ function TodoRow({ todo, t }: { todo: any; t: Theme }) {
   );
 }
 
+/**
+ * Sub-agent prompts are typically multi-line and dominate the chat. Keep them
+ * hidden behind a one-tap toggle so the card stays a couple of lines tall.
+ */
+function PromptToggle({ text, t }: { text: string; t: Theme }) {
+  const [open, setOpen] = useState(false);
+  if (!open) {
+    return (
+      <Pressable onPress={() => setOpen(true)}>
+        <Text style={[styles.expand, { color: t.accent.primary }]}>Show prompt ({text.length} chars)</Text>
+      </Pressable>
+    );
+  }
+  return (
+    <View>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator
+        style={{ marginTop: 4, flexGrow: 0, flexShrink: 0 }}>
+        <Text style={[styles.mono, { color: t.text.primary }]} selectable>
+          {text}
+        </Text>
+      </ScrollView>
+      <Pressable onPress={() => setOpen(false)}>
+        <Text style={[styles.expand, { color: t.accent.primary }]}>Hide prompt</Text>
+      </Pressable>
+    </View>
+  );
+}
+
 function CollapsibleMono({ text, max, t }: { text: string; max: number; t: Theme }) {
   const [expanded, setExpanded] = useState(false);
   const truncated = text.length > max;
   const visible = truncated && !expanded ? text.slice(0, max) : text;
   return (
     <View style={{ marginTop: 4 }}>
-      <ScrollView horizontal showsHorizontalScrollIndicator>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator
+        style={{ flexGrow: 0, flexShrink: 0 }}>
         <Text style={[styles.mono, { color: t.text.primary }]} selectable>
           {visible}
         </Text>
