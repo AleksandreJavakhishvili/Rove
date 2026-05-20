@@ -11,64 +11,24 @@ import { config, runtimeState } from './config.ts';
 import { getDriver, listAgents, listAllSessions } from './agents/registry.ts';
 import { devices } from './devices.ts';
 import { scanDevServers } from './devServers.ts';
-import { entryFromRaw } from './agents/claudeCode.ts';
 import { readScopedFile, relToCwd } from './files.ts';
 import { JsonlTail } from './jsonlTail.ts';
 import { getDiff } from './git.ts';
 import { inspectPid } from './lsof.ts';
-import { permissions, requestPermissionFromUser } from './permissions.ts';
+import { permissions } from './permissions.ts';
 import { preflight } from './preflight.ts';
 import { printConnectionQR } from './qr.ts';
 import { runtime } from './runtime.ts';
 import { sessionMeta } from './sessionMeta.ts';
 import { saveUpload } from './uploads.ts';
 import { getTailscaleCert, getTailscaleInfo, isTailscaleServeRunning } from './tailscale.ts';
-import { watchers, type FileChange } from './watcher.ts';
-import type { AgentEvent, AgentKind } from './agents/types.ts';
+import { PERMISSION_MODES, type AgentEvent, type AgentKind } from './agents/types.ts';
 import type { ClientToServer, ServerToClient, SessionListItem } from './types.ts';
 
 const app = new Hono<{ Variables: { auth: { user: string; source: string } } }>();
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 
-app.use('*', cors({ origin: '*', allowHeaders: ['Authorization', 'Tailscale-User-Login', 'Content-Type', 'X-Bridge-Internal-Token'] }));
-
-// Internal endpoint: the MCP permission-prompt server (spawned by claude) calls
-// this to ask the phone. We bypass the normal auth middleware here because the
-// MCP server presents its own one-time internal token.
-app.post('/internal/permission', async (c) => {
-  const tok = c.req.header('x-bridge-internal-token');
-  if (!permissions.isInternalAuth(tok)) {
-    return c.json({ behavior: 'deny', message: 'unauthorized' }, 401);
-  }
-  let body: { agent?: string; sessionId?: string; toolUseId?: string; tool?: string; input?: unknown };
-  try {
-    body = await c.req.json();
-  } catch {
-    return c.json({ behavior: 'deny', message: 'bad json' }, 400);
-  }
-  const { agent, sessionId, toolUseId, tool, input } = body;
-  if (!agent || !sessionId || !tool) {
-    return c.json({ behavior: 'deny', message: 'missing fields' }, 400);
-  }
-  console.log(`[bridge] permission_prompt for ${agent}/${sessionId.slice(0, 8)} tool=${tool}`);
-  const session = runtime.get(agent, sessionId);
-  try {
-    const decision = await requestPermissionFromUser({
-      agent,
-      sessionId,
-      cwd: session?.cwd ?? null,
-      toolUseId: toolUseId ?? '',
-      tool,
-      input,
-      emitSessionEvent: session ? (ev) => session.emit('event', ev) : null,
-    });
-    console.log(`[bridge] permission decision: ${decision.behavior}`);
-    return c.json(decision);
-  } catch (err) {
-    console.error(`[bridge] permission await failed:`, err);
-    return c.json({ behavior: 'deny', message: (err as Error).message });
-  }
-});
+app.use('*', cors({ origin: '*', allowHeaders: ['Authorization', 'Tailscale-User-Login', 'Content-Type'] }));
 
 app.use('*', authMiddleware);
 
@@ -195,6 +155,33 @@ app.get('/sessions/:agent/:id/history', async (c) => {
     entries,
     cursor: { before: oldest, hasMore: entries.length === limit },
   });
+});
+
+// Fork the current session. Capability-gated: the driver must expose
+// `session.fork()` AND the session's capabilities must report
+// `sessionForking: true`. Returns the new session ID for the mobile to
+// navigate to.
+app.post('/sessions/:agent/:id/fork', async (c) => {
+  const agent = c.req.param('agent') as AgentKind;
+  const id = c.req.param('id') ?? '';
+  const session = await runtime.getOrCreate(agent, id);
+  if (!session.capabilities().sessionForking || !session.fork) {
+    return c.json({ error: 'fork not supported by this agent' }, 409);
+  }
+  let body: { atMessage?: string } = {};
+  try {
+    if (c.req.header('content-type')?.startsWith('application/json')) {
+      body = (await c.req.json()) as { atMessage?: string };
+    }
+  } catch {
+    // optional body — ignore parse errors and fork from the head
+  }
+  try {
+    const result = await session.fork(body.atMessage ? { atMessage: body.atMessage } : undefined);
+    return c.json({ ok: true, ...result });
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 500);
+  }
 });
 
 app.post('/sessions/:agent/:id/interrupt', (c) => {
@@ -410,7 +397,15 @@ const clientSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('ping') }),
   z.object({
     type: z.literal('set_mode'),
-    mode: z.enum(['default', 'acceptEdits', 'plan', 'bypassPermissions']),
+    mode: z.enum(PERMISSION_MODES),
+  }),
+  z.object({
+    type: z.literal('set_model'),
+    model: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal('rewind_to'),
+    messageId: z.string().min(1),
   }),
 ]);
 
@@ -423,18 +418,42 @@ app.get(
     let session: Awaited<ReturnType<typeof runtime.getOrCreate>> | null = null;
     let onEvent: ((e: AgentEvent) => void) | null = null;
     let onExit: ((info: { code: number | null; signal: NodeJS.Signals | null }) => void) | null = null;
-    let watcherEmitter: ReturnType<typeof watchers.acquire> | null = null;
-    let onWatcherChange: ((info: FileChange) => void) | null = null;
-    let watchedCwd: string | null = null;
     let jsonlTail: JsonlTail | null = null;
+    // The whole onOpen handler is async (history replay + attach), but a fast
+    // client (e.g. the sessions-list one-shot approval helper) sends its first
+    // frame the instant the socket reports `open` — which arrives BEFORE we've
+    // finished initializing. Track that init as a promise so onMessage can
+    // await it instead of silently dropping the frame.
+    let readyPromise: Promise<void> | null = null;
 
     const attach = async (ws: WSContext) => {
       session = await runtime.getOrCreate(agent, id);
       session.subscribers += 1;
       send(ws, { type: 'status', status: session.alive ? 'live-bridge' : 'idle', pid: session.pid });
+      // Capability snapshot first — the mobile relies on this to decide which
+      // chrome (mode chip, model chip, rewind affordance…) to render before
+      // any per-session events arrive.
+      send(ws, { type: 'event', event: { type: 'capabilities', capabilities: session.capabilities() } });
       // Tell the new subscriber what permission mode the session is in. The
       // bridge is the source of truth; the mobile client just mirrors this.
       send(ws, { type: 'event', event: { type: 'permission_mode', mode: session.permissionMode } });
+      // Replay any approvals that are already pending for this session, so a
+      // user opening the chat after the prompt fired still sees the
+      // ApprovalSheet. Without this, the sessions-list chip shows the chip
+      // (it hydrates from the bridge-wide /events snapshot) but the chat
+      // stays blank until the next, unrelated prompt arrives.
+      for (const p of permissions.list()) {
+        if (p.agent !== agent || p.sessionId !== id) continue;
+        send(ws, {
+          type: 'event',
+          event: {
+            type: 'permission_request',
+            toolUseId: p.toolUseId,
+            tool: p.tool,
+            input: p.input,
+          },
+        });
+      }
       let eventCount = 0;
       onEvent = (e: AgentEvent) => {
         eventCount += 1;
@@ -446,73 +465,67 @@ app.get(
           jsonlTail = null;
           console.log(`[bridge] jsonl-tail stopped (bridge took over)`);
         }
+        // file_changed is a top-level wire frame (the mobile already handles
+        // it that way); unwrap so we don't break that contract just because
+        // the driver started emitting it as an AgentEvent.
+        if (e.type === 'file_changed') {
+          send(ws, { type: 'file_changed', path: e.path, op: e.op });
+          return;
+        }
         send(ws, { type: 'event', event: e });
       };
       onExit = (info) => send(ws, { type: 'process_exit', code: info.code, signal: info.signal });
       session.on('event', onEvent);
       session.on('exit', onExit);
-      // Start a file watcher rooted at the session's cwd. Shared across sessions
-      // that point at the same cwd.
-      watchedCwd = session.cwd;
-      watcherEmitter = watchers.acquire(session.cwd);
-      onWatcherChange = (info) => send(ws, { type: 'file_changed', path: info.rel || info.path, op: info.op });
-      watcherEmitter.on('change', onWatcherChange);
+      // No external file watcher — every driver registered here is required
+      // to advertise `nativeFileChanges: true` and feed `file_changed`
+      // AgentEvents itself.
+    };
+
+    const initialize = async (ws: WSContext): Promise<void> => {
+      const driver = getDriver(agent);
+      if (!driver) {
+        send(ws, { type: 'error', message: `unknown agent: ${agent}` });
+        ws.close(1008, 'unknown agent');
+        return;
+      }
+      const entries = await driver.readHistory(id, { limit: config.historyMaxEntries });
+      console.log(
+        `[bridge] history replay for ${agent}/${id.slice(0, 8)}: ${entries.length} entries`,
+      );
+      send(ws, { type: 'history_replay_start' });
+      for (const entry of entries) send(ws, { type: 'history_entry', entry });
+      send(ws, { type: 'history_replay_end' });
+      await attach(ws);
+
+      // If the desktop owns the session right now, tail its JSONL so the
+      // phone sees the desktop user's new turns in real time. Stops as soon
+      // as the bridge spawns its own claude (see onEvent) or the socket
+      // closes. Only meaningful for claude-code (the other drivers don't
+      // have a JSONL on disk yet).
+      if (agent === 'claude-code' && !session?.alive) {
+        const foreign = await runtime.checkDesktopConflict(agent, id);
+        const located = await driver.findSession(id);
+        if (foreign && foreign.length > 0 && located?.path) {
+          console.log(
+            `[bridge] starting jsonl-tail for ${id.slice(0, 8)} (desktop pids: ${foreign.join(',')})`,
+          );
+          jsonlTail = new JsonlTail({
+            path: located.path,
+            onEntry: (entry) => send(ws, { type: 'history_entry', entry }),
+            onError: (err) => console.log(`[bridge] jsonl-tail error: ${err.message}`),
+          });
+          await jsonlTail.start();
+        }
+      }
     };
 
     return {
-      onOpen: async (_evt, ws) => {
-        try {
-          const driver = getDriver(agent);
-          if (!driver) {
-            send(ws, { type: 'error', message: `unknown agent: ${agent}` });
-            ws.close(1008, 'unknown agent');
-            return;
-          }
-          const entries = await driver.readHistory(id, { limit: config.historyMaxEntries });
-          console.log(
-            `[bridge] history replay for ${agent}/${id.slice(0, 8)}: ${entries.length} entries`,
-          );
-          send(ws, { type: 'history_replay_start' });
-          for (const entry of entries) send(ws, { type: 'history_entry', entry });
-          send(ws, { type: 'history_replay_end' });
-          await attach(ws);
-
-          // If the desktop owns the session right now, tail its JSONL so the
-          // phone sees the desktop user's new turns in real time. Stops as soon
-          // as the bridge spawns its own claude (see onEvent) or the socket
-          // closes. Only meaningful for claude-code (the other drivers don't
-          // have a JSONL on disk yet).
-          if (agent === 'claude-code' && !session?.alive) {
-            const foreign = await runtime.checkDesktopConflict(agent, id);
-            const located = await driver.findSession(id);
-            if (foreign && foreign.length > 0 && located?.path) {
-              console.log(
-                `[bridge] starting jsonl-tail for ${id.slice(0, 8)} (desktop pids: ${foreign.join(',')})`,
-              );
-              jsonlTail = new JsonlTail({
-                path: located.path,
-                onLine: (line) => {
-                  let obj: unknown;
-                  try {
-                    obj = JSON.parse(line);
-                  } catch {
-                    return;
-                  }
-                  const parsed = entryFromRaw(obj);
-                  if (!parsed) return;
-                  for (const entry of parsed) {
-                    send(ws, { type: 'history_entry', entry });
-                  }
-                },
-                onError: (err) => console.log(`[bridge] jsonl-tail error: ${err.message}`),
-              });
-              await jsonlTail.start();
-            }
-          }
-        } catch (err) {
+      onOpen: (_evt, ws) => {
+        readyPromise = initialize(ws).catch((err) => {
           send(ws, { type: 'error', message: (err as Error).message });
           ws.close(1011, 'init failed');
-        }
+        });
       },
       onMessage: async (evt, ws) => {
         let parsed: ClientToServer;
@@ -522,6 +535,17 @@ app.get(
         } catch (err) {
           send(ws, { type: 'error', message: `invalid message: ${(err as Error).message}` });
           return;
+        }
+        // Wait for the open-time history replay + session attach to finish so
+        // fast clients (e.g. the sessions-list one-shot approval) don't get
+        // their first frame dropped because `session` is still null.
+        if (readyPromise) {
+          try {
+            await readyPromise;
+          } catch {
+            // initialize already surfaced the error to the client.
+            return;
+          }
         }
         if (!session) return;
         try {
@@ -556,11 +580,50 @@ app.get(
               break;
             }
             case 'interrupt':
+              if (!session.capabilities().interrupt) {
+                send(ws, { type: 'error', message: 'interrupt not supported by this agent' });
+                break;
+              }
               session.interrupt();
               break;
             case 'set_mode':
-              if (parsed.mode) session.setMode(parsed.mode);
+              if (!parsed.mode) break;
+              if (!session.capabilities().permissionModes?.length || !session.setMode) {
+                send(ws, { type: 'error', message: 'set_mode not supported by this agent' });
+                break;
+              }
+              session.setMode(parsed.mode);
               break;
+            case 'set_model': {
+              const caps = session.capabilities();
+              if (!caps.modelSelection || !session.setModel) {
+                send(ws, { type: 'error', message: 'set_model not supported by this agent' });
+                break;
+              }
+              const available = caps.modelSelection.available;
+              if (available.length > 0 && !available.includes(parsed.model!)) {
+                send(ws, {
+                  type: 'error',
+                  message: `model ${parsed.model} not in agent's available list`,
+                });
+                break;
+              }
+              session.setModel(parsed.model!);
+              break;
+            }
+            case 'rewind_to': {
+              const caps = session.capabilities();
+              if (!caps.fileCheckpointing || !session.rewindTo) {
+                send(ws, { type: 'error', message: 'rewind not supported by this agent' });
+                break;
+              }
+              try {
+                await session.rewindTo(parsed.messageId!);
+              } catch (err) {
+                send(ws, { type: 'error', message: `rewind failed: ${(err as Error).message}` });
+              }
+              break;
+            }
             case 'ping':
               send(ws, { type: 'event', event: { type: 'raw', payload: { pong: true } } });
               break;
@@ -575,12 +638,6 @@ app.get(
           session.subscribers = Math.max(0, session.subscribers - 1);
           if (onEvent) session.off('event', onEvent);
           if (onExit) session.off('exit', onExit);
-        }
-        if (watcherEmitter && onWatcherChange) {
-          watcherEmitter.off('change', onWatcherChange);
-        }
-        if (watchedCwd) {
-          watchers.release(watchedCwd);
         }
         if (jsonlTail) {
           jsonlTail.stop();

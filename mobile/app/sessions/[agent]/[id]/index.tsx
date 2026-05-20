@@ -6,12 +6,17 @@ import { ToolResultCard, ToolUseCard } from '@/components/chat/ToolCard';
 import {
   fetchHistory,
   fetchSessionInfo,
+  forkSession,
   openStream,
   renameSession,
   takeOwnership,
   type ConnectionState,
 } from '@/lib/bridge';
-import { useHydratedSettings } from '@/lib/store';
+import {
+  useHydratedSettings,
+  useSessionCapabilities,
+  useSessionCapabilitiesStore,
+} from '@/lib/store';
 import {
   captureAndUploadPhoto,
   pickAndUploadDocument,
@@ -55,8 +60,8 @@ const SLASH_COMMANDS: SlashCmd[] = [
 ];
 
 type ChatItem =
-  | { id: string; kind: 'user'; text: string; live?: boolean; parentToolUseId?: string }
-  | { id: string; kind: 'assistant'; text: string; live?: boolean; parentToolUseId?: string }
+  | { id: string; kind: 'user'; text: string; live?: boolean; parentToolUseId?: string; messageId?: string }
+  | { id: string; kind: 'assistant'; text: string; live?: boolean; parentToolUseId?: string; messageId?: string }
   | {
       id: string;
       kind: 'tool_use';
@@ -84,12 +89,24 @@ function entryToChatItem(e: HistoryEntry, index: number): ChatItem | null {
     case 'user': {
       const text = extractText(e.content).trim();
       if (!text) return null;
-      return { id: `h-${index}-${e.uuid}`, kind: 'user', text, parentToolUseId: e.parentToolUseId };
+      return {
+        id: `h-${index}-${e.uuid}`,
+        kind: 'user',
+        text,
+        parentToolUseId: e.parentToolUseId,
+        messageId: stripUuidSuffix(e.uuid),
+      };
     }
     case 'assistant': {
       const text = extractText(e.content).trim();
       if (!text) return null;
-      return { id: `h-${index}-${e.uuid}`, kind: 'assistant', text, parentToolUseId: e.parentToolUseId };
+      return {
+        id: `h-${index}-${e.uuid}`,
+        kind: 'assistant',
+        text,
+        parentToolUseId: e.parentToolUseId,
+        messageId: stripUuidSuffix(e.uuid),
+      };
     }
     case 'tool_use':
       return {
@@ -115,6 +132,15 @@ function entryToChatItem(e: HistoryEntry, index: number): ChatItem | null {
     case 'system':
       return null;
   }
+}
+
+/** Bridge replay uuids sometimes have a `:t` (text block) or `:<toolUseId>`
+ *  suffix tacked on so multiple entries from one transcript record stay
+ *  unique. The rewind API wants the original message uuid, so strip the
+ *  first `:` and anything after. */
+function stripUuidSuffix(uuid: string): string {
+  const colon = uuid.indexOf(':');
+  return colon === -1 ? uuid : uuid.slice(0, colon);
 }
 
 function extractText(content: unknown): string {
@@ -157,6 +183,12 @@ const MODE_LABEL: Record<PermissionMode, string> = {
   bypassPermissions: 'bypass',
 };
 
+/** Short label for the chat-header model chip — strips the long anthropic
+ *  prefix so a full ID like `claude-opus-4-7-1m` collapses to `opus-4-7-1m`. */
+function modelDisplay(model: string): string {
+  return model.replace(/^claude-/, '');
+}
+
 const MODE_DESCRIPTION: Record<PermissionMode, string> = {
   default: 'Prompt on every tool use that isn’t allowlisted.',
   acceptEdits: 'Auto-approve file edits; still prompt for bash and other tools.',
@@ -168,6 +200,9 @@ export default function ChatScreen() {
   const { agent, id } = useLocalSearchParams<{ agent: string; id: string }>();
   const settings = useHydratedSettings();
   const t = useTheme();
+  const capabilities = useSessionCapabilities(agent, id);
+  const setCapabilities = useSessionCapabilitiesStore((s) => s.set);
+  const clearCapabilities = useSessionCapabilitiesStore((s) => s.clear);
 
   const headerHeight = useHeaderHeight();
   const [items, setItems] = useState<ChatItem[]>([]);
@@ -194,6 +229,7 @@ export default function ChatScreen() {
   const [pagerIndex, setPagerIndex] = useState(0);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
   const [modePickerOpen, setModePickerOpen] = useState(false);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const listRef = useRef<FlatList<ChatItem>>(null);
   const sending = pendingTurns > 0;
   const stickToBottomRef = useRef(true);
@@ -429,7 +465,13 @@ export default function ChatScreen() {
             setItems((prev) =>
               prev.map((it) =>
                 it.id === buf.id && it.kind === 'assistant'
-                  ? { ...it, text: finalText, live: false, parentToolUseId: ev.parentToolUseId }
+                  ? {
+                      ...it,
+                      text: finalText,
+                      live: false,
+                      parentToolUseId: ev.parentToolUseId,
+                      messageId: ev.messageId ?? it.messageId,
+                    }
                   : it,
               ),
             );
@@ -449,6 +491,7 @@ export default function ChatScreen() {
                 text: trimmed,
                 live: true,
                 parentToolUseId: ev.parentToolUseId,
+                messageId: ev.messageId,
               },
             ]);
           }
@@ -525,6 +568,38 @@ export default function ChatScreen() {
         case 'permission_mode':
           setPermissionMode(ev.mode);
           break;
+        case 'capabilities':
+          setCapabilities(agent, id, ev.capabilities);
+          break;
+        case 'model':
+          // Model chip already re-renders off the capabilities snapshot the
+          // driver re-emits on every `setModel`. Nothing to do per-event.
+          break;
+        case 'rewind': {
+          // Prune every chat item whose messageId comes at-or-after the
+          // rewind target. The bridge already restored the files; surface a
+          // meta row so the user knows the action took effect.
+          const targetId = ev.messageId;
+          setItems((prev) => {
+            const cutIdx = prev.findIndex(
+              (it) =>
+                (it.kind === 'user' || it.kind === 'assistant') && it.messageId === targetId,
+            );
+            const trimmed = cutIdx === -1 ? prev : prev.slice(0, cutIdx);
+            return [
+              ...trimmed,
+              {
+                id: `meta-${Date.now()}`,
+                kind: 'meta',
+                text:
+                  ev.filesAffected.length > 0
+                    ? `Rewound — restored ${ev.filesAffected.length} file${ev.filesAffected.length === 1 ? '' : 's'}`
+                    : 'Rewound to checkpoint',
+              },
+            ];
+          });
+          break;
+        }
         case 'result':
           setPendingTurns((n) => Math.max(0, n - 1));
           if (ev.subtype && ev.subtype !== 'success') {
@@ -548,8 +623,9 @@ export default function ChatScreen() {
     return () => {
       handle.close();
       sendRef.current = null;
+      clearCapabilities(agent, id);
     };
-  }, [settings.baseUrl, settings.token, agent, id]);
+  }, [settings.baseUrl, settings.token, agent, id, setCapabilities, clearCapabilities]);
 
   function onSend() {
     const userText = draft.trim();
@@ -699,6 +775,78 @@ export default function ChatScreen() {
     [settings.baseUrl, settings.token, agent, id],
   );
 
+  const onFork = useCallback(() => {
+    Alert.alert(
+      'Fork this session?',
+      'Creates a copy of the conversation as a new session. The original is unchanged.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Fork',
+          onPress: async () => {
+            try {
+              const res = await forkSession(
+                { baseUrl: settings.baseUrl, token: settings.token },
+                agent,
+                id,
+              );
+              router.replace(`/sessions/${agent}/${res.sessionId}`);
+            } catch (err) {
+              Alert.alert('Fork failed', String((err as Error).message ?? err));
+            }
+          },
+        },
+      ],
+    );
+  }, [settings.baseUrl, settings.token, agent, id]);
+
+  const onHeaderMenu = useCallback(() => {
+    // Single overflow trigger — keeps the native header to one slot instead
+    // of crowding multiple text buttons that clip on smaller devices. The
+    // file-change count rides on the trigger itself ("··· (3)") so the user
+    // still sees there's something to look at without opening the sheet.
+    const diffLabel =
+      changedFiles.size > 0 ? `Open diff (${changedFiles.size} changed)` : 'Open diff';
+    const buttons: Array<{
+      text: string;
+      onPress?: () => void;
+      style?: 'cancel' | 'default' | 'destructive';
+    }> = [
+      { text: diffLabel, onPress: () => router.push(`/sessions/${agent}/${id}/diff`) },
+    ];
+    if (capabilities?.sessionForking) {
+      buttons.push({ text: 'Fork session', onPress: onFork });
+    }
+    buttons.push({ text: 'Cancel', style: 'cancel' });
+    Alert.alert(sessionLabel ?? sessionProject ?? 'Session', undefined, buttons);
+  }, [
+    agent,
+    id,
+    changedFiles.size,
+    capabilities?.sessionForking,
+    sessionLabel,
+    sessionProject,
+    onFork,
+  ]);
+
+  const onRewindRequest = useCallback(
+    (messageId: string) => {
+      Alert.alert(
+        'Rewind to here?',
+        'Restores files to their state right before this turn. Chat history past this point is dropped.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Rewind',
+            style: 'destructive',
+            onPress: () => sendRef.current?.({ type: 'rewind_to', messageId }),
+          },
+        ],
+      );
+    },
+    [],
+  );
+
   function onApprovalDecision(decision: 'allow' | 'allow_always' | 'deny') {
     if (!approval || !sendRef.current) {
       setApproval(null);
@@ -758,11 +906,11 @@ export default function ChatScreen() {
           ),
           headerRight: () => (
             <Pressable
-              onPress={() => router.push(`/sessions/${agent}/${id}/diff`)}
+              onPress={onHeaderMenu}
               hitSlop={8}
-              style={{ paddingHorizontal: 4 }}>
-              <Text style={{ color: t.accent.primary, fontSize: fontSize.lg, fontWeight: '600' }}>
-                {changedFiles.size > 0 ? `Diff (${changedFiles.size})` : 'Diff'}
+              style={{ paddingHorizontal: 8, paddingVertical: 4 }}>
+              <Text style={{ color: t.accent.primary, fontSize: fontSize.xl, fontWeight: '700' }}>
+                {changedFiles.size > 0 ? `··· (${changedFiles.size})` : '···'}
               </Text>
             </Pressable>
           ),
@@ -772,18 +920,75 @@ export default function ChatScreen() {
         <Text style={[styles.statusBarText, { color: t.text.secondary }]} numberOfLines={1}>
           {statusLabel} · {agent} · {id.slice(0, 8)} · {items.length}
         </Text>
-        <Pressable
-          onPress={() => setModePickerOpen((o) => !o)}
-          hitSlop={6}
-          style={[styles.modeChip, { borderColor: t.border.subtle, backgroundColor: t.surface.raised }]}>
-          <Text style={[styles.modeChipLabel, { color: t.accent.primary }]} numberOfLines={1}>
-            mode: {MODE_LABEL[permissionMode]} ▾
-          </Text>
-        </Pressable>
+        <View style={styles.chipRow}>
+          {capabilities?.modelSelection ? (
+            <Pressable
+              onPress={() => setModelPickerOpen((o) => !o)}
+              hitSlop={6}
+              style={[styles.modeChip, { borderColor: t.border.subtle, backgroundColor: t.surface.raised }]}>
+              <Text style={[styles.modeChipLabel, { color: t.accent.primary }]} numberOfLines={1}>
+                model: {modelDisplay(capabilities.modelSelection.current)} ▾
+              </Text>
+            </Pressable>
+          ) : null}
+          {capabilities?.permissionModes && capabilities.permissionModes.length > 0 ? (
+            <Pressable
+              onPress={() => setModePickerOpen((o) => !o)}
+              hitSlop={6}
+              style={[styles.modeChip, { borderColor: t.border.subtle, backgroundColor: t.surface.raised }]}>
+              <Text style={[styles.modeChipLabel, { color: t.accent.primary }]} numberOfLines={1}>
+                mode: {MODE_LABEL[permissionMode]} ▾
+              </Text>
+            </Pressable>
+          ) : null}
+        </View>
       </View>
-      {modePickerOpen ? (
+      {modelPickerOpen && capabilities?.modelSelection ? (
         <View style={[styles.modePicker, { borderBottomColor: t.border.subtle, backgroundColor: t.surface.sunken }]}>
-          {(['default', 'acceptEdits', 'plan', 'bypassPermissions'] as const).map((m) => {
+          {(capabilities.modelSelection.available.length > 0
+            ? capabilities.modelSelection.available
+            : [capabilities.modelSelection.current]
+          ).map((m) => {
+            const active = m === capabilities.modelSelection!.current;
+            return (
+              <Pressable
+                key={m}
+                onPress={() => {
+                  setModelPickerOpen(false);
+                  if (!active) sendRef.current?.({ type: 'set_model', model: m });
+                }}
+                style={({ pressed }) => [
+                  styles.modeOption,
+                  {
+                    backgroundColor: active
+                      ? t.accent.primary
+                      : pressed
+                        ? t.surface.pressed
+                        : t.surface.raised,
+                    borderColor: active ? t.accent.primary : t.border.subtle,
+                  },
+                ]}>
+                <Text
+                  style={[
+                    styles.modeOptionLabel,
+                    { color: active ? t.accent.fg : t.text.primary },
+                  ]}>
+                  {m}
+                </Text>
+              </Pressable>
+            );
+          })}
+          {capabilities.modelSelection.available.length === 0 ? (
+            <Text style={[styles.modeOptionDescription, { color: t.text.secondary }]} numberOfLines={2}>
+              No alternate models advertised. The bridge will accept any model ID the agent honors —
+              tap the chip again to switch back.
+            </Text>
+          ) : null}
+        </View>
+      ) : null}
+      {modePickerOpen && capabilities?.permissionModes ? (
+        <View style={[styles.modePicker, { borderBottomColor: t.border.subtle, backgroundColor: t.surface.sunken }]}>
+          {capabilities.permissionModes.map((m) => {
             const active = m === permissionMode;
             return (
               <Pressable
@@ -882,7 +1087,13 @@ export default function ChatScreen() {
                   ↳ sub-agent
                 </Text>
               ) : null}
-              <ChatRow item={item} onTakeover={onTakeover} />
+              <ChatRow
+                item={item}
+                agent={agent}
+                onTakeover={onTakeover}
+                rewindEnabled={Boolean(capabilities?.fileCheckpointing)}
+                onRewindRequest={onRewindRequest}
+              />
             </View>
           );
         }}
@@ -1030,7 +1241,9 @@ export default function ChatScreen() {
           <Text style={[styles.sendLabel, { color: draft.trim() ? t.accent.fg : t.text.muted }]}>Send</Text>
         </Pressable>
       </View>
-      <ApprovalSheet approval={approval} onDecision={onApprovalDecision} />
+      {capabilities?.permissionPrompts !== false ? (
+        <ApprovalSheet approval={approval} onDecision={onApprovalDecision} />
+      ) : null}
     </KeyboardAvoidingView>
   );
 
@@ -1082,10 +1295,16 @@ function SlashPicker({ draft, onPick }: { draft: string; onPick: (cmd: string) =
 const ChatRow = memo(
   function ChatRow({
     item,
+    agent,
     onTakeover,
+    rewindEnabled,
+    onRewindRequest,
   }: {
     item: ChatItem;
+    agent: string;
     onTakeover: (pendingMessage: string) => void;
+    rewindEnabled: boolean;
+    onRewindRequest: (messageId: string) => void;
   }) {
     const t = useTheme();
 
@@ -1097,14 +1316,20 @@ const ChatRow = memo(
       );
     }
     if (item.kind === 'assistant') {
+      const canRewind = rewindEnabled && Boolean(item.messageId);
       return (
-        <View style={[styles.bubbleAssistant, { backgroundColor: t.bubble.assistantBg }]}>
+        <Pressable
+          onLongPress={() => {
+            if (canRewind && item.messageId) onRewindRequest(item.messageId);
+          }}
+          delayLongPress={450}
+          style={[styles.bubbleAssistant, { backgroundColor: t.bubble.assistantBg }]}>
           <Markdown text={item.text.trim()} color={t.bubble.assistantFg} />
-        </View>
+        </Pressable>
       );
     }
     if (item.kind === 'tool_use') {
-      return <ToolUseCard name={item.name} input={item.input} running={item.running} />;
+      return <ToolUseCard agent={agent} name={item.name} input={item.input} running={item.running} />;
     }
     if (item.kind === 'tool_result') {
       return <ToolResultCard toolUseId={item.toolUseId} content={item.content} isError={item.isError} />;
@@ -1144,6 +1369,9 @@ const ChatRow = memo(
     return null;
   },
   (prev, next) => {
+    if (prev.agent !== next.agent) return false;
+    if (prev.rewindEnabled !== next.rewindEnabled) return false;
+    if (prev.onRewindRequest !== next.onRewindRequest) return false;
     if (prev.onTakeover !== next.onTakeover) return false;
     if (prev.item.id !== next.item.id) return false;
     if (prev.item.kind !== next.item.kind) return false;
@@ -1169,6 +1397,7 @@ const styles = StyleSheet.create({
     gap: space[2],
   },
   statusBarText: { fontSize: fontSize.sm, flexShrink: 1 },
+  chipRow: { flexDirection: 'row', alignItems: 'center', gap: space[1.5] },
   modeChip: {
     paddingHorizontal: space[2],
     paddingVertical: 2,

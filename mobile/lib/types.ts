@@ -67,6 +67,19 @@ export type HistoryEntry =
 
 export type PermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
 
+/** Capability snapshot the bridge publishes on session attach. Mobile mirrors
+ *  it into a per-(agent,sessionId) slice and gates chat-header controls,
+ *  approval surfaces, and rewind/fork actions on the matching field. */
+export interface AgentCapabilities {
+  agent: AgentKind;
+  permissionPrompts: boolean;
+  permissionModes: PermissionMode[] | null;
+  modelSelection: { current: string; available: string[] } | null;
+  fileCheckpointing: boolean;
+  sessionForking: boolean;
+  interrupt: boolean;
+}
+
 export type AgentEvent =
   | { type: 'text'; role: 'assistant' | 'user'; text: string; messageId?: string; parentToolUseId?: string }
   | { type: 'text_delta'; role: 'assistant'; delta: string; messageId?: string; parentToolUseId?: string }
@@ -74,6 +87,9 @@ export type AgentEvent =
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean; parentToolUseId?: string }
   | { type: 'permission_request'; toolUseId: string; tool: string; input: unknown; parentToolUseId?: string }
   | { type: 'permission_mode'; mode: PermissionMode }
+  | { type: 'model'; model: string }
+  | { type: 'rewind'; messageId: string; filesAffected: string[] }
+  | { type: 'capabilities'; capabilities: AgentCapabilities }
   | { type: 'result'; subtype: string; durationMs?: number; usage?: unknown }
   | { type: 'thinking'; text: string; parentToolUseId?: string }
   | { type: 'raw'; payload: unknown };
@@ -90,11 +106,20 @@ export type ServerToClient =
   | { type: 'process_exit'; code: number | null; signal: NodeJS.Signals | null };
 
 export interface ClientToServer {
-  type: 'user_message' | 'approval' | 'interrupt' | 'ping' | 'set_mode';
+  type:
+    | 'user_message'
+    | 'approval'
+    | 'interrupt'
+    | 'ping'
+    | 'set_mode'
+    | 'set_model'
+    | 'rewind_to';
   content?: string;
   toolUseId?: string;
   decision?: 'allow' | 'allow_always' | 'deny';
   mode?: PermissionMode;
+  model?: string;
+  messageId?: string;
 }
 
 export interface DevServerCandidate {

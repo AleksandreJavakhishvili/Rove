@@ -1,4 +1,8 @@
 import {
+  forkSession as sdkForkSession,
+  getSessionInfo as sdkGetSessionInfo,
+  getSessionMessages as sdkGetSessionMessages,
+  listSessions as sdkListSessions,
   query,
   type CanUseTool,
   type Options as SdkOptions,
@@ -6,35 +10,191 @@ import {
   type PermissionResult as SdkPermissionResult,
   type Query as SdkQuery,
   type SDKMessage,
+  type SDKSessionInfo,
   type SDKUserMessage,
+  type SessionMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import { EventEmitter } from 'node:events';
+import { basename } from 'node:path';
+import { existsSync } from 'node:fs';
 import { config } from '../config.ts';
+import { getHeadSha } from '../git.ts';
 import { requestPermissionFromUser } from '../permissions.ts';
-import { ClaudeCodeDriver } from './claudeCode.ts';
-import type { AgentEvent, AgentSession, PermissionMode } from './types.ts';
+import type { HistoryEntry } from '../types.ts';
+import { attributeManySessions, getDesktopPidsForSession } from './desktopPids.ts';
+import {
+  CLAUDE_CODE_AGENT,
+  PERMISSION_MODES,
+  isPermissionMode,
+  type AgentCapabilities,
+  type AgentDriver,
+  type AgentEvent,
+  type AgentSession,
+  type DriverSessionListItem,
+  type PermissionMode,
+  type ReadHistoryOptions,
+} from './types.ts';
 
-const VALID_MODES: PermissionMode[] = ['default', 'acceptEdits', 'plan', 'bypassPermissions'];
+const DEFAULT_PERMISSION_MODE: PermissionMode = 'default';
 
 function envMode(): PermissionMode {
   const raw = process.env.PERMISSION_MODE;
-  return raw && (VALID_MODES as string[]).includes(raw) ? (raw as PermissionMode) : 'default';
+  return isPermissionMode(raw) ? raw : DEFAULT_PERMISSION_MODE;
+}
+
+/** Pull out the timestamp the SDK preserved from the on-disk JSONL entry.
+ *  The SDK's public `SessionMessage` type doesn't surface this field, but the
+ *  runtime value carries it through because the JSONL always has one. */
+function messageTimestamp(msg: SessionMessage): string {
+  const top = (msg as unknown as { timestamp?: unknown }).timestamp;
+  if (typeof top === 'string') return top;
+  const inner = (msg.message as { timestamp?: unknown } | undefined)?.timestamp;
+  if (typeof inner === 'string') return inner;
+  return new Date(0).toISOString();
 }
 
 /**
- * Translate one SDK message frame into our normalized AgentEvent list.
+ * Remap one SDK `SessionMessage` into our normalized `HistoryEntry[]`. Mirrors
+ * the structure of `streamLineToEvents` but produces `HistoryEntry` shapes for
+ * the on-attach replay (not live `AgentEvent`s).
+ */
+function sessionMessageToEntries(msg: SessionMessage): HistoryEntry[] {
+  const ts = messageTimestamp(msg);
+  const uuid = msg.uuid;
+  const parentToolUseId = msg.parent_tool_use_id ?? undefined;
+  const inner = (msg.message ?? {}) as Record<string, unknown> & {
+    role?: string;
+    content?: unknown;
+    model?: string;
+    parentUuid?: string | null;
+  };
+  const parentUuid =
+    (msg as unknown as { parentUuid?: string | null }).parentUuid ??
+    inner.parentUuid ??
+    null;
+
+  if (msg.type === 'user' && inner.role === 'user') {
+    const content = inner.content;
+    if (Array.isArray(content)) {
+      const out: HistoryEntry[] = [];
+      for (const block of content as Array<Record<string, unknown>>) {
+        if (block.type === 'tool_result') {
+          out.push({
+            kind: 'tool_result',
+            uuid: `${uuid}:${block.tool_use_id}`,
+            parentUuid,
+            timestamp: ts,
+            toolUseId: String(block.tool_use_id),
+            content: block.content,
+            isError: Boolean(block.is_error),
+            ...(parentToolUseId ? { parentToolUseId } : {}),
+          });
+        } else if (block.type === 'text') {
+          out.push({
+            kind: 'user',
+            uuid,
+            parentUuid,
+            timestamp: ts,
+            content: block.text,
+            ...(parentToolUseId ? { parentToolUseId } : {}),
+          });
+        }
+      }
+      return out;
+    }
+    return [
+      {
+        kind: 'user',
+        uuid,
+        parentUuid,
+        timestamp: ts,
+        content,
+        ...(parentToolUseId ? { parentToolUseId } : {}),
+      },
+    ];
+  }
+
+  if (msg.type === 'assistant' && inner.role === 'assistant') {
+    const out: HistoryEntry[] = [];
+    const content = inner.content;
+    if (Array.isArray(content)) {
+      for (const block of content as Array<Record<string, unknown>>) {
+        if (block.type === 'text') {
+          out.push({
+            kind: 'assistant',
+            uuid: `${uuid}:t`,
+            parentUuid,
+            timestamp: ts,
+            content: block.text,
+            ...(inner.model ? { model: inner.model } : {}),
+            ...(parentToolUseId ? { parentToolUseId } : {}),
+          });
+        } else if (block.type === 'tool_use') {
+          out.push({
+            kind: 'tool_use',
+            uuid: `${uuid}:${block.id}`,
+            parentUuid,
+            timestamp: ts,
+            name: String(block.name),
+            input: block.input,
+            toolUseId: String(block.id),
+            ...(parentToolUseId ? { parentToolUseId } : {}),
+          });
+        }
+      }
+    } else if (typeof content === 'string') {
+      out.push({
+        kind: 'assistant',
+        uuid,
+        parentUuid,
+        timestamp: ts,
+        content,
+        ...(parentToolUseId ? { parentToolUseId } : {}),
+      });
+    }
+    return out;
+  }
+
+  if (msg.type === 'system') {
+    const subtype =
+      (msg as unknown as { subtype?: string }).subtype ??
+      ((typeof inner === 'object' && (inner as { type?: string }).type) || 'system');
+    return [
+      {
+        kind: 'system',
+        uuid,
+        timestamp: ts,
+        subtype: String(subtype),
+        content: msg.message,
+      },
+    ];
+  }
+  return [];
+}
+
+/**
+ * Translate one SDK live message frame into our normalized AgentEvent list.
  *
  * The SDK preserves the same `{ type, message, ... }` shape as the CLI's
- * stream-json output, so this mapping is intentionally parallel to the one
- * in `claudeCode.ts#streamLineToEvents`. It's duplicated rather than shared so
- * the SDK driver stays self-contained and can be deleted (or the CLI driver
- * can) without dragging the other along.
+ * stream-json output, so the mapping is parallel to the one used during
+ * on-disk history replay (`sessionMessageToEntries`) but produces live
+ * `AgentEvent`s instead of `HistoryEntry`s.
  */
-function sdkMessageToEvents(msg: SDKMessage): AgentEvent[] {
+function sdkMessageToEvents(
+  msg: SDKMessage,
+  onSystemInit?: (info: { model?: string }) => void,
+): AgentEvent[] {
   const obj = msg as Record<string, unknown> & {
     parent_tool_use_id?: string | null;
   };
   const parentToolUseId: string | undefined = obj.parent_tool_use_id ?? undefined;
+
+  if (msg.type === 'system' && (msg as { subtype?: string }).subtype === 'init') {
+    const init = msg as { model?: string };
+    onSystemInit?.({ model: init.model });
+    if (init.model) return [{ type: 'model', model: init.model }];
+    return [];
+  }
 
   if (msg.type === 'assistant') {
     const events: AgentEvent[] = [];
@@ -140,30 +300,32 @@ function sdkMessageToEvents(msg: SDKMessage): AgentEvent[] {
 }
 
 /**
- * SDK-backed session. Mirrors the public surface of the CLI-backed
- * `ClaudeCodeSession` so the rest of the bridge doesn't care which one is in
- * use. Key behavioural differences from the CLI driver:
+ * SDK-backed session. The mobile / WS layer treats this identically to the CLI
+ * session — events flow through `emit('event', ev)` and lifecycle through
+ * `emit('exit', …)` — but the underlying transport is an in-process `Query`
+ * iterator, not a child claude binary.
  *
- *  - `setMode()` uses `Query.setPermissionMode()` — no kill, the conversation
- *    keeps going with the new mode applied to subsequent tool calls.
- *  - `interrupt()` uses `Query.interrupt()` — graceful, the SDK closes out the
- *    current turn cleanly instead of SIGINT'ing a child process.
+ *  - `setMode()` calls `Query.setPermissionMode()` live (no kill).
+ *  - `interrupt()` calls `Query.interrupt()` (graceful — current turn closes).
  *  - There's no `child` process / pid; `alive` tracks whether a Query iterator
  *    is currently running.
  *
- * Auth, session JSONLs and the MCP permission server are identical — the SDK
- * uses the same on-disk session files at `~/.claude/projects/...jsonl` and the
- * same MCP server we spawn for the CLI, so history replay, the permissions
- * registry, and everything downstream keep working unchanged.
+ * Sessions on disk are identical to the CLI's (~/.claude/projects/<slug>/<id>.jsonl)
+ * so takeover-from-desktop and history replay are interoperable byte-for-byte
+ * with the CLI driver.
  */
 class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
-  readonly agent = 'claude-code' as const;
+  readonly agent = CLAUDE_CODE_AGENT;
   readonly sessionId: string;
   readonly cwd: string;
   lastActivity = Date.now();
   subscribers = 0;
   baselineSha: string | null = null;
   permissionMode: PermissionMode = envMode();
+  /** Tracks the model the SDK reports in its `init` system message; '' until
+   *  the first turn so the capabilities snapshot can omit the model picker if
+   *  we never get one. */
+  private currentModel = '';
 
   private q: SdkQuery | null = null;
   private inputQueue: Array<SDKUserMessage | null> = [];
@@ -174,6 +336,24 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
     super();
     this.sessionId = sessionId;
     this.cwd = cwd;
+  }
+
+  capabilities(): AgentCapabilities {
+    return {
+      agent: this.agent,
+      permissionPrompts: true,
+      permissionModes: PERMISSION_MODES,
+      // `available` stays empty until Phase 3 wires the discovery; mobile
+      // hides the picker when the list is empty, the chip stays visible
+      // because `current` is non-empty as soon as the SDK reports one.
+      modelSelection: this.currentModel
+        ? { current: this.currentModel, available: [] }
+        : null,
+      fileCheckpointing: true,
+      sessionForking: true,
+      interrupt: true,
+      nativeFileChanges: true,
+    };
   }
 
   get pid(): number | undefined {
@@ -197,13 +377,39 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       cwd: this.cwd,
       resume: this.sessionId,
       permissionMode: this.permissionMode as SdkPermissionMode,
-      // In-process permission gate — replaces the MCP permission server we
-      // use on the CLI path. Routes through the shared `permissions` registry
-      // so the sessions-list approval UI and the in-chat ApprovalSheet keep
-      // working with no protocol changes.
+      // In-process permission gate — no MCP subprocess. Routes through the
+      // shared `permissions` registry so the sessions-list approval UI and
+      // the in-chat ApprovalSheet keep working unchanged.
       canUseTool: this.makeCanUseTool(),
       allowedTools: safeAutoAllow,
       includePartialMessages: true,
+      // Enables `Query.rewindFiles()` — without this the SDK won't snapshot
+      // file state between turns and rewind requests come back canRewind:false.
+      enableFileCheckpointing: true,
+      // SDK-side file-change feed. The hook fires when the agent (or its
+      // sandboxed tools) write to the project tree — the only thing the
+      // mobile files-changed pane needs to stay live.
+      hooks: {
+        FileChanged: [
+          {
+            hooks: [
+              async (input) => {
+                if ((input as { hook_event_name?: string }).hook_event_name !== 'FileChanged') {
+                  return {};
+                }
+                const fc = input as {
+                  file_path?: string;
+                  event?: 'change' | 'add' | 'unlink';
+                };
+                if (typeof fc.file_path === 'string' && fc.event) {
+                  this.emit('event', { type: 'file_changed', path: fc.file_path, op: fc.event });
+                }
+                return {};
+              },
+            ],
+          },
+        ],
+      },
       env: { ...process.env, ROVE_BRIDGE: '1' },
       allowDangerouslySkipPermissions: this.permissionMode === 'bypassPermissions',
       pathToClaudeCodeExecutable: config.claudeBin,
@@ -212,15 +418,23 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
     this.q = query({ prompt: this.userMessageStream(), options });
     this.lastActivity = Date.now();
     console.log(`[claude-sdk ${this.sessionId.slice(0, 8)}] query started cwd=${this.cwd}`);
+
+    // Capture git baseline lazily on first spawn so the diff endpoint can show
+    // "everything this session changed."
+    if (!this.baselineSha) {
+      getHeadSha(this.cwd).then((sha) => {
+        this.baselineSha = sha;
+      });
+    }
+
     void this.driveQuery();
   }
 
   /**
    * Build the `canUseTool` callback the SDK calls before each tool execution.
-   * Defers to the shared `requestPermissionFromUser` orchestration so the
-   * MCP-backed CLI path and this SDK path stay byte-identical from the user's
-   * perspective (chat ApprovalSheet, sessions-list chip, allow_always rule
-   * persistence). Only the transport differs.
+   * Defers to `requestPermissionFromUser` so the chat ApprovalSheet, sessions-
+   * list chip, and allow-always rule persistence stay byte-identical with the
+   * legacy CLI/MCP path from the user's perspective.
    */
   private makeCanUseTool(): CanUseTool {
     return async (toolName, input, opts) => {
@@ -235,10 +449,14 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
           emitSessionEvent: (ev) => this.emit('event', ev),
         });
         if (res.behavior === 'allow') {
-          return {
+          const result: SdkPermissionResult = {
             behavior: 'allow',
             updatedInput: (res.updatedInput as Record<string, unknown>) ?? input,
-          } satisfies SdkPermissionResult;
+          };
+          if (res.updatedPermissions && res.updatedPermissions.length > 0) {
+            result.updatedPermissions = res.updatedPermissions;
+          }
+          return result;
         }
         return {
           behavior: 'deny',
@@ -284,7 +502,15 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
     try {
       for await (const msg of q) {
         this.lastActivity = Date.now();
-        for (const ev of sdkMessageToEvents(msg)) this.emit('event', ev);
+        const events = sdkMessageToEvents(msg, ({ model }) => {
+          if (model && model !== this.currentModel) {
+            this.currentModel = model;
+            // Re-emit capabilities so the mobile chip refreshes the moment
+            // we learn what model the SDK is using.
+            this.emit('event', { type: 'capabilities', capabilities: this.capabilities() });
+          }
+        });
+        for (const ev of events) this.emit('event', ev);
       }
     } catch (err) {
       console.error(`[claude-sdk ${this.sessionId.slice(0, 8)}] query threw:`, err);
@@ -311,9 +537,8 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
   }
 
   sendApproval(_toolUseId: string, _decision: 'allow' | 'allow_always' | 'deny'): void {
-    // The SDK driver uses the same MCP permission server as the CLI driver,
-    // so approvals already flow through `permissions.resolve()` in the WS
-    // handler. There's no legacy stdin path to fall back to.
+    // No-op for the SDK path — `canUseTool` is the gate and the WS handler
+    // resolves it via `permissions.resolve()`. There's no stdin to write to.
   }
 
   interrupt(): boolean {
@@ -325,7 +550,7 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
   }
 
   setMode(mode: PermissionMode): void {
-    if (!(VALID_MODES as string[]).includes(mode)) return;
+    if (!isPermissionMode(mode)) return;
     if (this.permissionMode === mode) {
       this.emit('event', { type: 'permission_mode', mode });
       return;
@@ -341,6 +566,41 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
     }
   }
 
+  async rewindTo(messageId: string): Promise<{ messageId: string; filesAffected: string[] }> {
+    if (!this.q) throw new Error('session not running — cannot rewind');
+    const res = await this.q.rewindFiles(messageId);
+    if (!res.canRewind) {
+      throw new Error(res.error ?? 'rewind not possible at this checkpoint');
+    }
+    const filesAffected = res.filesChanged ?? [];
+    this.emit('event', { type: 'rewind', messageId, filesAffected });
+    return { messageId, filesAffected };
+  }
+
+  async fork(opts?: { atMessage?: string }): Promise<{ sessionId: string }> {
+    return sdkForkSession(this.sessionId, {
+      ...(opts?.atMessage ? { upToMessageId: opts.atMessage } : {}),
+      ...(this.cwd ? { dir: this.cwd } : {}),
+    });
+  }
+
+  setModel(model: string): void {
+    if (!model || model === this.currentModel) return;
+    this.currentModel = model;
+    // Mirror onto the per-session subscribers immediately so the mobile chip
+    // updates without waiting for the SDK's next init frame. We also re-emit
+    // the full capability snapshot so the picker's "selectable" list refreshes
+    // if it ever changes (it's static today; will matter once `available`
+    // gets populated from a discovery source).
+    this.emit('event', { type: 'model', model });
+    this.emit('event', { type: 'capabilities', capabilities: this.capabilities() });
+    if (this.q) {
+      this.q.setModel(model).catch((err) => {
+        console.error(`[claude-sdk ${this.sessionId.slice(0, 8)}] setModel failed:`, err);
+      });
+    }
+  }
+
   shutdown(): void {
     if (!this.q) return;
     this.q.interrupt().catch(() => undefined);
@@ -350,18 +610,132 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
 }
 
 /**
- * Drop-in replacement for `ClaudeCodeDriver` backed by the Claude Agent SDK.
- * Session-list / history / available checks are inherited from the CLI driver
- * because both speak the exact same on-disk format (`~/.claude/projects/`).
- * Only `createSession` is swapped, so flipping driver via env var is a pure
- * runtime swap — no schema or sessions-list differences.
+ * Translate one `SDKSessionInfo` into our wire shape. The SDK guarantees `cwd`
+ * for sessions that came from a local-filesystem store (which is our case); we
+ * fall back to an empty cwd just to keep the type honest.
  */
-export class ClaudeCodeSdkDriver extends ClaudeCodeDriver {
-  // displayName intentionally inherits from the parent ('Claude Code'). The
-  // mobile + sessions list key off `kind`, not display name, and we want users
-  // to see the same label regardless of which transport is in use.
+function sdkSessionToListItem(
+  info: SDKSessionInfo,
+  desktopPids: number[],
+): DriverSessionListItem {
+  const cwd = info.cwd ?? '';
+  return {
+    id: info.sessionId,
+    cwd,
+    projectName: cwd ? basename(cwd) : info.sessionId,
+    lastModified: info.lastModified,
+    preview: (info.firstPrompt ?? info.summary ?? '').slice(0, 200),
+    sizeBytes: info.fileSize ?? 0,
+    desktopPids,
+  };
+}
 
-  override createSession(id: string, cwd: string): AgentSession {
+/**
+ * Claude-code driver, fully SDK-backed. Session reads (`listSessions`,
+ * `findSession`, `readHistory`) delegate to the SDK's session-management
+ * functions; we keep zero hand-rolled JSONL parsing on the bridge side. The
+ * only non-SDK helper is `desktopPids.ts` (ps-scan) because the SDK can't see
+ * processes it didn't spawn.
+ */
+export class ClaudeCodeSdkDriver implements AgentDriver {
+  readonly kind = CLAUDE_CODE_AGENT;
+  readonly displayName = 'Claude Code';
+
+  async isAvailable(): Promise<boolean> {
+    // The SDK reads from the on-disk projects dir. If it doesn't exist, there
+    // are no sessions and most likely claude has never run on this host.
+    return existsSync(config.projectsDir);
+  }
+
+  async listSessions(): Promise<DriverSessionListItem[]> {
+    let sdkSessions: SDKSessionInfo[];
+    try {
+      sdkSessions = await sdkListSessions();
+    } catch (err) {
+      console.error('[claude-sdk] listSessions failed:', (err as Error).message);
+      return [];
+    }
+    const items = sdkSessions
+      .filter((s) => Boolean(s.cwd))
+      .map((s) => ({ id: s.sessionId, cwd: s.cwd!, lastModified: s.lastModified }));
+    const desktopByid = await attributeManySessions(items);
+    const out = sdkSessions.map((s) =>
+      sdkSessionToListItem(s, desktopByid.get(s.sessionId) ?? []),
+    );
+    out.sort((a, b) => b.lastModified - a.lastModified);
+    return out;
+  }
+
+  async findSession(id: string): Promise<{ cwd: string; path?: string } | null> {
+    let info: SDKSessionInfo | undefined;
+    try {
+      info = await sdkGetSessionInfo(id);
+    } catch (err) {
+      console.error(`[claude-sdk] getSessionInfo(${id.slice(0, 8)}) failed:`, (err as Error).message);
+      return null;
+    }
+    if (!info) return null;
+    return { cwd: info.cwd ?? '' };
+  }
+
+  async readHistory(id: string, opts: ReadHistoryOptions = {}): Promise<HistoryEntry[]> {
+    const limit = opts.limit ?? 100;
+    let messages: SessionMessage[];
+    try {
+      messages = await sdkGetSessionMessages(id);
+    } catch (err) {
+      console.error(`[claude-sdk] getSessionMessages(${id.slice(0, 8)}) failed:`, (err as Error).message);
+      return [];
+    }
+    const entries: HistoryEntry[] = [];
+    for (const msg of messages) {
+      for (const e of sessionMessageToEntries(msg)) {
+        if (opts.before && e.timestamp >= opts.before) continue;
+        entries.push(e);
+      }
+    }
+    // Oldest-first; clients render newest-at-bottom from the tail.
+    return entries.length > limit ? entries.slice(-limit) : entries;
+  }
+
+  async getDesktopPids(id: string): Promise<number[]> {
+    let info: SDKSessionInfo | undefined;
+    try {
+      info = await sdkGetSessionInfo(id);
+    } catch {
+      return [];
+    }
+    if (!info?.cwd) return [];
+
+    // "Most recent in cwd" — re-list sessions for that directory so the
+    // attribution heuristic matches a no-resume desktop claude correctly.
+    let siblings: SDKSessionInfo[] = [];
+    try {
+      siblings = await sdkListSessions({ dir: info.cwd });
+    } catch {
+      siblings = [info];
+    }
+    let bestId = id;
+    let bestTime = 0;
+    for (const s of siblings) {
+      if (s.lastModified > bestTime) {
+        bestTime = s.lastModified;
+        bestId = s.sessionId;
+      }
+    }
+    return getDesktopPidsForSession({
+      sessionId: id,
+      cwd: info.cwd,
+      isMostRecentInCwd: bestId === id,
+    });
+  }
+
+  createSession(id: string, cwd: string): AgentSession {
     return new ClaudeCodeSdkSession(id, cwd);
+  }
+
+  /** Fork the session via the SDK. Returns the new session id. */
+  async forkSession(id: string, opts?: { upToMessageId?: string }): Promise<{ sessionId: string }> {
+    return sdkForkSession(id, opts);
   }
 }

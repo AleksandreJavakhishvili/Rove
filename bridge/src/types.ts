@@ -1,4 +1,4 @@
-import type { AgentEvent, AgentKind } from './agents/types.ts';
+import type { AgentEvent, AgentKind, PermissionMode } from './agents/types.ts';
 
 export type SessionStatus = 'idle' | 'live-bridge' | 'live-desktop';
 
@@ -27,11 +27,20 @@ export type HistoryEntry =
   | { kind: 'system'; uuid: string; timestamp: string; subtype: string; content?: unknown };
 
 export interface ClientToServer {
-  type: 'user_message' | 'approval' | 'interrupt' | 'ping' | 'set_mode';
+  type:
+    | 'user_message'
+    | 'approval'
+    | 'interrupt'
+    | 'ping'
+    | 'set_mode'
+    | 'set_model'
+    | 'rewind_to';
   content?: string;
   toolUseId?: string;
   decision?: 'allow' | 'allow_always' | 'deny';
-  mode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
+  mode?: PermissionMode;
+  model?: string;
+  messageId?: string;
 }
 
 export type ServerToClient =

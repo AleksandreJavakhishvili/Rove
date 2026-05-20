@@ -1,5 +1,5 @@
-import { ClaudeCodeDriver } from './claudeCode.ts';
 import { ClaudeCodeSdkDriver } from './claudeCodeSdk.ts';
+import { StubAgentDriver } from './stubAgent.ts';
 import type { AgentDriver, AgentKind, AgentMetadata, DriverSessionListItem } from './types.ts';
 
 const drivers = new Map<AgentKind, AgentDriver>();
@@ -8,16 +8,21 @@ function register(driver: AgentDriver): void {
   drivers.set(driver.kind, driver);
 }
 
-// Pick the claude-code driver implementation: CLI (default) or SDK (opt-in).
-// CLAUDE_DRIVER=sdk swaps to the @anthropic-ai/claude-agent-sdk-backed driver
-// — same sessions, same auth, but runtime mode/interrupt control (no process
-// kill on mode change). Set CLAUDE_DRIVER=cli or leave unset for the original.
-const useSdk = (process.env.CLAUDE_DRIVER ?? '').toLowerCase() === 'sdk';
-if (useSdk) {
-  console.log('[registry] claude-code driver: SDK (@anthropic-ai/claude-agent-sdk)');
-  register(new ClaudeCodeSdkDriver());
-} else {
-  register(new ClaudeCodeDriver());
+const STUB_AGENT_ENV = 'STUB_AGENT';
+
+// The SDK is the only claude-code transport — in-process via
+// `@anthropic-ai/claude-agent-sdk` (no spawn, no MCP subprocess, live mode/
+// model swap, native rewind/fork, FileChanged hook).
+register(new ClaudeCodeSdkDriver());
+
+// Multi-agent regression fixture. Opt-in (no impact on production builds) —
+// when enabled, registers a stub agent with a deliberately different
+// capability profile so the mobile UI can be exercised against an agent that
+// has no permission prompts, no mode picker, no model selection, no rewind,
+// no fork.
+if ((process.env[STUB_AGENT_ENV] ?? '') === '1') {
+  console.log(`[registry] stub agent enabled (${STUB_AGENT_ENV}=1)`);
+  register(new StubAgentDriver());
 }
 
 export function getDriver(kind: AgentKind): AgentDriver | undefined {

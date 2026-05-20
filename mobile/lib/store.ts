@@ -6,6 +6,7 @@ import {
 import KV from './kv';
 import { useEffect } from 'react';
 import { create } from 'zustand';
+import type { AgentCapabilities, AgentKind } from './types';
 
 interface Settings {
   baseUrl: string;
@@ -255,6 +256,47 @@ export const usePendingPermissions = create<PendingPermissionsStore>((set, get) 
     });
   },
 }));
+
+// ─── Session capabilities (per-session, populated from WS `capabilities` frames) ─
+
+interface CapabilitiesState {
+  byKey: Record<string, AgentCapabilities>;
+}
+
+interface CapabilitiesActions {
+  set(agent: AgentKind, sessionId: string, caps: AgentCapabilities): void;
+  clear(agent: AgentKind, sessionId: string): void;
+}
+
+type CapabilitiesStore = CapabilitiesState & CapabilitiesActions;
+
+function capsKey(agent: string, sessionId: string): string {
+  return `${agent}:${sessionId}`;
+}
+
+export const useSessionCapabilitiesStore = create<CapabilitiesStore>((set) => ({
+  byKey: {},
+  set(agent, sessionId, caps) {
+    set((s) => ({ byKey: { ...s.byKey, [capsKey(agent, sessionId)]: caps } }));
+  },
+  clear(agent, sessionId) {
+    set((s) => {
+      const next = { ...s.byKey };
+      delete next[capsKey(agent, sessionId)];
+      return { byKey: next };
+    });
+  },
+}));
+
+/** Read-only convenience hook for the current per-session capabilities snapshot.
+ *  Returns `null` until the bridge has sent its first `capabilities` frame; the
+ *  caller hides every capability-gated control while null to avoid a flicker. */
+export function useSessionCapabilities(
+  agent: AgentKind,
+  sessionId: string,
+): AgentCapabilities | null {
+  return useSessionCapabilitiesStore((s) => s.byKey[capsKey(agent, sessionId)] ?? null);
+}
 
 /** Hook that starts the stream once settings are hydrated. Mount this once at
  *  the app root so the connection survives navigation. */

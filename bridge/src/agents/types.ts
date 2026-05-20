@@ -2,7 +2,27 @@ import type { HistoryEntry } from '../types.ts';
 
 export type AgentKind = 'claude-code' | 'codex' | 'aider' | (string & {});
 
+/**
+ * The agent kind exposed to mobile + storage for the Claude Code driver.
+ * Kept as a named const so the literal isn't duplicated across every place
+ * that needs to refer to "this is a claude-code session" (driver kind,
+ * AgentSession.agent field, registry key, etc.).
+ */
+export const CLAUDE_CODE_AGENT: AgentKind = 'claude-code';
+
 export type PermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
+
+/** Canonical, ordered list of permission modes the claude-code agent supports. */
+export const PERMISSION_MODES = [
+  'default',
+  'acceptEdits',
+  'plan',
+  'bypassPermissions',
+] as const satisfies readonly PermissionMode[];
+
+export function isPermissionMode(value: unknown): value is PermissionMode {
+  return typeof value === 'string' && (PERMISSION_MODES as readonly string[]).includes(value);
+}
 
 export interface AgentMetadata {
   kind: AgentKind;
@@ -25,6 +45,36 @@ export interface DriverSessionListItem {
 }
 
 /**
+ * Capability snapshot a session publishes on attach. The mobile app uses this
+ * to decide which controls to render (mode chip, model chip, rewind action,
+ * approval surfaces…). Drivers leave optional methods undefined when the
+ * matching capability is false; the server only invokes them when the
+ * capability says it's safe.
+ */
+export interface AgentCapabilities {
+  /** Agent identifier — used by mobile to pick the right tool card pack. */
+  agent: AgentKind;
+  /** Does this agent ever prompt the user for tool permission? */
+  permissionPrompts: boolean;
+  /** Permission modes the agent supports; null/empty → no mode picker. */
+  permissionModes: readonly PermissionMode[] | null;
+  /** Current model + selectable models; null → no model picker. */
+  modelSelection: { current: string; available: readonly string[] } | null;
+  /** Per-message file-checkpoint restore (Query.rewindFiles). */
+  fileCheckpointing: boolean;
+  /** Branch the session into a new one at a given point (forkSession). */
+  sessionForking: boolean;
+  /** Graceful interrupt of the current turn. */
+  interrupt: boolean;
+  /**
+   * Driver emits `file_changed` AgentEvents itself (typically via an in-
+   * process hook). Required by the server today — there's no other file-
+   * watch fallback — so drivers that can't surface this should not register.
+   */
+  nativeFileChanges?: boolean;
+}
+
+/**
  * Normalized live-event shape that all drivers must emit. The mobile app
  * speaks AgentEvent only; per-agent details get wrapped in `raw` if they
  * don't map cleanly to one of the structured kinds.
@@ -36,6 +86,10 @@ export type AgentEvent =
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean; parentToolUseId?: string }
   | { type: 'permission_request'; toolUseId: string; tool: string; input: unknown; parentToolUseId?: string }
   | { type: 'permission_mode'; mode: PermissionMode }
+  | { type: 'model'; model: string }
+  | { type: 'rewind'; messageId: string; filesAffected: string[] }
+  | { type: 'capabilities'; capabilities: AgentCapabilities }
+  | { type: 'file_changed'; path: string; op: 'add' | 'change' | 'unlink' }
   | { type: 'result'; subtype: string; durationMs?: number; usage?: unknown }
   | { type: 'thinking'; text: string; parentToolUseId?: string }
   | { type: 'raw'; payload: unknown };
@@ -65,11 +119,18 @@ export interface AgentSession {
   emit<K extends keyof SessionLifecycleListeners>(event: K, ...args: Parameters<SessionLifecycleListeners[K]>): boolean;
   sendUserMessage(content: string): void;
   sendApproval(toolUseId: string, decision: 'allow' | 'allow_always' | 'deny'): void;
-  /** Update the permission mode for future spawns; kills the live child so the next message respawns with the new mode. */
-  setMode(mode: PermissionMode): void;
   interrupt(): boolean;
   shutdown(): void;
   spawnIfNeeded(): void;
+  /** Snapshot of what this session supports right now. */
+  capabilities(): AgentCapabilities;
+  // Optional control methods. Drivers leave them undefined when the matching
+  // capability is false; the server only invokes them when capability says
+  // it's safe.
+  setMode?(mode: PermissionMode): void;
+  setModel?(model: string): void;
+  rewindTo?(messageId: string): Promise<{ messageId: string; filesAffected: string[] }>;
+  fork?(opts?: { atMessage?: string }): Promise<{ sessionId: string }>;
 }
 
 export interface ReadHistoryOptions {

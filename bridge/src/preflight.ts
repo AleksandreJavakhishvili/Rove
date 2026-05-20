@@ -18,7 +18,8 @@ async function getFdLimit(): Promise<number | null> {
 
 /**
  * Runs once at startup. Prints warnings (and remediation) for known footguns:
- * - macOS default 256 file descriptors (causes spawn EBADF when chokidar watches a big repo).
+ * - macOS default 256 file descriptors (Node spawn / SDK hooks hit EBADF on
+ *   larger repos otherwise).
  * - `claude` binary not on PATH.
  */
 export async function preflight(claudeBin: string): Promise<void> {
@@ -26,7 +27,7 @@ export async function preflight(claudeBin: string): Promise<void> {
   if (limit !== null && limit < 4096) {
     console.log('━'.repeat(60));
     console.log(`[preflight] FD limit is low: ulimit -n = ${limit}`);
-    console.log('  Chokidar + Node spawn will hit EBADF on bigger projects.');
+    console.log('  Node spawn + SDK file hooks may hit EBADF on bigger projects.');
     console.log('  Fix in this shell:');
     console.log('    ulimit -n 8192');
     console.log('  Permanent (zsh): add the same line to ~/.zshrc');

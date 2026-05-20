@@ -238,6 +238,29 @@ export async function takeOwnership(
   return res.json();
 }
 
+/** Fork a session via the bridge. Returns the new session ID. */
+export async function forkSession(
+  cfg: BridgeConfig,
+  agent: AgentKind,
+  id: string,
+  opts?: { atMessage?: string },
+): Promise<{ ok: true; sessionId: string }> {
+  const res = await fetchWithTimeout(
+    `${cfg.baseUrl}/sessions/${encodeURIComponent(agent)}/${id}/fork`,
+    {
+      method: 'POST',
+      headers: { ...authHeaders(cfg), 'content-type': 'application/json' },
+      body: JSON.stringify(opts ?? {}),
+    },
+    15000,
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`/fork → ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
 export type ConnectionState = 'connecting' | 'open' | 'closing' | 'closed' | 'error';
 
 export interface StreamHandle {
