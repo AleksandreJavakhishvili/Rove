@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
@@ -37,7 +38,32 @@ interface Pending {
    *  a rule to that session's `.claude/settings.local.json`. */
   tool: string;
   cwd: string | null;
+  agent: string;
+  sessionId: string;
+  toolUseId: string;
+  createdAt: number;
 }
+
+/** Snapshot of a pending permission, safe to broadcast to clients. */
+export interface PendingPermissionSnapshot {
+  agent: string;
+  sessionId: string;
+  toolUseId: string;
+  tool: string;
+  input: unknown;
+  cwd: string | null;
+  createdAt: number;
+}
+
+export type PermissionEvent =
+  | { type: 'permission_added'; pending: PendingPermissionSnapshot }
+  | {
+      type: 'permission_resolved';
+      agent: string;
+      sessionId: string;
+      toolUseId: string;
+      decision: 'allow' | 'allow_always' | 'deny' | 'timeout';
+    };
 
 /**
  * Derive a `.claude/settings.local.json` permission rule from a tool invocation.
@@ -99,12 +125,31 @@ async function appendAllowRule(cwd: string, rule: string): Promise<void> {
   await writeFile(file, JSON.stringify(data, null, 2) + '\n', 'utf8');
 }
 
-class PermissionRegistry {
+class PermissionRegistry extends EventEmitter {
   private pendingByKey = new Map<string, Pending>();
   private internalTokenValue: string;
 
   constructor() {
+    super();
     this.internalTokenValue = randomUUID();
+  }
+
+  /** Snapshot of every pending permission across all sessions. */
+  list(): PendingPermissionSnapshot[] {
+    return Array.from(this.pendingByKey.values()).map((p) => ({
+      agent: p.agent,
+      sessionId: p.sessionId,
+      toolUseId: p.toolUseId,
+      tool: p.tool,
+      input: p.input,
+      cwd: p.cwd,
+      createdAt: p.createdAt,
+    }));
+  }
+
+  onChange(listener: (e: PermissionEvent) => void): () => void {
+    this.on('change', listener as (...args: unknown[]) => void);
+    return () => this.off('change', listener as (...args: unknown[]) => void);
   }
 
   /** Token shared between bridge and the MCP permission server it spawns. */
@@ -129,11 +174,43 @@ class PermissionRegistry {
   ): Promise<PermissionResponse> {
     return new Promise<PermissionResponse>((resolve, reject) => {
       const k = this.key(agent, sessionId, req.toolUseId);
+      const createdAt = Date.now();
       const timer = setTimeout(() => {
         this.pendingByKey.delete(k);
+        this.emit('change', {
+          type: 'permission_resolved',
+          agent,
+          sessionId,
+          toolUseId: req.toolUseId,
+          decision: 'timeout',
+        } satisfies PermissionEvent);
         reject(new Error(`permission_prompt timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pendingByKey.set(k, { resolve, reject, timer, input: req.input, tool: req.tool, cwd });
+      const pending: Pending = {
+        resolve,
+        reject,
+        timer,
+        input: req.input,
+        tool: req.tool,
+        cwd,
+        agent,
+        sessionId,
+        toolUseId: req.toolUseId,
+        createdAt,
+      };
+      this.pendingByKey.set(k, pending);
+      this.emit('change', {
+        type: 'permission_added',
+        pending: {
+          agent,
+          sessionId,
+          toolUseId: req.toolUseId,
+          tool: req.tool,
+          input: req.input,
+          cwd,
+          createdAt,
+        },
+      } satisfies PermissionEvent);
     });
   }
 
@@ -164,6 +241,13 @@ class PermissionRegistry {
         });
       }
     }
+    this.emit('change', {
+      type: 'permission_resolved',
+      agent,
+      sessionId,
+      toolUseId,
+      decision,
+    } satisfies PermissionEvent);
     return true;
   }
 

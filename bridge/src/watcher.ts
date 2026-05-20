@@ -8,7 +8,7 @@ interface WatcherEvents {
   change: (info: FileChange) => void;
 }
 
-const IGNORE = /(^|[\\/])(node_modules|\.git|\.next|dist|build|\.turbo|\.cache|\.vercel|target|coverage|\.expo|ios\/build|android\/build|Pods|DerivedData|out|\.parcel-cache|\.svelte-kit|\.idea|\.vscode|__pycache__|\.venv|venv|env|\.pytest_cache|.mypy_cache)([\\/]|$)/;
+const IGNORE = /(^|[\\/])(node_modules|\.git|\.next|dist|build|\.turbo|\.cache|\.vercel|target|coverage|\.expo|ios\/build|android\/build|Pods|DerivedData|out|\.parcel-cache|\.svelte-kit|\.idea|\.vscode|__pycache__|\.venv|venv|env|\.pytest_cache|.mypy_cache|\.anchor|test-ledger)([\\/]|$)/;
 
 const WATCH_DEPTH = Number(process.env.WATCHER_DEPTH ?? 4);
 const USE_POLLING = process.env.WATCHER_POLLING === '1';
@@ -38,7 +38,14 @@ class WatcherRegistry extends EventEmitter {
       watcher.on('add', (path) => emitter.emit('change', { op: 'add', path, rel: relToCwd(cwd, path) } satisfies FileChange));
       watcher.on('change', (path) => emitter.emit('change', { op: 'change', path, rel: relToCwd(cwd, path) } satisfies FileChange));
       watcher.on('unlink', (path) => emitter.emit('change', { op: 'unlink', path, rel: relToCwd(cwd, path) } satisfies FileChange));
-      watcher.on('error', (err) => console.error(`[watcher ${cwd}]`, err));
+      watcher.on('error', (err) => {
+        // fs.watch on macOS throws UNKNOWN (errno -102) for non-regular files
+        // like Unix sockets / FIFOs (e.g. Solana's `admin.rpc`). Drop those so
+        // they don't spam the bridge log on every session open.
+        const e = err as NodeJS.ErrnoException;
+        if (e?.code === 'UNKNOWN' || e?.errno === -102) return;
+        console.error(`[watcher ${cwd}]`, err);
+      });
       entry = { watcher, refCount: 0, emitter };
       this.watchers.set(cwd, entry);
     }

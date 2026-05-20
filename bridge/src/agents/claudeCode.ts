@@ -11,7 +11,13 @@ import { attributeClaudePids, getLiveClaudes } from '../lsof.ts';
 import { getMcpConfig } from '../permissions.ts';
 import { runtime } from '../runtime.ts';
 import type { HistoryEntry } from '../types.ts';
-import type { AgentDriver, AgentEvent, AgentSession, DriverSessionListItem } from './types.ts';
+import type {
+  AgentDriver,
+  AgentEvent,
+  AgentSession,
+  DriverSessionListItem,
+  PermissionMode,
+} from './types.ts';
 
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
 
@@ -232,6 +238,13 @@ function streamLineToEvents(obj: any): AgentEvent[] {
   return [{ type: 'raw', payload: obj }];
 }
 
+const VALID_MODES: PermissionMode[] = ['default', 'acceptEdits', 'plan', 'bypassPermissions'];
+
+function envMode(): PermissionMode {
+  const raw = process.env.PERMISSION_MODE;
+  return raw && (VALID_MODES as string[]).includes(raw) ? (raw as PermissionMode) : 'default';
+}
+
 class ClaudeCodeSession extends EventEmitter implements AgentSession {
   readonly agent = 'claude-code' as const;
   readonly sessionId: string;
@@ -240,6 +253,7 @@ class ClaudeCodeSession extends EventEmitter implements AgentSession {
   lastActivity = Date.now();
   subscribers = 0;
   baselineSha: string | null = null;
+  permissionMode: PermissionMode = envMode();
 
   constructor(sessionId: string, cwd: string) {
     super();
@@ -275,7 +289,7 @@ class ClaudeCodeSession extends EventEmitter implements AgentSession {
       '--include-partial-messages',
       '--replay-user-messages',
       '--permission-mode',
-      process.env.PERMISSION_MODE ?? 'default',
+      this.permissionMode,
       '--allowedTools',
       safeAutoAllow,
       '--mcp-config',
@@ -376,6 +390,24 @@ class ClaudeCodeSession extends EventEmitter implements AgentSession {
       return true;
     }
     return false;
+  }
+
+  setMode(mode: PermissionMode): void {
+    if (!(VALID_MODES as string[]).includes(mode)) return;
+    if (this.permissionMode === mode) {
+      // Re-emit so a new client subscriber sees the current value.
+      this.emit('event', { type: 'permission_mode', mode });
+      return;
+    }
+    this.permissionMode = mode;
+    // Surface the new mode to subscribers before respawning so the UI updates
+    // even if the next spawn is delayed (no pending user message yet).
+    this.emit('event', { type: 'permission_mode', mode });
+    // Kill the running child so the next user message respawns with the new
+    // --permission-mode arg. Claude CLI doesn't accept a runtime mode swap.
+    if (this.child && this.alive) {
+      this.child.kill('SIGTERM');
+    }
   }
 
   shutdown(): void {

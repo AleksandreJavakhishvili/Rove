@@ -27,10 +27,11 @@ export type HistoryEntry =
   | { kind: 'system'; uuid: string; timestamp: string; subtype: string; content?: unknown };
 
 export interface ClientToServer {
-  type: 'user_message' | 'approval' | 'interrupt' | 'ping';
+  type: 'user_message' | 'approval' | 'interrupt' | 'ping' | 'set_mode';
   content?: string;
   toolUseId?: string;
   decision?: 'allow' | 'allow_always' | 'deny';
+  mode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
 }
 
 export type ServerToClient =

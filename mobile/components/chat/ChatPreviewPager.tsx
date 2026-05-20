@@ -52,9 +52,19 @@ export function ChatPreviewPager({ chat, preview, onIndexChange }: Props) {
 
   const setIndex = (i: number) => setActiveIndex(i);
 
+  // Direction the pan can activate in depends on which page is visible. On
+  // chat we only accept LEFT swipes (chat → preview); a right swipe is the
+  // iOS back-edge gesture and must be left alone, otherwise it never reaches
+  // the navigator. On preview we only accept RIGHT swipes (preview → chat).
+  // activeOffsetX uses a very large outer bound to effectively disable that
+  // direction (RNGH doesn't accept Infinity).
+  const HUGE = 100_000;
+  const activeOffsetX: [number, number] =
+    activeIndex === 0 ? [-14, HUGE] : [-HUGE, 14];
+
   const pan = Gesture.Pan()
     .enabled(!keyboardVisible)
-    .activeOffsetX([-14, 14])
+    .activeOffsetX(activeOffsetX)
     .failOffsetY([-12, 12])
     .onChange((e) => {
       'worklet';

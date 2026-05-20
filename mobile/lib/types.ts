@@ -65,12 +65,15 @@ export type HistoryEntry =
     }
   | { kind: 'system'; uuid: string; timestamp: string; subtype: string; content?: unknown };
 
+export type PermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
+
 export type AgentEvent =
   | { type: 'text'; role: 'assistant' | 'user'; text: string; messageId?: string; parentToolUseId?: string }
   | { type: 'text_delta'; role: 'assistant'; delta: string; messageId?: string; parentToolUseId?: string }
   | { type: 'tool_use'; toolUseId: string; name: string; input: unknown; parentToolUseId?: string }
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean; parentToolUseId?: string }
   | { type: 'permission_request'; toolUseId: string; tool: string; input: unknown; parentToolUseId?: string }
+  | { type: 'permission_mode'; mode: PermissionMode }
   | { type: 'result'; subtype: string; durationMs?: number; usage?: unknown }
   | { type: 'thinking'; text: string; parentToolUseId?: string }
   | { type: 'raw'; payload: unknown };
@@ -87,10 +90,11 @@ export type ServerToClient =
   | { type: 'process_exit'; code: number | null; signal: NodeJS.Signals | null };
 
 export interface ClientToServer {
-  type: 'user_message' | 'approval' | 'interrupt' | 'ping';
+  type: 'user_message' | 'approval' | 'interrupt' | 'ping' | 'set_mode';
   content?: string;
   toolUseId?: string;
   decision?: 'allow' | 'allow_always' | 'deny';
+  mode?: PermissionMode;
 }
 
 export interface DevServerCandidate {

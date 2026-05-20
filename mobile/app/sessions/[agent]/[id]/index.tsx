@@ -18,7 +18,7 @@ import {
   pickAndUploadImage,
   type UploadResult,
 } from '@/lib/uploads';
-import type { AgentEvent, HistoryEntry, SessionStatus } from '@/lib/types';
+import type { AgentEvent, HistoryEntry, PermissionMode, SessionStatus } from '@/lib/types';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
@@ -150,6 +150,20 @@ function opStyle(op: 'add' | 'change' | 'unlink', t: Theme): { color: string; sy
   return { color: t.op.change, symbol: 'M' };
 }
 
+const MODE_LABEL: Record<PermissionMode, string> = {
+  default: 'default',
+  acceptEdits: 'auto-accept edits',
+  plan: 'plan',
+  bypassPermissions: 'bypass',
+};
+
+const MODE_DESCRIPTION: Record<PermissionMode, string> = {
+  default: 'Prompt on every tool use that isn’t allowlisted.',
+  acceptEdits: 'Auto-approve file edits; still prompt for bash and other tools.',
+  plan: 'Read-only; Claude proposes a plan instead of acting.',
+  bypassPermissions: 'Skip every prompt. Use with care.',
+};
+
 export default function ChatScreen() {
   const { agent, id } = useLocalSearchParams<{ agent: string; id: string }>();
   const settings = useHydratedSettings();
@@ -178,6 +192,8 @@ export default function ChatScreen() {
   // suppress the navigator's back-swipe, otherwise iOS' edge gesture captures
   // a right-swipe and pops to /sessions instead of returning to chat.
   const [pagerIndex, setPagerIndex] = useState(0);
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
+  const [modePickerOpen, setModePickerOpen] = useState(false);
   const listRef = useRef<FlatList<ChatItem>>(null);
   const sending = pendingTurns > 0;
   const stickToBottomRef = useRef(true);
@@ -506,6 +522,9 @@ export default function ChatScreen() {
         case 'permission_request':
           setApproval({ toolUseId: ev.toolUseId, tool: ev.tool, input: ev.input });
           break;
+        case 'permission_mode':
+          setPermissionMode(ev.mode);
+          break;
         case 'result':
           setPendingTurns((n) => Math.max(0, n - 1));
           if (ev.subtype && ev.subtype !== 'success') {
@@ -753,7 +772,59 @@ export default function ChatScreen() {
         <Text style={[styles.statusBarText, { color: t.text.secondary }]} numberOfLines={1}>
           {statusLabel} · {agent} · {id.slice(0, 8)} · {items.length}
         </Text>
+        <Pressable
+          onPress={() => setModePickerOpen((o) => !o)}
+          hitSlop={6}
+          style={[styles.modeChip, { borderColor: t.border.subtle, backgroundColor: t.surface.raised }]}>
+          <Text style={[styles.modeChipLabel, { color: t.accent.primary }]} numberOfLines={1}>
+            mode: {MODE_LABEL[permissionMode]} ▾
+          </Text>
+        </Pressable>
       </View>
+      {modePickerOpen ? (
+        <View style={[styles.modePicker, { borderBottomColor: t.border.subtle, backgroundColor: t.surface.sunken }]}>
+          {(['default', 'acceptEdits', 'plan', 'bypassPermissions'] as const).map((m) => {
+            const active = m === permissionMode;
+            return (
+              <Pressable
+                key={m}
+                onPress={() => {
+                  setModePickerOpen(false);
+                  if (m !== permissionMode) {
+                    sendRef.current?.({ type: 'set_mode', mode: m });
+                  }
+                }}
+                style={({ pressed }) => [
+                  styles.modeOption,
+                  {
+                    backgroundColor: active
+                      ? t.accent.primary
+                      : pressed
+                        ? t.surface.pressed
+                        : t.surface.raised,
+                    borderColor: active ? t.accent.primary : t.border.subtle,
+                  },
+                ]}>
+                <Text
+                  style={[
+                    styles.modeOptionLabel,
+                    { color: active ? t.accent.fg : t.text.primary },
+                  ]}>
+                  {MODE_LABEL[m]}
+                </Text>
+                <Text
+                  style={[
+                    styles.modeOptionDescription,
+                    { color: active ? t.accent.fg : t.text.secondary },
+                  ]}
+                  numberOfLines={2}>
+                  {MODE_DESCRIPTION[m]}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      ) : null}
       {changedFiles.size > 0 ? (
         <View style={[styles.filesPane, { borderBottomColor: t.border.subtle }]}>
           <Pressable onPress={() => setFilesPaneOpen((o) => !o)} style={styles.filesPaneHeader}>
@@ -1092,8 +1163,34 @@ const styles = StyleSheet.create({
     paddingVertical: space[1.5],
     paddingHorizontal: space[3],
     borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: space[2],
   },
-  statusBarText: { fontSize: fontSize.sm },
+  statusBarText: { fontSize: fontSize.sm, flexShrink: 1 },
+  modeChip: {
+    paddingHorizontal: space[2],
+    paddingVertical: 2,
+    borderRadius: radius.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  modeChipLabel: { fontSize: fontSize.xs, fontWeight: '600' },
+  modePicker: {
+    paddingHorizontal: space[3],
+    paddingVertical: space[2],
+    gap: space[1.5],
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  modeOption: {
+    paddingHorizontal: space[3],
+    paddingVertical: space[2],
+    borderRadius: radius.lg,
+    borderWidth: StyleSheet.hairlineWidth,
+    gap: 2,
+  },
+  modeOptionLabel: { fontSize: fontSize.base, fontWeight: '700' },
+  modeOptionDescription: { fontSize: fontSize.sm },
   bubbleUser: {
     alignSelf: 'flex-end',
     maxWidth: '85%',

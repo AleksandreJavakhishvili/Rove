@@ -115,6 +115,8 @@ app.delete('/devices', async (c) => {
 
 app.get('/devices', async (c) => c.json({ devices: await devices.list() }));
 
+app.get('/permissions/pending', (c) => c.json({ pending: permissions.list() }));
+
 app.get('/sessions', async (c) => {
   const ourPids = runtime.livePids();
   const raw = await listAllSessions();
@@ -412,6 +414,10 @@ const clientSchema = z.discriminatedUnion('type', [
   }),
   z.object({ type: z.literal('interrupt') }),
   z.object({ type: z.literal('ping') }),
+  z.object({
+    type: z.literal('set_mode'),
+    mode: z.enum(['default', 'acceptEdits', 'plan', 'bypassPermissions']),
+  }),
 ]);
 
 app.get(
@@ -432,6 +438,9 @@ app.get(
       session = await runtime.getOrCreate(agent, id);
       session.subscribers += 1;
       send(ws, { type: 'status', status: session.alive ? 'live-bridge' : 'idle', pid: session.pid });
+      // Tell the new subscriber what permission mode the session is in. The
+      // bridge is the source of truth; the mobile client just mirrors this.
+      send(ws, { type: 'event', event: { type: 'permission_mode', mode: session.permissionMode } });
       let eventCount = 0;
       onEvent = (e: AgentEvent) => {
         eventCount += 1;
@@ -555,6 +564,9 @@ app.get(
             case 'interrupt':
               session.interrupt();
               break;
+            case 'set_mode':
+              if (parsed.mode) session.setMode(parsed.mode);
+              break;
             case 'ping':
               send(ws, { type: 'event', event: { type: 'raw', payload: { pong: true } } });
               break;
@@ -595,6 +607,49 @@ function send(ws: WSContext, msg: ServerToClient): void {
     // socket likely closing
   }
 }
+
+/**
+ * Bridge-wide event stream. Lets the sessions list (and any other ambient UI)
+ * observe permission requests across every running session without having to
+ * subscribe to each session's /stream individually. On attach we send the
+ * current snapshot so the client hydrates immediately.
+ */
+app.get(
+  '/events',
+  upgradeWebSocket(() => {
+    let off: (() => void) | null = null;
+    return {
+      onOpen: (_evt, ws) => {
+        // Snapshot first; live updates after.
+        try {
+          ws.send(
+            JSON.stringify({
+              type: 'permissions_snapshot',
+              pending: permissions.list(),
+            }),
+          );
+        } catch {
+          // socket likely closing
+        }
+        off = permissions.onChange((e) => {
+          try {
+            ws.send(JSON.stringify(e));
+          } catch {
+            // socket likely closing
+          }
+        });
+      },
+      onClose: () => {
+        off?.();
+        off = null;
+      },
+      onError: () => {
+        off?.();
+        off = null;
+      },
+    };
+  }),
+);
 
 /**
  * Resolve the bind interface. Order:

@@ -314,3 +314,113 @@ export function openStream(
     state: () => state,
   };
 }
+
+export interface PendingPermissionSnapshot {
+  agent: AgentKind;
+  sessionId: string;
+  toolUseId: string;
+  tool: string;
+  input: unknown;
+  cwd: string | null;
+  createdAt: number;
+}
+
+export type PermissionEvent =
+  | { type: 'permissions_snapshot'; pending: PendingPermissionSnapshot[] }
+  | { type: 'permission_added'; pending: PendingPermissionSnapshot }
+  | {
+      type: 'permission_resolved';
+      agent: AgentKind;
+      sessionId: string;
+      toolUseId: string;
+      decision: 'allow' | 'allow_always' | 'deny' | 'timeout';
+    };
+
+export async function fetchPendingPermissions(
+  cfg: BridgeConfig,
+): Promise<PendingPermissionSnapshot[]> {
+  const res = await fetch(`${cfg.baseUrl}/permissions/pending`, {
+    headers: cfg.token ? { Authorization: `Bearer ${cfg.token}` } : undefined,
+  });
+  if (!res.ok) throw new Error(`fetchPendingPermissions: ${res.status} ${await res.text()}`);
+  const j = (await res.json()) as { pending: PendingPermissionSnapshot[] };
+  return j.pending;
+}
+
+/**
+ * Subscribes to bridge-wide events (currently: permission added / resolved
+ * across all sessions). The sessions list uses this to badge rows with pending
+ * approvals without having to open one WS per session.
+ */
+export function openEventsStream(
+  cfg: BridgeConfig,
+  onMessage: (msg: PermissionEvent) => void,
+): { close(): void } {
+  const wsUrl = cfg.baseUrl.replace(/^http(s?)/i, 'ws$1').replace(/\/+$/, '');
+  const tokenParam = cfg.token ? `?token=${encodeURIComponent(cfg.token)}` : '';
+  const fullUrl = `${wsUrl}/events${tokenParam}`;
+  let socket: WebSocket | null = new WebSocket(fullUrl);
+  socket.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(typeof evt.data === 'string' ? evt.data : '') as PermissionEvent;
+      onMessage(msg);
+    } catch (err) {
+      console.warn('[bridge events] invalid frame', err);
+    }
+  };
+  socket.onerror = (evt) => {
+    console.log('[bridge events] error', (evt as any)?.message ?? evt);
+  };
+  return {
+    close() {
+      if (socket) {
+        try {
+          socket.close();
+        } catch {
+          // ignore
+        }
+        socket = null;
+      }
+    },
+  };
+}
+
+/**
+ * One-shot helper: open the per-session WS just long enough to deliver an
+ * approval decision, then close. Used by the sessions list so a decision can be
+ * applied without navigating into the chat.
+ */
+export function sendApproval(
+  cfg: BridgeConfig,
+  agent: AgentKind,
+  sessionId: string,
+  toolUseId: string,
+  decision: 'allow' | 'allow_always' | 'deny',
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const handle = openStream(cfg, agent, sessionId, {
+      onMessage: () => undefined,
+      onStateChange: (state) => {
+        if (state === 'open') {
+          try {
+            handle.send({ type: 'approval', toolUseId, decision });
+            // Give the bridge a moment to forward, then close.
+            setTimeout(() => {
+              handle.close();
+              resolve();
+            }, 50);
+          } catch (err) {
+            handle.close();
+            reject(err as Error);
+          }
+        } else if (state === 'error' || state === 'closed') {
+          // Only reject if we never reached `open`.
+        }
+      },
+    });
+    setTimeout(() => {
+      handle.close();
+      reject(new Error('approval send timed out'));
+    }, 5_000);
+  });
+}

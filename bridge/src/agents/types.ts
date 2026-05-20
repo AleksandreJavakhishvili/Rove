@@ -2,6 +2,8 @@ import type { HistoryEntry } from '../types.ts';
 
 export type AgentKind = 'claude-code' | 'codex' | 'aider' | (string & {});
 
+export type PermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
+
 export interface AgentMetadata {
   kind: AgentKind;
   displayName: string;
@@ -33,6 +35,7 @@ export type AgentEvent =
   | { type: 'tool_use'; toolUseId: string; name: string; input: unknown; parentToolUseId?: string }
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean; parentToolUseId?: string }
   | { type: 'permission_request'; toolUseId: string; tool: string; input: unknown; parentToolUseId?: string }
+  | { type: 'permission_mode'; mode: PermissionMode }
   | { type: 'result'; subtype: string; durationMs?: number; usage?: unknown }
   | { type: 'thinking'; text: string; parentToolUseId?: string }
   | { type: 'raw'; payload: unknown };
@@ -52,6 +55,8 @@ export interface AgentSession {
   readonly pid: number | undefined;
   /** Git HEAD captured the first time the session was spawned (or null when cwd isn't a git repo). */
   baselineSha: string | null;
+  /** Current permission mode passed to the agent on spawn. */
+  permissionMode: PermissionMode;
   subscribers: number;
   lastActivity: number;
   on<K extends keyof SessionLifecycleListeners>(event: K, listener: SessionLifecycleListeners[K]): this;
@@ -60,6 +65,8 @@ export interface AgentSession {
   emit<K extends keyof SessionLifecycleListeners>(event: K, ...args: Parameters<SessionLifecycleListeners[K]>): boolean;
   sendUserMessage(content: string): void;
   sendApproval(toolUseId: string, decision: 'allow' | 'allow_always' | 'deny'): void;
+  /** Update the permission mode for future spawns; kills the live child so the next message respawns with the new mode. */
+  setMode(mode: PermissionMode): void;
   interrupt(): boolean;
   shutdown(): void;
   spawnIfNeeded(): void;
