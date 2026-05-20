@@ -1,12 +1,10 @@
 import {
-  fetchPendingPermissions,
   fetchSessions,
-  openEventsStream,
   renameSession,
   sendApproval,
   type PendingPermissionSnapshot,
 } from '@/lib/bridge';
-import { useHydratedSettings } from '@/lib/store';
+import { useHydratedSettings, usePendingPermissions } from '@/lib/store';
 import type { SessionListItem } from '@/lib/types';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
 import { router } from 'expo-router';
@@ -21,8 +19,6 @@ import {
   Text,
   View,
 } from 'react-native';
-
-type PendingMap = Record<string, PendingPermissionSnapshot[]>;
 
 function pendingKey(agent: string, sessionId: string): string {
   return `${agent}:${sessionId}`;
@@ -78,7 +74,10 @@ export default function SessionsScreen() {
   const [sessions, setSessions] = useState<SessionListItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [pending, setPending] = useState<PendingMap>({});
+  // Pending approvals are kept in a global store so the WS survives navigation
+  // and we don't miss events fired while the user is inside a chat.
+  const pending = usePendingPermissions((s) => s.byKey);
+  const removePending = usePendingPermissions((s) => s.removeOne);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState<Set<string>>(new Set());
 
@@ -97,57 +96,6 @@ export default function SessionsScreen() {
   useEffect(() => {
     if (settings.hydrated && settings.baseUrl) void load();
   }, [settings.hydrated, settings.baseUrl, load]);
-
-  // Hydrate pending approvals + subscribe to the bridge-wide event stream so we
-  // can badge rows the moment a session asks for permission, without having to
-  // open a per-session WS for every visible row.
-  useEffect(() => {
-    if (!settings.hydrated || !settings.baseUrl) return;
-    let cancelled = false;
-    fetchPendingPermissions({ baseUrl: settings.baseUrl, token: settings.token })
-      .then((list) => {
-        if (cancelled) return;
-        const next: PendingMap = {};
-        for (const p of list) {
-          const k = pendingKey(p.agent, p.sessionId);
-          (next[k] ??= []).push(p);
-        }
-        setPending(next);
-      })
-      .catch((err) => console.warn('[sessions] pending hydrate failed', err));
-    const stream = openEventsStream(
-      { baseUrl: settings.baseUrl, token: settings.token },
-      (msg) => {
-        if (msg.type === 'permissions_snapshot') {
-          const next: PendingMap = {};
-          for (const p of msg.pending) {
-            const k = pendingKey(p.agent, p.sessionId);
-            (next[k] ??= []).push(p);
-          }
-          setPending(next);
-        } else if (msg.type === 'permission_added') {
-          const k = pendingKey(msg.pending.agent, msg.pending.sessionId);
-          setPending((prev) => ({
-            ...prev,
-            [k]: [...(prev[k] ?? []), msg.pending],
-          }));
-        } else if (msg.type === 'permission_resolved') {
-          const k = pendingKey(msg.agent, msg.sessionId);
-          setPending((prev) => {
-            const list = (prev[k] ?? []).filter((p) => p.toolUseId !== msg.toolUseId);
-            const copy = { ...prev };
-            if (list.length === 0) delete copy[k];
-            else copy[k] = list;
-            return copy;
-          });
-        }
-      },
-    );
-    return () => {
-      cancelled = true;
-      stream.close();
-    };
-  }, [settings.hydrated, settings.baseUrl, settings.token]);
 
   const decide = useCallback(
     async (
@@ -168,8 +116,10 @@ export default function SessionsScreen() {
           p.toolUseId,
           decision,
         );
-        // The bridge will broadcast permission_resolved which clears the entry;
-        // no need to optimistically drop it here.
+        // Drop locally as well — the bridge's permission_resolved echo will
+        // confirm shortly, but the user shouldn't see a stale chip in the
+        // meantime.
+        removePending(p.agent, p.sessionId, p.toolUseId);
       } catch (err) {
         Alert.alert('Approval failed', String((err as Error).message ?? err));
       } finally {

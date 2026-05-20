@@ -2,7 +2,14 @@
   "name": "rove-bridge",
   "version": "0.1.0",
   "description": "Rove — control your local coding agents from your phone over Tailscale. Bridge daemon that runs alongside the agent CLI on your desktop.",
-  "keywords": ["claude", "claude-code", "tailscale", "mobile", "agent", "rove"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "tailscale",
+    "mobile",
+    "agent",
+    "rove"
+  ],
   "author": "Ako Javakhishvili",
   "license": "MIT",
   "homepage": "https://github.com/<your-handle>/rove",
@@ -21,6 +28,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.145",
     "@hono/node-server": "^1.13.0",
     "@hono/node-ws": "^1.0.0",
     "@modelcontextprotocol/sdk": "^1.29.0",

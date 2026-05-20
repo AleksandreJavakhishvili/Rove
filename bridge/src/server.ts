@@ -16,7 +16,7 @@ import { readScopedFile, relToCwd } from './files.ts';
 import { JsonlTail } from './jsonlTail.ts';
 import { getDiff } from './git.ts';
 import { inspectPid } from './lsof.ts';
-import { permissions } from './permissions.ts';
+import { permissions, requestPermissionFromUser } from './permissions.ts';
 import { preflight } from './preflight.ts';
 import { printConnectionQR } from './qr.ts';
 import { runtime } from './runtime.ts';
@@ -51,23 +51,17 @@ app.post('/internal/permission', async (c) => {
     return c.json({ behavior: 'deny', message: 'missing fields' }, 400);
   }
   console.log(`[bridge] permission_prompt for ${agent}/${sessionId.slice(0, 8)} tool=${tool}`);
-  // Forward to the WS subscribers.
   const session = runtime.get(agent, sessionId);
-  if (session) {
-    session.emit('event', {
-      type: 'permission_request',
+  try {
+    const decision = await requestPermissionFromUser({
+      agent,
+      sessionId,
+      cwd: session?.cwd ?? null,
       toolUseId: toolUseId ?? '',
       tool,
       input,
+      emitSessionEvent: session ? (ev) => session.emit('event', ev) : null,
     });
-  }
-  try {
-    const decision = await permissions.await(
-      agent,
-      sessionId,
-      { toolUseId: toolUseId ?? '', tool, input },
-      session?.cwd ?? null,
-    );
     console.log(`[bridge] permission decision: ${decision.behavior}`);
     return c.json(decision);
   } catch (err) {

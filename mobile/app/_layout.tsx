@@ -5,6 +5,7 @@ import { Platform } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
 
+import { useEnsurePendingPermissionsStream } from '@/lib/store';
 import { useWebBootstrap } from '@/lib/web-bootstrap';
 import { useTheme } from '@/theme';
 
@@ -19,6 +20,9 @@ export default function RootLayout() {
   const t = useTheme();
   const isDark = t.scheme === 'dark';
   useWebBootstrap();
+  // Keep the bridge-wide events stream alive as long as the app is mounted, so
+  // permission requests fired while the user is inside a chat are not lost.
+  useEnsurePendingPermissionsStream();
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>

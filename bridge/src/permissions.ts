@@ -258,6 +258,46 @@ class PermissionRegistry extends EventEmitter {
 
 export const permissions = new PermissionRegistry();
 
+/**
+ * Single source of truth for "ask the user to approve a tool call". Both the
+ * CLI driver (via the /internal/permission endpoint that the MCP server hits)
+ * and the SDK driver (via `canUseTool`) call this so the orchestration —
+ * emitting the per-session `permission_request` event for the ApprovalSheet,
+ * adding to the registry so the sessions-list chip lights up, awaiting the
+ * user's decision — lives in exactly one place.
+ *
+ * `emitSessionEvent` is the per-session AgentEvent emitter (typically
+ * `session.emit.bind(session, 'event')`). Pass `null` when there's no session
+ * to notify (e.g. internal automation paths) — the registry-side broadcast on
+ * /events still fires.
+ */
+export interface RequestPermissionParams {
+  agent: string;
+  sessionId: string;
+  cwd: string | null;
+  toolUseId: string;
+  tool: string;
+  input: unknown;
+  emitSessionEvent: ((event: { type: 'permission_request'; toolUseId: string; tool: string; input: unknown }) => void) | null;
+}
+
+export async function requestPermissionFromUser(
+  params: RequestPermissionParams,
+): Promise<PermissionResponse> {
+  params.emitSessionEvent?.({
+    type: 'permission_request',
+    toolUseId: params.toolUseId,
+    tool: params.tool,
+    input: params.input,
+  });
+  return permissions.await(
+    params.agent,
+    params.sessionId,
+    { toolUseId: params.toolUseId, tool: params.tool, input: params.input },
+    params.cwd,
+  );
+}
+
 export function getMcpConfig(extraEnv?: Record<string, string>): string {
   // Inline MCP config — claude will spawn the permission server with these env vars.
   // Absolute paths so claude (whose cwd is the session's project dir) can find them.
