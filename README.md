@@ -14,7 +14,8 @@
 </p>
 
 <p align="center">
-  <a href="#quickstart"><strong>Quickstart →</strong></a> &nbsp;·&nbsp;
+  <a href="https://aleksandrejavakhishvili.github.io/Rove/"><strong>Try the web client →</strong></a> &nbsp;·&nbsp;
+  <a href="#quickstart"><strong>Quickstart</strong></a> &nbsp;·&nbsp;
   <a href="#why"><strong>Why</strong></a> &nbsp;·&nbsp;
   <a href="#live-preview"><strong>Live preview</strong></a> &nbsp;·&nbsp;
   <a href="#comparison-with-similar-projects"><strong>vs. Happy</strong></a>
@@ -35,10 +36,10 @@
 
 `rove` is two pieces you self-host on your own machines:
 
-1. A **bridge** — tiny Node.js server you run alongside `claude` on your desktop. Speaks the CLI's headless protocol and exposes each session over HTTP + WebSocket on your tailnet.
-2. A **mobile app** (Expo / React Native) — reads session history, sends prompts, streams tool calls + diffs as they happen, surfaces approval prompts as bottom sheets, and previews the dev server your agent is editing in a WebView right next to the chat.
+1. A **bridge** — tiny Node.js server you run alongside `claude` on your desktop. Drives Claude Code in-process via `@anthropic-ai/claude-agent-sdk` and exposes each session over HTTP + WebSocket on your tailnet.
+2. A **client** — either the **Expo / React Native mobile app**, or the [hosted web client](https://aleksandrejavakhishvili.github.io/Rove/) running from your browser. Both read session history, stream tool calls + diffs as they happen, surface approval prompts as bottom sheets, and preview the dev server your agent is editing right next to the chat.
 
-Your laptop runs the agent. Your phone is the editor surface. Tailscale is the network. Nothing in between.
+Your laptop runs the agent. Your phone (or browser) is the editor surface. Tailscale is the network. Nothing in between.
 
 ## Why
 
@@ -52,21 +53,21 @@ Early. Works end-to-end with Claude Code today; Codex / Aider / Gemini drivers a
 
 ```
 ┌────────────────────┐                          ┌────────────────────────────────────┐
-│ Phone (Expo RN)    │                          │ Your desktop                       │
-│                    │                          │                                    │
-│  - Sessions list   │   Tailscale tunnel       │  bridge (Hono + WebSocket)         │
-│  - Chat view       ├──── HTTPS / WSS ────────►│   ├─ /sessions  /sessions/:agent/  │
-│  - File / diff     │                          │   ├─ spawns claude -p as needed    │
-│  - Approval sheets │                          │   ├─ chokidar (file changes)       │
+│ Phone (Expo RN) or │                          │ Your desktop                       │
+│ browser (web)      │                          │                                    │
+│                    │   Tailscale tunnel       │  bridge (Hono + WebSocket)         │
+│  - Sessions list   ├──── HTTPS / WSS ────────►│   ├─ /sessions  /sessions/:agent/  │
+│  - Chat view       │                          │   ├─ @anthropic-ai/claude-agent-sdk│
+│  - File / diff     │                          │   ├─ canUseTool → permission gate  │
+│  - Approval sheets │                          │   ├─ FileChanged hook (file events)│
 │                    │                          │   └─ git diff helpers              │
 └────────────────────┘                          │                                    │
-                                                │  claude CLI (authenticated)        │
                                                 │  ~/.claude/projects/.../*.jsonl    │
                                                 │  your repositories                 │
                                                 └────────────────────────────────────┘
 ```
 
-Sessions live as JSONL files in `~/.claude/projects/`. The bridge spawns `claude -p --resume <id>` per turn, streams normalized events over WebSocket, and forwards approval requests through an MCP permission-prompt tool back to the phone.
+Sessions live as JSONL files in `~/.claude/projects/`. The bridge runs Claude Code in-process via the agent SDK, streams normalized events over WebSocket, and forwards approval requests through the SDK's `canUseTool` callback straight to your phone — no subprocess hop, no separate MCP server.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full picture and [`docs/WIRE_PROTOCOL.md`](docs/WIRE_PROTOCOL.md) for the event schema.
 
@@ -137,20 +138,21 @@ In the app: **Settings → Scan QR from the bridge** → point camera at the QR 
 ├── bridge/                 # Node.js bridge that runs alongside claude on your desktop
 │   ├── src/
 │   │   ├── server.ts       # Hono HTTP + WebSocket server
-│   │   ├── runtime.ts      # Per-session subprocess manager
-│   │   ├── agents/         # AgentDriver interface + ClaudeCodeDriver
-│   │   ├── mcp/            # MCP permission-prompt server (spawned by claude)
+│   │   ├── runtime.ts      # Per-session lifecycle manager
+│   │   ├── agents/         # AgentDriver interface + SDK-backed Claude Code driver
+│   │   ├── permissions.ts  # Cross-session approval registry (canUseTool → user)
 │   │   ├── tailscale.ts    # Tailscale detection
 │   │   └── ...
 │   ├── bin/                # CLI entry (for npx rove-bridge)
 │   └── SETUP.md            # Deployment modes
-├── mobile/                 # Expo React Native app
+├── mobile/                 # Expo React Native + web app
 │   ├── app/                # Expo Router screens
 │   ├── components/         # Chat UI, markdown, code blocks, scanner
 │   └── lib/                # Transport, store, types
 └── docs/
     ├── ARCHITECTURE.md
-    └── WIRE_PROTOCOL.md
+    ├── WIRE_PROTOCOL.md
+    └── web-client-setup.md # Pointing the live web client at your bridge
 ```
 
 ## Production builds

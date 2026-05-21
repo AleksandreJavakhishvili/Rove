@@ -76,7 +76,7 @@ Goal: every push to `main` rebuilds and republishes the site.
 - [ ] **Manual one-time:** enable GitHub Pages in repo Settings → Pages → Source = "GitHub Actions". Document in PR description
 - [ ] Verify the workflow turns green on first push
 - [ ] Visit the published URL; confirm landing loads, "Launch web app" navigates to `/app/`, asset paths resolve
-- [ ] Add "Try the web client →" link to `README.md`
+- [x] Add "Try the web client →" link to `README.md`
 
 **Definition of done — Phase 5:** ⚙️ (code shipped; live verification pending)
 - Workflow file exists and references `cd web && pnpm build` correctly.
