@@ -26,18 +26,52 @@ import type { HistoryEntry } from '../types.ts';
 import { attributeManySessions, getDesktopPidsForSession } from './desktopPids.ts';
 import {
   CLAUDE_CODE_AGENT,
+  COMPACT_TRIGGER,
   PERMISSION_MODES,
+  SDK_RUN_STATUS,
   isPermissionMode,
   type AgentCapabilities,
   type AgentDriver,
   type AgentEvent,
   type AgentSession,
+  type CompactResult,
+  type CompactTrigger,
   type DriverSessionListItem,
   type PermissionMode,
   type ReadHistoryOptions,
+  type SdkRunStatus,
 } from './types.ts';
 
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'default';
+
+/**
+ * `type` discriminator values for SDK frames we care about. The SDK doesn't
+ * export string constants for these — the values come from the public
+ * `SDKMessage` discriminated-union literals — but we want them named so a
+ * typo silently dropping a frame is impossible.
+ */
+const SDK_MESSAGE_TYPE = {
+  system: 'system',
+  assistant: 'assistant',
+  user: 'user',
+  streamEvent: 'stream_event',
+  result: 'result',
+} as const;
+
+/**
+ * `subtype` discriminator values for `system` frames we translate into
+ * AgentEvents. Each one is the literal the SDK ships in `SDKSystemMessage`,
+ * `SDKStatusMessage`, `SDKCompactBoundaryMessage`, etc.
+ */
+const SDK_SYSTEM_SUBTYPE = {
+  init: 'init',
+  status: 'status',
+  compactBoundary: 'compact_boundary',
+  localCommandOutput: 'local_command_output',
+} as const;
+
+/** Default `subtype` value the SDK emits when a turn completes cleanly. */
+const RESULT_SUBTYPE_SUCCESS = 'success';
 
 /** Drop in-flight user sends that the SDK still hasn't surfaced after this
  *  long. Generous (10 min) — the goal is just to keep stale entries from
@@ -80,7 +114,7 @@ function sessionMessageToEntries(msg: SessionMessage): HistoryEntry[] {
     inner.parentUuid ??
     null;
 
-  if (msg.type === 'user' && inner.role === 'user') {
+  if (msg.type === SDK_MESSAGE_TYPE.user && inner.role === 'user') {
     const content = inner.content;
     if (Array.isArray(content)) {
       const out: HistoryEntry[] = [];
@@ -121,7 +155,7 @@ function sessionMessageToEntries(msg: SessionMessage): HistoryEntry[] {
     ];
   }
 
-  if (msg.type === 'assistant' && inner.role === 'assistant') {
+  if (msg.type === SDK_MESSAGE_TYPE.assistant && inner.role === 'assistant') {
     const out: HistoryEntry[] = [];
     const content = inner.content;
     if (Array.isArray(content)) {
@@ -162,10 +196,10 @@ function sessionMessageToEntries(msg: SessionMessage): HistoryEntry[] {
     return out;
   }
 
-  if (msg.type === 'system') {
+  if (msg.type === SDK_MESSAGE_TYPE.system) {
     const subtype =
       (msg as unknown as { subtype?: string }).subtype ??
-      ((typeof inner === 'object' && (inner as { type?: string }).type) || 'system');
+      ((typeof inner === 'object' && (inner as { type?: string }).type) || SDK_MESSAGE_TYPE.system);
     return [
       {
         kind: 'system',
@@ -196,14 +230,82 @@ function sdkMessageToEvents(
   };
   const parentToolUseId: string | undefined = obj.parent_tool_use_id ?? undefined;
 
-  if (msg.type === 'system' && (msg as { subtype?: string }).subtype === 'init') {
+  if (
+    msg.type === SDK_MESSAGE_TYPE.system &&
+    (msg as { subtype?: string }).subtype === SDK_SYSTEM_SUBTYPE.init
+  ) {
     const init = msg as { model?: string };
     onSystemInit?.({ model: init.model });
     if (init.model) return [{ type: 'model', model: init.model }];
     return [];
   }
 
-  if (msg.type === 'assistant') {
+  // Compaction boundary — emitted after /compact runs (or when the auto-compact
+  // threshold fires). Carries pre/post token counts and how it was triggered so
+  // we can surface a "Conversation compacted (32k → 8k)" meta line instead of
+  // leaking the `<command-name>` / `<local-command-stdout>` transcript noise.
+  if (
+    msg.type === SDK_MESSAGE_TYPE.system &&
+    (msg as { subtype?: string }).subtype === SDK_SYSTEM_SUBTYPE.compactBoundary
+  ) {
+    const cb = msg as unknown as {
+      compact_metadata?: {
+        trigger?: CompactTrigger;
+        pre_tokens?: number;
+        post_tokens?: number;
+        duration_ms?: number;
+      };
+    };
+    const meta = cb.compact_metadata ?? {};
+    return [
+      {
+        type: 'compact_boundary',
+        trigger: meta.trigger ?? COMPACT_TRIGGER.manual,
+        preTokens: meta.pre_tokens ?? 0,
+        ...(typeof meta.post_tokens === 'number' ? { postTokens: meta.post_tokens } : {}),
+        ...(typeof meta.duration_ms === 'number' ? { durationMs: meta.duration_ms } : {}),
+      },
+    ];
+  }
+
+  // High-level Query status — `compacting` while a /compact (or auto-compact)
+  // is running, `requesting` while waiting for the model's next response, null
+  // when idle. We rebroadcast this so the mobile can show a dedicated
+  // "Compacting…" footer instead of the generic "thinking…" one.
+  if (
+    msg.type === SDK_MESSAGE_TYPE.system &&
+    (msg as { subtype?: string }).subtype === SDK_SYSTEM_SUBTYPE.status
+  ) {
+    const s = msg as unknown as {
+      status?: Exclude<SdkRunStatus, 'idle'> | null;
+      compact_result?: CompactResult;
+      compact_error?: string;
+    };
+    return [
+      {
+        type: 'sdk_status',
+        status: s.status ?? SDK_RUN_STATUS.idle,
+        ...(s.compact_result ? { compactResult: s.compact_result } : {}),
+        ...(s.compact_error ? { compactError: s.compact_error } : {}),
+      },
+    ];
+  }
+
+  // Output captured from a local slash command handler (`/voice`, `/usage`,
+  // `/compact`, etc). The SDK already records it as a `<local-command-stdout>`
+  // user message in the JSONL, but in the live stream this dedicated event
+  // lets the mobile render the result without parsing XML.
+  if (
+    msg.type === SDK_MESSAGE_TYPE.system &&
+    (msg as { subtype?: string }).subtype === SDK_SYSTEM_SUBTYPE.localCommandOutput
+  ) {
+    const out = msg as unknown as { content?: string };
+    const content = (out.content ?? '').trim();
+    if (!content) return [];
+    return [{ type: 'slash_command_output', content }];
+  }
+
+  if (msg.type === SDK_MESSAGE_TYPE.assistant) {
     const events: AgentEvent[] = [];
     const messageId =
       (msg.message as { id?: string } | undefined)?.id ?? (msg as { uuid?: string }).uuid;
@@ -246,7 +348,7 @@ function sdkMessageToEvents(
     return events;
   }
 
-  if (msg.type === 'user') {
+  if (msg.type === SDK_MESSAGE_TYPE.user) {
     const content = (msg.message as { content?: unknown }).content;
     if (Array.isArray(content)) {
       const events: AgentEvent[] = [];
@@ -271,7 +373,7 @@ function sdkMessageToEvents(
     return [];
   }
 
-  if (msg.type === 'stream_event') {
+  if (msg.type === SDK_MESSAGE_TYPE.streamEvent) {
     const ev = (msg as unknown as { event?: Record<string, unknown> }).event;
     if (
       ev?.type === 'content_block_delta' &&
@@ -291,12 +393,12 @@ function sdkMessageToEvents(
     return [{ type: 'raw', payload: msg }];
   }
 
-  if (msg.type === 'result') {
+  if (msg.type === SDK_MESSAGE_TYPE.result) {
     const r = msg as { subtype?: string; duration_ms?: number; usage?: unknown };
     return [
       {
         type: 'result',
-        subtype: r.subtype ?? 'success',
+        subtype: r.subtype ?? RESULT_SUBTYPE_SUCCESS,
         durationMs: r.duration_ms,
         usage: r.usage,
       },

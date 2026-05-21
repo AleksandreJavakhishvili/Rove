@@ -24,6 +24,33 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
   return typeof value === 'string' && (PERMISSION_MODES as readonly string[]).includes(value);
 }
 
+/**
+ * High-level run-state mirror of the SDK's `SDKStatus`. The SDK emits
+ * `compacting` while /compact (or the auto-compact threshold) is processing,
+ * `requesting` while waiting for the model's response, and `null` when idle —
+ * we coalesce `null` to the explicit `idle` label so downstream code never
+ * has to special-case null.
+ */
+export type SdkRunStatus = 'compacting' | 'requesting' | 'idle';
+export const SDK_RUN_STATUS = {
+  compacting: 'compacting',
+  requesting: 'requesting',
+  idle: 'idle',
+} as const satisfies Record<SdkRunStatus, SdkRunStatus>;
+
+/**
+ * How a compact boundary was reached: `manual` is a user-typed /compact,
+ * `auto` is the SDK's threshold-based auto-compact.
+ */
+export type CompactTrigger = 'manual' | 'auto';
+export const COMPACT_TRIGGER = {
+  manual: 'manual',
+  auto: 'auto',
+} as const satisfies Record<CompactTrigger, CompactTrigger>;
+
+/** Outcome of an attempted compaction, when the SDK reports it. */
+export type CompactResult = 'success' | 'failed';
+
 export interface AgentMetadata {
   kind: AgentKind;
   displayName: string;
@@ -92,6 +119,20 @@ export type AgentEvent =
   | { type: 'file_changed'; path: string; op: 'add' | 'change' | 'unlink' }
   | { type: 'result'; subtype: string; durationMs?: number; usage?: unknown }
   | { type: 'thinking'; text: string; parentToolUseId?: string }
+  | {
+      type: 'compact_boundary';
+      trigger: CompactTrigger;
+      preTokens: number;
+      postTokens?: number;
+      durationMs?: number;
+    }
+  | {
+      type: 'sdk_status';
+      status: SdkRunStatus;
+      compactResult?: CompactResult;
+      compactError?: string;
+    }
+  | { type: 'slash_command_output'; content: string }
   | { type: 'raw'; payload: unknown };
 
 export interface SessionLifecycleListeners {

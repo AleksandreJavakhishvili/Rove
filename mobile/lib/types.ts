@@ -67,6 +67,24 @@ export type HistoryEntry =
 
 export type PermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
 
+/** Mirror of the bridge's `SdkRunStatus`. See bridge/src/agents/types.ts. */
+export type SdkRunStatus = 'compacting' | 'requesting' | 'idle';
+export const SDK_RUN_STATUS = {
+  compacting: 'compacting',
+  requesting: 'requesting',
+  idle: 'idle',
+} as const satisfies Record<SdkRunStatus, SdkRunStatus>;
+
+/** Mirror of the bridge's `CompactTrigger`. */
+export type CompactTrigger = 'manual' | 'auto';
+export const COMPACT_TRIGGER = {
+  manual: 'manual',
+  auto: 'auto',
+} as const satisfies Record<CompactTrigger, CompactTrigger>;
+
+/** Mirror of the bridge's `CompactResult`. */
+export type CompactResult = 'success' | 'failed';
+
 /** Capability snapshot the bridge publishes on session attach. Mobile mirrors
  *  it into a per-(agent,sessionId) slice and gates chat-header controls,
  *  approval surfaces, and rewind/fork actions on the matching field. */
@@ -92,6 +110,20 @@ export type AgentEvent =
   | { type: 'capabilities'; capabilities: AgentCapabilities }
   | { type: 'result'; subtype: string; durationMs?: number; usage?: unknown }
   | { type: 'thinking'; text: string; parentToolUseId?: string }
+  | {
+      type: 'compact_boundary';
+      trigger: CompactTrigger;
+      preTokens: number;
+      postTokens?: number;
+      durationMs?: number;
+    }
+  | {
+      type: 'sdk_status';
+      status: SdkRunStatus;
+      compactResult?: CompactResult;
+      compactError?: string;
+    }
+  | { type: 'slash_command_output'; content: string }
   | { type: 'raw'; payload: unknown };
 
 export type ServerToClient =

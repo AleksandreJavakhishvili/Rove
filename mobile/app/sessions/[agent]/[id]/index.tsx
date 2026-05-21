@@ -24,8 +24,17 @@ import {
   pickAndUploadImage,
   type UploadResult,
 } from '@/lib/uploads';
-import type { AgentEvent, HistoryEntry, PermissionMode, SessionStatus } from '@/lib/types';
+import {
+  COMPACT_TRIGGER,
+  SDK_RUN_STATUS,
+  type AgentEvent,
+  type HistoryEntry,
+  type PermissionMode,
+  type SdkRunStatus,
+  type SessionStatus,
+} from '@/lib/types';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
+import { Ionicons } from '@expo/vector-icons';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -86,11 +95,37 @@ type ChatItem =
   | { id: string; kind: 'meta'; text: string }
   | { id: string; kind: 'takeover_prompt'; pids: number[]; pendingMessage: string };
 
+// Claude Code rewrites a user-typed slash command into a synthetic user
+// message wrapped in `<command-name>…</command-name><command-message>…
+// </command-message><command-args>…</command-args>`, then posts the
+// captured stdout back as another user message wrapped in
+// `<local-command-stdout>…</local-command-stdout>`. These artifacts live
+// in the JSONL transcript but are noise to display verbatim — surface them
+// as a small meta pill so the user sees "what happened" without the XML.
+const SLASH_CMD_WRAPPER_RE = /^\s*<command-name>([^<]+)<\/command-name>/;
+const LOCAL_STDOUT_WRAPPER_RE = /^\s*<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*$/;
+
+function slashCommandMeta(text: string, id: string): ChatItem | null {
+  const cmd = text.match(SLASH_CMD_WRAPPER_RE);
+  if (cmd) {
+    return { id, kind: 'meta', text: `Ran ${cmd[1].trim()}` };
+  }
+  const out = text.match(LOCAL_STDOUT_WRAPPER_RE);
+  if (out) {
+    const body = out[1].trim();
+    if (!body) return null;
+    return { id, kind: 'meta', text: body };
+  }
+  return null;
+}
+
 function entryToChatItem(e: HistoryEntry, index: number): ChatItem | null {
   switch (e.kind) {
     case 'user': {
       const text = extractText(e.content).trim();
       if (!text) return null;
+      const meta = slashCommandMeta(text, `h-${index}-${e.uuid}`);
+      if (meta) return meta;
       return {
         id: `h-${index}-${e.uuid}`,
         kind: 'user',
@@ -143,6 +178,11 @@ function entryToChatItem(e: HistoryEntry, index: number): ChatItem | null {
 function stripUuidSuffix(uuid: string): string {
   const colon = uuid.indexOf(':');
   return colon === -1 ? uuid : uuid.slice(0, colon);
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+  return String(n);
 }
 
 function extractText(content: unknown): string {
@@ -230,6 +270,17 @@ export default function ChatScreen() {
   // a right-swipe and pops to /sessions instead of returning to chat.
   const [pagerIndex, setPagerIndex] = useState(0);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
+  // Mirrors the SDK's `SDKStatus` — `'compacting'` while /compact (or the
+  // auto-compact threshold) is running, `'requesting'` while waiting for the
+  // model's response, `'idle'` otherwise. Used to swap the chat footer text so
+  // the user sees "Compacting context…" instead of the generic "thinking…"
+  // line, which makes /compact feel like an action that's actually happening.
+  const [sdkStatus, setSdkStatus] = useState<SdkRunStatus>(SDK_RUN_STATUS.idle);
+  // Most recent extended-thinking text from the SDK, shown as a live ticker
+  // right above the input row. Cleared as soon as real assistant output (text,
+  // text_delta, or tool_use) starts to land, and on result/process_exit. This
+  // is the live preview — historical thinking blocks are not (yet) rendered.
+  const [thinkingTicker, setThinkingTicker] = useState<string>('');
   const [modePickerOpen, setModePickerOpen] = useState(false);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   // Bumped when the app comes back to the foreground while the chat WS isn't
@@ -469,6 +520,8 @@ export default function ChatScreen() {
             case 'process_exit':
               setPendingTurns((n) => Math.max(0, n - 1));
               setStatus('idle');
+              setThinkingTicker('');
+              setSdkStatus(SDK_RUN_STATUS.idle);
               break;
           }
         },
@@ -477,6 +530,16 @@ export default function ChatScreen() {
     sendRef.current = (m) => handle.send(m);
 
     function handleLiveEvent(ev: AgentEvent) {
+      // Any real output from the model ends the "thinking" phase — drop the
+      // live ticker as soon as text, deltas, or tool calls start landing.
+      if (
+        ev.type === 'text' ||
+        ev.type === 'text_delta' ||
+        ev.type === 'tool_use' ||
+        ev.type === 'result'
+      ) {
+        setThinkingTicker('');
+      }
       switch (ev.type) {
         case 'text':
           if (ev.role === 'user') return;
@@ -639,7 +702,50 @@ export default function ChatScreen() {
           }
           liveAssistantBuffer = null;
           break;
-        case 'thinking':
+        case 'compact_boundary': {
+          // Conversation compaction finished — drop a single meta line so the
+          // user can see what just happened. `pre/postTokens` are best-effort;
+          // when missing we keep the message simple.
+          const trigger = ev.trigger === COMPACT_TRIGGER.auto ? 'Auto-compacted' : 'Compacted';
+          const tokens =
+            ev.postTokens !== undefined
+              ? ` (${formatTokens(ev.preTokens)} → ${formatTokens(ev.postTokens)} tokens)`
+              : '';
+          setItems((prev) => [
+            ...prev,
+            { id: `meta-${Date.now()}`, kind: 'meta', text: `${trigger} conversation${tokens}` },
+          ]);
+          break;
+        }
+        case 'sdk_status':
+          setSdkStatus(ev.status);
+          if (ev.compactResult === 'failed' && ev.compactError) {
+            setItems((prev) => [
+              ...prev,
+              { id: `meta-${Date.now()}`, kind: 'meta', text: `Compact failed: ${ev.compactError}` },
+            ]);
+          }
+          break;
+        case 'slash_command_output': {
+          const trimmed = ev.content.trim();
+          if (!trimmed) break;
+          setItems((prev) => [
+            ...prev,
+            { id: `meta-${Date.now()}`, kind: 'meta', text: trimmed },
+          ]);
+          break;
+        }
+        case 'thinking': {
+          // Replace the ticker rather than append — thinking blocks aren't
+          // streaming deltas, they're complete chunks; appending would create a
+          // run-on wall of text. Trim to the last ~3 lines so a long block
+          // doesn't blow up the bar height.
+          const trimmed = ev.text.trim();
+          if (!trimmed) break;
+          const lastLines = trimmed.split('\n').slice(-3).join('\n');
+          setThinkingTicker(lastLines);
+          break;
+        }
         case 'raw':
           break;
       }
@@ -934,6 +1040,8 @@ export default function ChatScreen() {
         options={{
           title: sessionLabel ?? sessionProject ?? 'Chat',
           gestureEnabled: pagerIndex === 0,
+          headerBackTitle: '',
+          headerBackButtonDisplayMode: 'minimal',
           headerTitle: () => (
             <Pressable onPress={onRename} hitSlop={8} style={{ alignItems: 'center' }}>
               <Text
@@ -952,10 +1060,19 @@ export default function ChatScreen() {
             <Pressable
               onPress={onHeaderMenu}
               hitSlop={8}
-              style={{ paddingHorizontal: 8, paddingVertical: 4 }}>
-              <Text style={{ color: t.accent.primary, fontSize: fontSize.xl, fontWeight: '700' }}>
-                {changedFiles.size > 0 ? `··· (${changedFiles.size})` : '···'}
-              </Text>
+              style={styles.headerRightButton}>
+              <Ionicons
+                name="ellipsis-horizontal-circle"
+                size={fontSize['4xl']}
+                color={t.accent.primary}
+              />
+              {changedFiles.size > 0 ? (
+                <View style={[styles.headerBadge, { backgroundColor: t.accent.primary }]}>
+                  <Text style={[styles.headerBadgeText, { color: t.accent.fg }]}>
+                    {changedFiles.size}
+                  </Text>
+                </View>
+              ) : null}
             </Pressable>
           ),
         }}
@@ -1164,14 +1281,7 @@ export default function ChatScreen() {
             </View>
           ) : null
         }
-        ListFooterComponent={
-          sending ? (
-            <View style={styles.thinkingRow}>
-              <ActivityIndicator size="small" color={t.text.secondary} />
-              <Text style={[styles.thinkingText, { color: t.text.secondary }]}>Claude is thinking…</Text>
-            </View>
-          ) : null
-        }
+        ListFooterComponent={null}
         onScrollBeginDrag={() => {
           userScrolledRef.current = true;
         }}
@@ -1188,6 +1298,24 @@ export default function ChatScreen() {
           }
         }}
       />
+      {sdkStatus === SDK_RUN_STATUS.compacting || sending || thinkingTicker ? (
+        <View
+          style={[
+            styles.liveStatusBar,
+            { borderTopColor: t.border.subtle, backgroundColor: t.surface.sunken },
+          ]}>
+          <ActivityIndicator size="small" color={t.text.secondary} />
+          <Text
+            style={[styles.liveStatusText, { color: t.text.secondary }]}
+            numberOfLines={2}>
+            {sdkStatus === SDK_RUN_STATUS.compacting
+              ? 'Compacting conversation…'
+              : thinkingTicker
+                ? thinkingTicker
+                : 'Claude is thinking…'}
+          </Text>
+        </View>
+      ) : null}
       {draft.startsWith('/') ? <SlashPicker draft={draft} onPick={(cmd) => setDraft(cmd + ' ')} /> : null}
       {attachments.length > 0 ? (
         <ScrollView
@@ -1201,7 +1329,11 @@ export default function ChatScreen() {
               {a.isImage && a.localUri ? (
                 <Image source={{ uri: a.localUri }} style={styles.attachThumb} />
               ) : (
-                <Text style={{ fontSize: fontSize.sm }}>{a.isImage ? '🖼' : '📎'}</Text>
+                <Ionicons
+                  name={a.isImage ? 'image-outline' : 'document-attach-outline'}
+                  size={fontSize.lg}
+                  color={t.text.secondary}
+                />
               )}
               <Text style={{ color: t.text.primary, fontSize: fontSize.sm, maxWidth: 180 }} numberOfLines={1}>
                 {a.rel.split('/').pop()}
@@ -1221,7 +1353,8 @@ export default function ChatScreen() {
               styles.attachOption,
               { backgroundColor: pressed ? t.surface.pressed : t.surface.raised, borderColor: t.border.subtle },
             ]}>
-            <Text style={[styles.attachLabel, { color: t.text.primary }]}>🖼  Photo library</Text>
+            <Ionicons name="image-outline" size={fontSize.lg} color={t.text.primary} />
+            <Text style={[styles.attachLabel, { color: t.text.primary }]}>Photo library</Text>
           </Pressable>
           <Pressable
             onPress={() => runUpload('photo')}
@@ -1229,7 +1362,8 @@ export default function ChatScreen() {
               styles.attachOption,
               { backgroundColor: pressed ? t.surface.pressed : t.surface.raised, borderColor: t.border.subtle },
             ]}>
-            <Text style={[styles.attachLabel, { color: t.text.primary }]}>📷  Take photo</Text>
+            <Ionicons name="camera-outline" size={fontSize.lg} color={t.text.primary} />
+            <Text style={[styles.attachLabel, { color: t.text.primary }]}>Take photo</Text>
           </Pressable>
           <Pressable
             onPress={() => runUpload('document')}
@@ -1237,7 +1371,8 @@ export default function ChatScreen() {
               styles.attachOption,
               { backgroundColor: pressed ? t.surface.pressed : t.surface.raised, borderColor: t.border.subtle },
             ]}>
-            <Text style={[styles.attachLabel, { color: t.text.primary }]}>📄  File</Text>
+            <Ionicons name="document-outline" size={fontSize.lg} color={t.text.primary} />
+            <Text style={[styles.attachLabel, { color: t.text.primary }]}>File</Text>
           </Pressable>
         </View>
       ) : null}
@@ -1491,6 +1626,19 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
   },
   thinkingText: { fontSize: fontSize.base, fontStyle: 'italic' },
+  liveStatusBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space[2],
+    paddingHorizontal: space[3],
+    paddingVertical: space[2],
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  liveStatusText: {
+    flex: 1,
+    fontSize: fontSize.sm,
+    fontStyle: 'italic',
+  },
   loadOlderRow: {
     alignSelf: 'center',
     paddingHorizontal: space[3] + 2,
@@ -1637,8 +1785,28 @@ const styles = StyleSheet.create({
     borderRadius: radius.lg,
     borderWidth: 1,
     alignItems: 'center',
+    gap: space[1],
   },
   attachLabel: { fontSize: fontSize.base, fontWeight: '500' },
   attachButton: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center' },
   attachIcon: { fontSize: fontSize.xl, fontWeight: '700', lineHeight: 22 },
+  headerRightButton: {
+    paddingHorizontal: space[2],
+    paddingVertical: space[1],
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space[1],
+  },
+  headerBadge: {
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    paddingHorizontal: space[1],
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerBadgeText: {
+    fontSize: fontSize.xs,
+    fontWeight: '700',
+  },
 });
