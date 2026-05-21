@@ -9,6 +9,7 @@ import {
   forkSession,
   openStream,
   renameSession,
+  sendApproval,
   takeOwnership,
   type ConnectionState,
 } from '@/lib/bridge';
@@ -31,6 +32,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   FlatList,
   Image,
   KeyboardAvoidingView,
@@ -230,6 +232,14 @@ export default function ChatScreen() {
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
   const [modePickerOpen, setModePickerOpen] = useState(false);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  // Bumped when the app comes back to the foreground while the chat WS isn't
+  // open — triggers the stream effect below to tear down the stale handle and
+  // open a fresh one. Without this, the socket stays in 'closed' after the OS
+  // kills it during backgrounding and the next user action (approval tap,
+  // message send) fails with "stream not open".
+  const [reconnectNonce, setReconnectNonce] = useState(0);
+  const connStateRef = useRef<ConnectionState>('connecting');
+  connStateRef.current = connState;
   const listRef = useRef<FlatList<ChatItem>>(null);
   const sending = pendingTurns > 0;
   const stickToBottomRef = useRef(true);
@@ -259,6 +269,21 @@ export default function ChatScreen() {
     shellMapRef.current = new Map();
     toolNamesRef.current = new Map();
   }, [agent, id]);
+
+  // Reconnect when the app returns to the foreground with a dead socket. iOS
+  // and Android both kill long-lived WebSockets while the app is backgrounded;
+  // without this listener the chat stays in 'closed' state and the next user
+  // action throws "stream not open".
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next !== 'active') return;
+      const s = connStateRef.current;
+      if (s === 'closed' || s === 'error') {
+        setReconnectNonce((n) => n + 1);
+      }
+    });
+    return () => sub.remove();
+  }, []);
 
   // Pull session metadata (label, project name) for the header title.
   useEffect(() => {
@@ -625,7 +650,7 @@ export default function ChatScreen() {
       sendRef.current = null;
       clearCapabilities(agent, id);
     };
-  }, [settings.baseUrl, settings.token, agent, id, setCapabilities, clearCapabilities]);
+  }, [settings.baseUrl, settings.token, agent, id, reconnectNonce, setCapabilities, clearCapabilities]);
 
   function onSend() {
     const userText = draft.trim();
@@ -847,13 +872,33 @@ export default function ChatScreen() {
     [],
   );
 
-  function onApprovalDecision(decision: 'allow' | 'allow_always' | 'deny') {
-    if (!approval || !sendRef.current) {
-      setApproval(null);
-      return;
+  async function onApprovalDecision(decision: 'allow' | 'allow_always' | 'deny') {
+    if (!approval) return;
+    const toolUseId = approval.toolUseId;
+    setApproval(null);
+
+    // Fast path: live WS is open — send on the existing socket so the bridge
+    // resolves the prompt without any extra round-trip.
+    if (connState === 'open' && sendRef.current) {
+      try {
+        sendRef.current({ type: 'approval', toolUseId, decision });
+        return;
+      } catch {
+        // Live socket flaked between our check and the send — fall through.
+      }
     }
+
+    // Fallback: one-shot WS, same path the sessions-list approval chip uses.
+    // Survives the case where the user reopens the app, taps Allow on the
+    // replayed ApprovalSheet, and the live chat WS is still mid-reconnect.
     try {
-      sendRef.current({ type: 'approval', toolUseId: approval.toolUseId, decision });
+      await sendApproval(
+        { baseUrl: settings.baseUrl, token: settings.token },
+        agent,
+        id,
+        toolUseId,
+        decision,
+      );
     } catch (err) {
       setItems((prev) => [
         ...prev,
@@ -864,7 +909,6 @@ export default function ChatScreen() {
         },
       ]);
     }
-    setApproval(null);
   }
 
   const statusLabel = useMemo(() => {

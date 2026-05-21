@@ -14,12 +14,14 @@ import {
   type SDKUserMessage,
   type SessionMessage,
 } from '@anthropic-ai/claude-agent-sdk';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { basename } from 'node:path';
 import { existsSync } from 'node:fs';
 import { config } from '../config.ts';
 import { getHeadSha } from '../git.ts';
 import { requestPermissionFromUser } from '../permissions.ts';
+import { runtime } from '../runtime.ts';
 import type { HistoryEntry } from '../types.ts';
 import { attributeManySessions, getDesktopPidsForSession } from './desktopPids.ts';
 import {
@@ -36,6 +38,11 @@ import {
 } from './types.ts';
 
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'default';
+
+/** Drop in-flight user sends that the SDK still hasn't surfaced after this
+ *  long. Generous (10 min) — the goal is just to keep stale entries from
+ *  haunting the chat forever if something goes wrong server-side. */
+const PENDING_TTL_MS = 10 * 60 * 1000;
 
 function envMode(): PermissionMode {
   const raw = process.env.PERMISSION_MODE;
@@ -331,6 +338,19 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
   private inputQueue: Array<SDKUserMessage | null> = [];
   private inputResolver: (() => void) | null = null;
   private inputClosed = false;
+  /**
+   * User messages we've handed to the SDK but haven't yet observed in the
+   * SDK's on-disk transcript. The SDK writes to JSONL asynchronously, so a
+   * client that reattaches a few seconds after sending can miss its own
+   * message in `getSessionMessages()`. The driver's `readHistory` merges
+   * this list in, deduped by UUID, so the mobile sees its message back
+   * regardless of how fast it navigated away.
+   *
+   * Entries older than `PENDING_TTL_MS` are pruned defensively — if the SDK
+   * never flushed, the message is gone for real and showing it forever
+   * would mislead the user.
+   */
+  pendingUserSends: Array<{ uuid: string; content: string; sentAt: number }> = [];
 
   constructor(sessionId: string, cwd: string) {
     super();
@@ -526,14 +546,38 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
 
   sendUserMessage(content: string): void {
     if (!this.alive) this.spawnIfNeeded();
-    const userMsg: SDKUserMessage = {
+    // Mint our own uuid + hand it to the SDK so the on-disk transcript entry
+    // carries the same id we'll dedupe against in `readHistory`. Without
+    // this, a quick re-attach can lose the message: the SDK hasn't flushed
+    // to JSONL yet, so `getSessionMessages` doesn't include it and the
+    // optimistic local item in mobile is gone after navigation.
+    const uuid = randomUUID();
+    const userMsg = {
       type: 'user',
       message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: this.sessionId,
-    } as SDKUserMessage;
+      uuid,
+    } as unknown as SDKUserMessage;
+    this.pendingUserSends.push({ uuid, content, sentAt: Date.now() });
     this.pushInput(userMsg);
     this.lastActivity = Date.now();
+  }
+
+  /** Snapshot of in-flight user sends, with TTL-stale entries pruned. The
+   *  driver's `readHistory` calls this to merge un-persisted messages into
+   *  the transcript replay. */
+  takePendingUserSends(): Array<{ uuid: string; content: string; sentAt: number }> {
+    const cutoff = Date.now() - PENDING_TTL_MS;
+    this.pendingUserSends = this.pendingUserSends.filter((p) => p.sentAt >= cutoff);
+    return [...this.pendingUserSends];
+  }
+
+  /** Mark a uuid as confirmed (seen in the SDK's persisted transcript) so
+   *  future history reads stop synthesizing the entry. Called from the
+   *  driver's `readHistory` whenever a pending uuid matches a real one. */
+  confirmPendingUserSend(uuid: string): void {
+    this.pendingUserSends = this.pendingUserSends.filter((p) => p.uuid !== uuid);
   }
 
   sendApproval(_toolUseId: string, _decision: 'allow' | 'allow_always' | 'deny'): void {
@@ -688,12 +732,39 @@ export class ClaudeCodeSdkDriver implements AgentDriver {
       return [];
     }
     const entries: HistoryEntry[] = [];
+    const seenUuids = new Set<string>();
     for (const msg of messages) {
+      seenUuids.add(msg.uuid);
       for (const e of sessionMessageToEntries(msg)) {
         if (opts.before && e.timestamp >= opts.before) continue;
         entries.push(e);
       }
     }
+
+    // Merge in user messages we forwarded to the SDK but haven't yet seen
+    // round-trip back through `getSessionMessages` (the SDK writes JSONL
+    // asynchronously, so a quick re-attach can otherwise lose the message).
+    // Anything whose uuid already appears in the SDK transcript is dropped
+    // from the pending list and skipped here.
+    const live = runtime.get(this.kind, id);
+    if (live instanceof ClaudeCodeSdkSession) {
+      for (const p of live.takePendingUserSends()) {
+        if (seenUuids.has(p.uuid)) {
+          live.confirmPendingUserSend(p.uuid);
+          continue;
+        }
+        const ts = new Date(p.sentAt).toISOString();
+        if (opts.before && ts >= opts.before) continue;
+        entries.push({
+          kind: 'user',
+          uuid: p.uuid,
+          parentUuid: null,
+          timestamp: ts,
+          content: p.content,
+        });
+      }
+    }
+
     // Oldest-first; clients render newest-at-bottom from the tail.
     return entries.length > limit ? entries.slice(-limit) : entries;
   }
