@@ -11,10 +11,17 @@ import { config, runtimeState } from './config.ts';
 import { getDriver, listAgents, listAllSessions } from './agents/registry.ts';
 import { devices } from './devices.ts';
 import { scanDevServers } from './devServers.ts';
-import { readScopedFile, relToCwd } from './files.ts';
+import { normalizeClientRelPath, readScopedFile, relToCwd } from './files.ts';
+import { listDirectory } from './fileTree.ts';
 import { JsonlTail } from './jsonlTail.ts';
-import { getDiff } from './git.ts';
-import { inspectPid } from './lsof.ts';
+import { getDiff, runGitDiffFile, runGitStatus } from './git.ts';
+import {
+  SEARCH_LIMIT_DEFAULT,
+  SEARCH_LIMIT_MAX,
+  detectSearchBackend,
+  search as searchFiles,
+} from './search.ts';
+import { inspectPid, invalidateClaudeCache } from './lsof.ts';
 import { permissions } from './permissions.ts';
 import { preflight } from './preflight.ts';
 import { printConnectionQR } from './qr.ts';
@@ -75,11 +82,27 @@ app.get('/sessions', async (c) => {
   const ourPids = runtime.livePids();
   const raw = await listAllSessions();
   const metas = await sessionMeta.getMany(raw.map((s) => ({ agent: s.agent, id: s.id })));
+  // A desktop `claude` process that's open but hasn't touched the JSONL in a
+  // while isn't actively driving the session — it's just sitting in another
+  // terminal. Treat the session as idle in that case so the badge stops
+  // crying wolf. Threshold is generous (2 minutes) — we want to catch real
+  // CLI sessions whose user is mid-conversation, not background processes.
+  const DESKTOP_ACTIVITY_WINDOW_MS = 2 * 60 * 1000;
+  const claimedByBridge = (agent: AgentKind, id: string) =>
+    runtime.get(agent, id)?.claimedByBridge === true;
   const sessions: SessionListItem[] = raw.map((s) => {
     const bridgePid = ourPids.get(`${s.agent}::${s.id}`);
     const foreignPids = s.desktopPids.filter((p) => p !== bridgePid && p !== process.pid);
+    const recentlyActive = Date.now() - s.lastModified < DESKTOP_ACTIVITY_WINDOW_MS;
+    // Order matters: a session the bridge has claimed (via spawn or
+    // takeover) reports `live-bridge` even if a stale desktop pid is also
+    // floating around — the user already chose phone-side ownership.
     const status: SessionListItem['status'] =
-      bridgePid !== undefined ? 'live-bridge' : foreignPids.length > 0 ? 'live-desktop' : 'idle';
+      bridgePid !== undefined || claimedByBridge(s.agent, s.id)
+        ? 'live-bridge'
+        : foreignPids.length > 0 && recentlyActive
+          ? 'live-desktop'
+          : 'idle';
     const meta = metas.get(`${s.agent}::${s.id}`);
     return {
       agent: s.agent,
@@ -206,12 +229,23 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
   const located = await driver.findSession(id);
   if (!located) return c.json({ error: 'session not found' }, 404);
 
+  // Mark ownership upfront — even if there are no foreign pids to kill, the
+  // fact that the user explicitly asked to take over means they want the
+  // bridge to own this session from here on. Subsequent user messages won't
+  // re-trigger the conflict check.
+  const liveSession = runtime.get(agent, id);
+  if (liveSession) liveSession.claimedByBridge = true;
+
   const foreign = await runtime.checkDesktopConflict(agent, id);
   if (!foreign || foreign.length === 0) {
     return c.json({ ok: true, killed: [], note: 'no conflict' });
   }
 
   // Safety: only kill PIDs whose command line actually looks like claude.
+  // A pid that's gone from ps between the conflict check and inspectPid()
+  // is treated as "already dead, that's a takeover success" rather than a
+  // 409 — refusing here makes the mobile UI report a phantom failure when
+  // the desktop process exited on its own moments earlier.
   const verified: number[] = [];
   for (const pid of foreign) {
     const info = await inspectPid(pid);
@@ -220,7 +254,12 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
     }
   }
   if (verified.length === 0) {
-    return c.json({ ok: false, error: 'no matching claude processes for those pids' }, 409);
+    invalidateClaudeCache();
+    return c.json({
+      ok: true,
+      killed: [],
+      note: 'no live claude processes for those pids — session is already free',
+    });
   }
 
   console.log(`[bridge] takeover requested — SIGTERM ${verified.join(',')}`);
@@ -245,6 +284,7 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
     });
     if (stillAlive.length === 0) {
       console.log(`[bridge] takeover complete — all pids exited cleanly`);
+      invalidateClaudeCache();
       return c.json({ ok: true, killed: verified, force: false });
     }
     await new Promise((r) => setTimeout(r, 200));
@@ -259,6 +299,7 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
       // ignore
     }
   }
+  invalidateClaudeCache();
   return c.json({ ok: true, killed: verified, force: true });
 });
 
@@ -367,6 +408,46 @@ app.get('/sessions/:agent/:id/preview', async (c) => {
   return c.json({ hostname, candidates });
 });
 
+// Project file tree scoped to the session cwd. Backs the @-mention picker
+// (Phase 1 of the mobile-file-visibility SDD) and, later, the Files-tab
+// project-tree section. Capability-gated on `projectBrowser` so drivers
+// with a synthetic/sandboxed cwd can opt out cleanly.
+app.get('/sessions/:agent/:id/tree', async (c) => {
+  const agent = c.req.param('agent') as AgentKind;
+  const id = c.req.param('id') ?? '';
+  const driver = getDriver(agent);
+  if (!driver) return c.json({ error: 'unknown agent' }, 404);
+  const located = await driver.findSession(id);
+  if (!located) return c.json({ error: 'session not found' }, 404);
+
+  // Capability gate. We pull the live session if there is one so the
+  // capability snapshot reflects the running agent; falling back to
+  // `createSession`-shaped probing would require spawning a session just to
+  // ask its capabilities, which is the wrong cost trade-off.
+  const live = runtime.get(agent, id);
+  const caps = live?.capabilities();
+  if (caps && caps.projectBrowser !== true) {
+    return c.json({ error: 'projectBrowser capability not supported' }, 404);
+  }
+
+  const parsed = treeQuerySchema.safeParse({
+    path: c.req.query('path'),
+    depth: c.req.query('depth'),
+    includeHidden: c.req.query('includeHidden'),
+    includeIgnored: c.req.query('includeIgnored'),
+  });
+  if (!parsed.success) {
+    return c.json({ error: 'bad query', issues: parsed.error.issues }, 400);
+  }
+
+  try {
+    const result = await listDirectory(located.cwd, parsed.data);
+    return c.json({ agent, id, cwd: located.cwd, ...result });
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 400);
+  }
+});
+
 app.get('/sessions/:agent/:id/diff', async (c) => {
   const agent = c.req.param('agent') as AgentKind;
   const id = c.req.param('id') ?? '';
@@ -376,14 +457,144 @@ app.get('/sessions/:agent/:id/diff', async (c) => {
   if (!located) return c.json({ error: 'session not found' }, 404);
   const session = runtime.get(agent, id);
   const baseline = session?.baselineSha ?? null;
+
+  // Optional per-file filter — used by the inline tool-card diff and by
+  // tapping a row in the "📂 N files changed" pane. Matches against either
+  // newPath (modify/add/rename) or oldPath (delete). The path-traversal
+  // guard rejects `..` segments up front; the underlying git command is
+  // scoped to cwd anyway, but the validation keeps the API tidy.
+  const rawPath = c.req.query('path');
+  let pathFilter: string | null = null;
+  if (rawPath !== undefined && rawPath !== '') {
+    try {
+      pathFilter = normalizeClientRelPath(rawPath);
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 400);
+    }
+  }
+
   const diff = await getDiff(located.cwd, baseline);
+  const files = pathFilter === null
+    ? diff.files
+    : diff.files.filter((f) => f.newPath === pathFilter || f.oldPath === pathFilter);
   return c.json({
     agent,
     id,
     cwd: located.cwd,
     baseline: diff.baseline,
-    files: diff.files,
+    files,
+    ...(pathFilter !== null ? { pathFilter } : {}),
   });
+});
+
+// Full working-tree git status — staged / unstaged / untracked entries plus
+// branch + ahead/behind metadata. Independent of the session's own baseline
+// diff (that's `/diff`). Drives the Files tab's git section. Capability-
+// gated on `gitStatus` so drivers without a real git cwd can opt out.
+app.get('/sessions/:agent/:id/git/status', async (c) => {
+  const agent = c.req.param('agent') as AgentKind;
+  const id = c.req.param('id') ?? '';
+  const driver = getDriver(agent);
+  if (!driver) return c.json({ error: 'unknown agent' }, 404);
+  const located = await driver.findSession(id);
+  if (!located) return c.json({ error: 'session not found' }, 404);
+  const live = runtime.get(agent, id);
+  const caps = live?.capabilities();
+  if (caps && caps.gitStatus !== true) {
+    return c.json({ error: 'gitStatus capability not supported' }, 404);
+  }
+  const result = await runGitStatus(located.cwd);
+  return c.json({ agent, id, cwd: located.cwd, ...result });
+});
+
+// Per-file git diff — vs HEAD by default (`staged=false`) or vs index when
+// `staged=true`. Used by the Files tab's git rows. Different code path
+// from `/diff?path=` (which is the session-baseline diff): this is the
+// pure git working-tree diff, regardless of when the session started.
+app.get('/sessions/:agent/:id/git/diff', async (c) => {
+  const agent = c.req.param('agent') as AgentKind;
+  const id = c.req.param('id') ?? '';
+  const driver = getDriver(agent);
+  if (!driver) return c.json({ error: 'unknown agent' }, 404);
+  const located = await driver.findSession(id);
+  if (!located) return c.json({ error: 'session not found' }, 404);
+  const live = runtime.get(agent, id);
+  const caps = live?.capabilities();
+  if (caps && caps.gitStatus !== true) {
+    return c.json({ error: 'gitStatus capability not supported' }, 404);
+  }
+
+  const rawPath = c.req.query('path');
+  if (!rawPath) return c.json({ error: 'missing path query' }, 400);
+  let path: string;
+  try {
+    path = normalizeClientRelPath(rawPath);
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 400);
+  }
+  if (!path) return c.json({ error: 'missing path query' }, 400);
+
+  const staged = c.req.query('staged') === 'true' || c.req.query('staged') === '1';
+  const file = await runGitDiffFile(located.cwd, { path, staged });
+  return c.json({ agent, id, cwd: located.cwd, path, staged, file });
+});
+
+// File-contents search (ripgrep, fallback to grep). Backs the Files-tab
+// search bar. Capability-gated on `projectSearch` so drivers without a
+// real filesystem cwd opt out cleanly.
+app.get('/sessions/:agent/:id/search', async (c) => {
+  const agent = c.req.param('agent') as AgentKind;
+  const id = c.req.param('id') ?? '';
+  const driver = getDriver(agent);
+  if (!driver) return c.json({ error: 'unknown agent' }, 404);
+  const located = await driver.findSession(id);
+  if (!located) return c.json({ error: 'session not found' }, 404);
+  const live = runtime.get(agent, id);
+  const caps = live?.capabilities();
+  if (caps && caps.projectSearch !== true) {
+    return c.json({ error: 'projectSearch capability not supported' }, 404);
+  }
+
+  const q = c.req.query('q');
+  if (!q || q.length === 0) return c.json({ error: 'missing q query' }, 400);
+  // Defensive cap on query length so a runaway client can't push a 10MB
+  // string at the shell.
+  if (q.length > 1000) return c.json({ error: 'q too long' }, 400);
+
+  const limitRaw = c.req.query('limit');
+  const limit = limitRaw ? Number.parseInt(limitRaw, 10) : SEARCH_LIMIT_DEFAULT;
+  if (!Number.isFinite(limit) || limit < 1 || limit > SEARCH_LIMIT_MAX) {
+    return c.json({ error: `limit must be between 1 and ${SEARCH_LIMIT_MAX}` }, 400);
+  }
+  const regex = c.req.query('regex') === 'true' || c.req.query('regex') === '1';
+
+  try {
+    const result = await searchFiles(located.cwd, { query: q, limit, regex });
+    return c.json({ agent, id, cwd: located.cwd, ...result });
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 500);
+  }
+});
+
+// Coerce truthy/falsy query strings ("true" / "1" / "false" / "0" / "") into
+// a real boolean so the route handler doesn't have to do this dance inline.
+const booleanQuery = z
+  .union([z.string(), z.undefined()])
+  .transform((v) => {
+    if (v === undefined || v === '') return false;
+    return v === 'true' || v === '1';
+  });
+
+const treeQuerySchema = z.object({
+  path: z
+    .union([z.string(), z.undefined()])
+    .transform((v) => (v === undefined ? '' : v)),
+  depth: z
+    .union([z.string(), z.undefined()])
+    .transform((v) => (v === undefined || v === '' ? 1 : Number.parseInt(v, 10)))
+    .pipe(z.number().int().min(1).max(4)),
+  includeHidden: booleanQuery,
+  includeIgnored: booleanQuery,
 });
 
 const clientSchema = z.discriminatedUnion('type', [
@@ -453,6 +664,30 @@ app.get(
             input: p.input,
           },
         });
+      }
+      // Replay the latest live-activity snapshot so a fresh subscriber
+      // (user navigated to sessions list mid-turn, then back) sees the
+      // "Compacting…" / "Thinking…" indicators resume immediately instead
+      // of going blank until the next live event arrives. Drivers that
+      // don't track this leave `getLiveActivity` undefined and we skip.
+      if (session.getLiveActivity) {
+        const live = session.getLiveActivity();
+        if (live.sdkStatus !== 'idle') {
+          send(ws, { type: 'event', event: { type: 'sdk_status', status: live.sdkStatus } });
+        }
+        if (live.thinkingText) {
+          send(ws, { type: 'event', event: { type: 'thinking', text: live.thinkingText } });
+        }
+        if (live.pendingTurns > 0) {
+          // Reuse the `status` frame to carry the in-flight count; mobile
+          // sets pendingTurns from the optional `pending` field on attach.
+          send(ws, {
+            type: 'status',
+            status: session.alive ? 'live-bridge' : 'idle',
+            ...(session.pid !== undefined ? { pid: session.pid } : {}),
+            pending: live.pendingTurns,
+          });
+        }
       }
       let eventCount = 0;
       onEvent = (e: AgentEvent) => {
@@ -551,8 +786,16 @@ app.get(
         try {
           switch (parsed.type) {
             case 'user_message': {
-              console.log(`[bridge] user_message agent=${agent} id=${id.slice(0, 8)} alive=${session.alive}`);
-              if (!session.alive) {
+              console.log(
+                `[bridge] user_message agent=${agent} id=${id.slice(0, 8)} alive=${session.alive} claimed=${session.claimedByBridge}`,
+              );
+              // Conflict-check only on the very first message for this
+              // session in the bridge's current lifetime. The SDK's Query
+              // iterator closes between turns (so `alive` flips back to
+              // false after each `result` event), but ownership doesn't
+              // bounce — once we've spawned (or taken over), we hold the
+              // session for the lifetime of this bridge process.
+              if (!session.alive && !session.claimedByBridge) {
                 const foreign = await runtime.checkDesktopConflict(agent, id);
                 if (foreign) {
                   console.log(`[bridge] session_busy — desktop pids: ${foreign.join(', ')}`);
@@ -563,6 +806,9 @@ app.get(
               }
               try {
                 session.sendUserMessage(parsed.content!);
+                // Mark ownership the first time a send succeeds; subsequent
+                // turns skip the (often-stale) conflict check entirely.
+                session.claimedByBridge = true;
                 console.log(`[bridge] forwarded user_message to subprocess pid=${session.pid}`);
               } catch (sendErr) {
                 console.error(`[bridge] sendUserMessage failed:`, sendErr);
@@ -789,6 +1035,11 @@ async function bootstrap(): Promise<void> {
         console.log('[info] ALLOWED_USERS not set — will auto-detect Tailscale owner on first request');
       }
       void preflight(config.claudeBin);
+      // Log which search backend will be used; helps the operator notice
+      // when ripgrep isn't installed and the grep fallback is in play.
+      void detectSearchBackend().then((b) => {
+        console.log(`[info] file search backend: ${b}${b === 'grep' ? ' (install ripgrep for faster results)' : ''}`);
+      });
       printConnectionQR().catch(() => undefined);
     },
   );

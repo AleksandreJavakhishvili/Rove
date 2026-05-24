@@ -3,6 +3,7 @@ import { fontFamily, fontSize, radius, space } from '@/theme';
 import { useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Diff } from '../Diff';
+import { InlineDiff } from '../InlineDiff';
 import type { ToolCardContext, ToolCardRenderer } from './types';
 
 function obj(input: unknown): Record<string, unknown> {
@@ -140,8 +141,9 @@ const renderRead: ToolCardRenderer = ({ name, input, running, t }) => {
   );
 };
 
-const renderEdit: ToolCardRenderer = ({ name, input, running, t }) => {
+const renderEdit: ToolCardRenderer = ({ agent, sessionId, name, input, running, t }) => {
   const o = obj(input);
+  const filePath = typeof o.file_path === 'string' ? o.file_path : null;
   return (
     <Card t={t}>
       <Header t={t} label={name} running={running} />
@@ -159,12 +161,24 @@ const renderEdit: ToolCardRenderer = ({ name, input, running, t }) => {
             </View>
           ))
         : null}
+      {/* Inline diff against the session baseline — confirms the edit
+       *  actually landed on disk. The input.old/new_string blocks above
+       *  show the *intended* change; this shows the *applied* change. */}
+      {filePath && !running ? (
+        <InlineDiff
+          agent={agent}
+          sessionId={sessionId}
+          path={normalizeFilePath(filePath)}
+          collapsed
+        />
+      ) : null}
     </Card>
   );
 };
 
-const renderWrite: ToolCardRenderer = ({ name, input, running, t }) => {
+const renderWrite: ToolCardRenderer = ({ agent, sessionId, name, input, running, t }) => {
   const o = obj(input);
+  const filePath = typeof o.file_path === 'string' ? o.file_path : null;
   return (
     <Card t={t}>
       <Header t={t} label={name} running={running} />
@@ -172,9 +186,65 @@ const renderWrite: ToolCardRenderer = ({ name, input, running, t }) => {
         {previewPath(o.file_path)}
       </Text>
       {typeof o.content === 'string' ? <CollapsibleMono text={o.content} max={300} t={t} /> : null}
+      {filePath && !running ? (
+        <InlineDiff
+          agent={agent}
+          sessionId={sessionId}
+          path={normalizeFilePath(filePath)}
+          collapsed
+        />
+      ) : null}
     </Card>
   );
 };
+
+const renderNotebookEdit: ToolCardRenderer = ({ agent, sessionId, name, input, running, t }) => {
+  const o = obj(input);
+  // NotebookEdit uses `notebook_path` rather than `file_path`. The diff is
+  // against the .ipynb file itself — noisy because JSON, but better than
+  // nothing.
+  const filePath = typeof o.notebook_path === 'string' ? o.notebook_path : null;
+  return (
+    <Card t={t}>
+      <Header t={t} label={name} running={running} />
+      <Text style={[styles.path, { color: t.text.primary }]} numberOfLines={2}>
+        {previewPath(o.notebook_path)}
+      </Text>
+      {typeof o.cell_id === 'string' ? (
+        <Text style={[styles.dimmed, { color: t.text.secondary }]}>cell {o.cell_id}</Text>
+      ) : null}
+      {filePath && !running ? (
+        <InlineDiff
+          agent={agent}
+          sessionId={sessionId}
+          path={normalizeFilePath(filePath)}
+          collapsed
+        />
+      ) : null}
+    </Card>
+  );
+};
+
+/**
+ * Edit / Write / MultiEdit inputs sometimes carry absolute paths (claude
+ * usually does) and sometimes carry repo-relative paths. The bridge's
+ * `/diff?path=` filter compares against git's `newPath`, which is always
+ * repo-relative POSIX. Strip a leading slash if present so the inline
+ * diff doesn't show a permanent "No diff vs baseline" caption for absolute
+ * paths that match a real changed file under cwd.
+ *
+ * Note: this doesn't try to be clever about path → cwd mapping. If the
+ * agent passes `/Users/x/proj/src/foo.ts` and cwd is `/Users/x/proj`,
+ * the bridge's filter compares `/Users/x/proj/src/foo.ts` to git's
+ * `src/foo.ts` and misses. That's a known limitation — the inline diff
+ * will gracefully degrade to "No diff vs baseline · <path>" and the user
+ * still has the input.old/new_string preview above. Phase 8 (chat ↔
+ * file backlinks) can fix this properly by tracking absolute paths and
+ * resolving them through the session's cwd.
+ */
+function normalizeFilePath(p: string): string {
+  return p.replace(/\\/g, '/').replace(/^\/+/, '');
+}
 
 const renderBash: ToolCardRenderer = ({ input, running, t }) => {
   const o = obj(input);
@@ -314,6 +384,7 @@ export const claudeCodeCards: Record<string, ToolCardRenderer> = {
   Edit: renderEdit,
   MultiEdit: renderEdit,
   Write: renderWrite,
+  NotebookEdit: renderNotebookEdit,
   Bash: renderBash,
   BashOutput: renderBashOutput,
   KillShell: renderKill,

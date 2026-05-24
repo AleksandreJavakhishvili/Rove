@@ -6,6 +6,7 @@ import { pickToolCard } from './cardPacks';
 
 interface ToolUseCardProps {
   agent: AgentKind;
+  sessionId: string;
   name: string;
   input: unknown;
   running?: boolean;
@@ -40,10 +41,10 @@ function asText(content: unknown): string {
  * registry and invokes it. The chat container only ever passes the session's
  * agent down — no string compares on `'claude-code'` happen here.
  */
-export function ToolUseCard({ agent, name, input, running }: ToolUseCardProps) {
+export function ToolUseCard({ agent, sessionId, name, input, running }: ToolUseCardProps) {
   const t = useTheme();
   const render = pickToolCard(agent, name);
-  return <>{render({ agent, name, input, running, t })}</>;
+  return <>{render({ agent, sessionId, name, input, running, t })}</>;
 }
 
 /**

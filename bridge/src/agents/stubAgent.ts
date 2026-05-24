@@ -32,6 +32,7 @@ class StubSession extends EventEmitter implements AgentSession {
   subscribers = 0;
   baselineSha: string | null = null;
   permissionMode: PermissionMode = 'default';
+  claimedByBridge = false;
   private _alive = false;
   private turn = 0;
 

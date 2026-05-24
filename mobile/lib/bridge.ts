@@ -1,10 +1,13 @@
 import type {
   AgentKind,
   ClientToServer,
+  GitStatusResult,
   HistoryEntry,
   PreviewResponse,
+  SearchHit,
   ServerToClient,
   SessionListItem,
+  TreeEntry,
 } from './types';
 
 interface BridgeConfig {
@@ -141,6 +144,157 @@ export interface SessionDiff {
   files: DiffFile[];
 }
 
+export interface TreeListing {
+  agent: AgentKind;
+  id: string;
+  cwd: string;
+  /** Echoed `path` query the bridge resolved against (relative, POSIX). */
+  root: string;
+  entries: TreeEntry[];
+  truncated: boolean;
+}
+
+export interface FetchTreeOpts {
+  /** Subdirectory relative to cwd; defaults to the cwd itself. */
+  path?: string;
+  /** 1–4. Higher → more entries returned (flat list). */
+  depth?: number;
+  includeHidden?: boolean;
+  includeIgnored?: boolean;
+}
+
+/**
+ * GET /sessions/:agent/:id/tree — project file listing for the @-mention
+ * picker (and, later, the Files tab project-tree section). Bridge-side
+ * skips node_modules / .git / etc. and honors .gitignore.
+ */
+export async function fetchTree(
+  cfg: BridgeConfig,
+  agent: AgentKind,
+  id: string,
+  opts: FetchTreeOpts = {},
+): Promise<TreeListing> {
+  const qs = new URLSearchParams();
+  if (opts.path) qs.set('path', opts.path);
+  if (typeof opts.depth === 'number') qs.set('depth', String(opts.depth));
+  if (opts.includeHidden) qs.set('includeHidden', 'true');
+  if (opts.includeIgnored) qs.set('includeIgnored', 'true');
+  const query = qs.toString();
+  const url = `${cfg.baseUrl}/sessions/${encodeURIComponent(agent)}/${id}/tree${query ? `?${query}` : ''}`;
+  const res = await fetchWithTimeout(url, { headers: authHeaders(cfg) }, 15000);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`/tree → ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+export interface GitStatusResponse extends GitStatusResult {
+  agent: AgentKind;
+  id: string;
+  cwd: string;
+}
+
+/**
+ * GET /sessions/:agent/:id/git/status — full working-tree git status,
+ * independent of the session's own baseline diff. Returns `isRepo: false`
+ * (with empty fields) when the cwd isn't a git repo; the caller should
+ * hide the section in that case rather than render an error.
+ */
+export async function fetchGitStatus(
+  cfg: BridgeConfig,
+  agent: AgentKind,
+  id: string,
+): Promise<GitStatusResponse> {
+  const res = await fetchWithTimeout(
+    `${cfg.baseUrl}/sessions/${encodeURIComponent(agent)}/${id}/git/status`,
+    { headers: authHeaders(cfg) },
+    15000,
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`/git/status → ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+export interface GitDiffFileResponse {
+  agent: AgentKind;
+  id: string;
+  cwd: string;
+  path: string;
+  staged: boolean;
+  /** null when there's no diff for this file in the requested mode. */
+  file: DiffFile | null;
+}
+
+/**
+ * GET /sessions/:agent/:id/git/diff — per-file diff vs HEAD (default) or
+ * vs index (`staged=true`). Different code path from `/diff?path=` which
+ * is session-baseline-relative; this one is pure git working-tree state.
+ */
+export async function fetchGitDiffFile(
+  cfg: BridgeConfig,
+  agent: AgentKind,
+  id: string,
+  path: string,
+  opts: { staged?: boolean } = {},
+): Promise<GitDiffFileResponse> {
+  const qs = new URLSearchParams({ path });
+  if (opts.staged) qs.set('staged', 'true');
+  const res = await fetchWithTimeout(
+    `${cfg.baseUrl}/sessions/${encodeURIComponent(agent)}/${id}/git/diff?${qs.toString()}`,
+    { headers: authHeaders(cfg) },
+    15000,
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`/git/diff → ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+export interface SearchResponse {
+  agent: AgentKind;
+  id: string;
+  cwd: string;
+  hits: SearchHit[];
+  truncated: boolean;
+  backend: 'ripgrep' | 'grep';
+}
+
+export interface FetchSearchOpts {
+  /** 1–500. Defaults to 100 on the bridge side. */
+  limit?: number;
+  /** True → PCRE-lite regex (ripgrep) or BRE (grep fallback). */
+  regex?: boolean;
+}
+
+/** GET /sessions/:agent/:id/search — file-contents search backed by ripgrep
+ *  (preferred) or POSIX grep (fallback). Returns hits with line/column +
+ *  a clipped preview snippet for the UI. */
+export async function fetchSearch(
+  cfg: BridgeConfig,
+  agent: AgentKind,
+  id: string,
+  query: string,
+  opts: FetchSearchOpts = {},
+): Promise<SearchResponse> {
+  const qs = new URLSearchParams({ q: query });
+  if (typeof opts.limit === 'number') qs.set('limit', String(opts.limit));
+  if (opts.regex) qs.set('regex', 'true');
+  const res = await fetchWithTimeout(
+    `${cfg.baseUrl}/sessions/${encodeURIComponent(agent)}/${id}/search?${qs.toString()}`,
+    { headers: authHeaders(cfg) },
+    20000,
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`/search → ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
 export async function fetchPreview(
   cfg: BridgeConfig,
   agent: AgentKind,
@@ -155,16 +309,23 @@ export async function fetchPreview(
   return res.json();
 }
 
+export interface FetchDiffOpts {
+  /** When set, the response only contains the diff for this single file
+   *  (relative POSIX path matching either newPath or oldPath). */
+  path?: string;
+}
+
 export async function fetchDiff(
   cfg: BridgeConfig,
   agent: AgentKind,
   id: string,
+  opts: FetchDiffOpts = {},
 ): Promise<SessionDiff> {
-  const res = await fetchWithTimeout(
-    `${cfg.baseUrl}/sessions/${encodeURIComponent(agent)}/${id}/diff`,
-    { headers: authHeaders(cfg) },
-    15000,
-  );
+  const qs = new URLSearchParams();
+  if (opts.path) qs.set('path', opts.path);
+  const query = qs.toString();
+  const url = `${cfg.baseUrl}/sessions/${encodeURIComponent(agent)}/${id}/diff${query ? `?${query}` : ''}`;
+  const res = await fetchWithTimeout(url, { headers: authHeaders(cfg) }, 15000);
   if (!res.ok) throw new Error(`/diff → ${res.status}`);
   return res.json();
 }

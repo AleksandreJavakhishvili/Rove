@@ -41,6 +41,12 @@ class SessionRuntime {
   /**
    * Checks for a live desktop process holding the session file. Returns the
    * list of foreign PIDs if one is found, or null if the session is free.
+   *
+   * Finishes with a `process.kill(pid, 0)` liveness probe so a stale entry
+   * in the lsof cache (or a pid that died between the ps snapshot and this
+   * call) can't surface a phantom desktop conflict. Without this, a fresh
+   * takeover would routinely fire `session_busy` again on the very next
+   * user message because the cache hadn't refreshed yet.
    */
   async checkDesktopConflict(agent: AgentKind, sessionId: string): Promise<number[] | null> {
     const driver = getDriver(agent);
@@ -48,7 +54,16 @@ class SessionRuntime {
     const ourPid = this.get(agent, sessionId)?.pid;
     const allPids = await driver.getDesktopPids(sessionId);
     const foreign = allPids.filter((p) => p !== ourPid && p !== process.pid);
-    return foreign.length ? foreign : null;
+    if (foreign.length === 0) return null;
+    const alive = foreign.filter((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    return alive.length ? alive : null;
   }
 
   async getOrCreate(agent: AgentKind, sessionId: string): Promise<AgentSession> {

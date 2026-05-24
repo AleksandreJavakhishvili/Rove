@@ -48,7 +48,7 @@ export type ServerToClient =
   | { type: 'history_replay_start' }
   | { type: 'history_replay_end' }
   | { type: 'history_entry'; entry: HistoryEntry }
-  | { type: 'status'; status: SessionStatus; pid?: number }
+  | { type: 'status'; status: SessionStatus; pid?: number; pending?: number }
   | { type: 'error'; message: string }
   | { type: 'file_changed'; path: string; op: 'add' | 'change' | 'unlink' }
   | { type: 'session_busy'; pids: number[]; source: 'desktop' | 'other_bridge' }

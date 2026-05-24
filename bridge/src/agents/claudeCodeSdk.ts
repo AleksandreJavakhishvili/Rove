@@ -431,6 +431,21 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
   subscribers = 0;
   baselineSha: string | null = null;
   permissionMode: PermissionMode = envMode();
+  claimedByBridge = false;
+  /**
+   * Latest live-activity snapshot. Kept on the session so a re-attaching
+   * client (user navigated to sessions list mid-turn, then back) can
+   * resume showing "Compacting…" / thinking text without waiting for the
+   * next event to land. Reset when the current turn ends (`result`).
+   */
+  liveActivity: {
+    sdkStatus: SdkRunStatus;
+    thinkingText: string | null;
+    /** Number of user messages we've pushed that haven't seen a `result`
+     *  reply yet. Drives the "Claude is thinking…" footer when a turn is
+     *  in progress but no thinking text has arrived. */
+    pendingTurns: number;
+  } = { sdkStatus: SDK_RUN_STATUS.idle, thinkingText: null, pendingTurns: 0 };
   /** Tracks the model the SDK reports in its `init` system message; '' until
    *  the first turn so the capabilities snapshot can omit the model picker if
    *  we never get one. */
@@ -475,6 +490,20 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       sessionForking: true,
       interrupt: true,
       nativeFileChanges: true,
+      // Claude Code's cwd is always a real filesystem path the bridge can
+      // read. Gated on the directory still existing — if the user deletes
+      // the project after the session was created we degrade to "no
+      // browser" instead of erroring out the whole capability payload.
+      projectBrowser: existsSync(this.cwd),
+      // Git working-tree visibility. Gated on `.git` existing under the
+      // cwd; if it doesn't (plain directory, not a repo) we hide the git
+      // section in the Files tab rather than failing the call.
+      gitStatus: existsSync(`${this.cwd}/.git`),
+      // File-contents search. Gated on the cwd existing — the search
+      // backend (ripgrep / grep) is probed lazily on first /search call,
+      // so we don't need to fail the capability if rg is missing; the
+      // grep fallback covers it on every macOS / Linux box.
+      projectSearch: existsSync(this.cwd),
     };
   }
 
@@ -632,7 +661,10 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
             this.emit('event', { type: 'capabilities', capabilities: this.capabilities() });
           }
         });
-        for (const ev of events) this.emit('event', ev);
+        for (const ev of events) {
+          this.trackLiveActivity(ev);
+          this.emit('event', ev);
+        }
       }
     } catch (err) {
       console.error(`[claude-sdk ${this.sessionId.slice(0, 8)}] query threw:`, err);
@@ -662,8 +694,53 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       uuid,
     } as unknown as SDKUserMessage;
     this.pendingUserSends.push({ uuid, content, sentAt: Date.now() });
+    // Bump pending-turns so a re-attaching client knows a turn is in
+    // flight even before the first assistant chunk arrives. Decremented
+    // when the SDK emits a `result` event (see trackLiveActivity).
+    this.liveActivity.pendingTurns += 1;
     this.pushInput(userMsg);
     this.lastActivity = Date.now();
+  }
+
+  /**
+   * Snoop on every event we're about to emit and update the per-session
+   * `liveActivity` cache. The cache is the source of truth a re-attaching
+   * client reads (via `getLiveActivity`) to restore the chat's "Thinking…"
+   * / "Compacting…" indicators without waiting for the next live event.
+   */
+  private trackLiveActivity(ev: AgentEvent): void {
+    if (ev.type === 'sdk_status') {
+      this.liveActivity.sdkStatus = ev.status;
+      return;
+    }
+    if (ev.type === 'thinking') {
+      const last3 = ev.text.split('\n').slice(-3).join('\n').trim();
+      if (last3) this.liveActivity.thinkingText = last3;
+      return;
+    }
+    if (ev.type === 'text' || ev.type === 'text_delta' || ev.type === 'tool_use') {
+      // Real output ends the "thinking" phase — drop the buffered thinking
+      // ticker so a late re-attach doesn't show a stale block.
+      this.liveActivity.thinkingText = null;
+      return;
+    }
+    if (ev.type === 'result') {
+      this.liveActivity.thinkingText = null;
+      this.liveActivity.sdkStatus = SDK_RUN_STATUS.idle;
+      if (this.liveActivity.pendingTurns > 0) this.liveActivity.pendingTurns -= 1;
+      return;
+    }
+  }
+
+  /** Snapshot used by the WS attach handler to replay live state to a
+   *  fresh subscriber so navigating-away-and-back doesn't lose the
+   *  "Thinking…" / "Compacting…" indicators mid-turn. */
+  getLiveActivity(): {
+    sdkStatus: SdkRunStatus;
+    thinkingText: string | null;
+    pendingTurns: number;
+  } {
+    return { ...this.liveActivity };
   }
 
   /** Snapshot of in-flight user sends, with TTL-stale entries pruned. The

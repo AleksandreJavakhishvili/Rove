@@ -51,6 +51,95 @@ export const COMPACT_TRIGGER = {
 /** Outcome of an attempted compaction, when the SDK reports it. */
 export type CompactResult = 'success' | 'failed';
 
+/**
+ * Kind of entry returned by the project-tree endpoint. `symlink` is exposed
+ * so the UI can render a visual cue; resolution still happens server-side
+ * and any symlink escaping the session cwd is rejected at the route layer.
+ */
+export type TreeEntryKind = 'file' | 'dir' | 'symlink';
+export const TREE_ENTRY_KIND = {
+  file: 'file',
+  dir: 'dir',
+  symlink: 'symlink',
+} as const satisfies Record<TreeEntryKind, TreeEntryKind>;
+
+/**
+ * Single entry returned by `GET /sessions/:agent/:id/tree`. Paths are
+ * always relative to the session cwd and use POSIX separators so the
+ * mobile / web client never has to worry about platform path quirks.
+ */
+export interface TreeEntry {
+  /** basename — e.g. `Markdown.tsx`. */
+  name: string;
+  /** Relative-to-cwd POSIX path — e.g. `mobile/components/chat/Markdown.tsx`. */
+  path: string;
+  kind: TreeEntryKind;
+  size?: number;
+  modifiedMs?: number;
+  /** True when `.gitignore` would exclude this entry. UI dims rather than hides. */
+  gitIgnored?: boolean;
+  /** True for dotfiles (leading `.`). UI can collapse these under a toggle. */
+  hidden?: boolean;
+}
+
+/**
+ * Status flags returned by `git status --porcelain=v2` for the index and
+ * worktree halves of a path. `unmodified` is the porcelain `.` character;
+ * the rest mirror git's letter codes. Returned for both the index and the
+ * worktree position so the UI can render "M /" vs "/M" vs "MM" correctly.
+ */
+export type GitFileStatus =
+  | 'unmodified'
+  | 'modified'
+  | 'added'
+  | 'deleted'
+  | 'renamed'
+  | 'copied'
+  | 'untracked'
+  | 'ignored'
+  | 'typeChange'
+  | 'updatedButUnmerged';
+export const GIT_FILE_STATUS = {
+  unmodified: 'unmodified',
+  modified: 'modified',
+  added: 'added',
+  deleted: 'deleted',
+  renamed: 'renamed',
+  copied: 'copied',
+  untracked: 'untracked',
+  ignored: 'ignored',
+  typeChange: 'typeChange',
+  updatedButUnmerged: 'updatedButUnmerged',
+} as const satisfies Record<GitFileStatus, GitFileStatus>;
+
+/**
+ * Single entry parsed out of `git status --porcelain=v2 -z`. Both
+ * `indexStatus` and `worktreeStatus` are surfaced separately so the UI
+ * can group "staged" (index ≠ unmodified) vs "modified" (worktree ≠
+ * unmodified) without re-deriving from a single combined glyph.
+ */
+export interface GitStatusEntry {
+  path: string;
+  /** Set when `path` is a rename target — original path on the index side. */
+  renamedFrom?: string;
+  indexStatus: GitFileStatus;
+  worktreeStatus: GitFileStatus;
+  isUntracked: boolean;
+  isIgnored: boolean;
+}
+
+/** Top-level shape of `GET /sessions/:agent/:id/git/status`. */
+export interface GitStatusResult {
+  isRepo: boolean;
+  branch: string | null;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  entries: GitStatusEntry[];
+  /** True when the parse was cut short by the server-side timeout / cap. */
+  incomplete?: boolean;
+}
+
 export interface AgentMetadata {
   kind: AgentKind;
   displayName: string;
@@ -99,6 +188,43 @@ export interface AgentCapabilities {
    * watch fallback — so drivers that can't surface this should not register.
    */
   nativeFileChanges?: boolean;
+  /**
+   * Driver's session cwd is a real filesystem path the bridge can read.
+   * Enables `GET /sessions/:agent/:id/tree` for the @-mention picker and
+   * (later) the Files-tab project tree. Reported false by drivers whose
+   * cwd is synthetic or sandboxed.
+   */
+  projectBrowser?: boolean;
+  /**
+   * Session cwd is a git working tree. Enables `GET /git/status` (full
+   * working-tree state, independent of the session's own baseline diff)
+   * and `GET /git/diff` (per-file diff vs HEAD or vs index). Reported
+   * false when `.git` is absent or git isn't on PATH.
+   */
+  gitStatus?: boolean;
+  /**
+   * `GET /search` endpoint supported — drives the Files-tab search bar.
+   * Backed by ripgrep when available, falling back to POSIX grep. The
+   * driver should set this to false if its cwd isn't a real filesystem
+   * path or if both binaries are missing from PATH.
+   */
+  projectSearch?: boolean;
+}
+
+/** Single match returned by `GET /sessions/:agent/:id/search`. */
+export interface SearchHit {
+  /** Relative-to-cwd POSIX path. */
+  path: string;
+  /** 1-based line number of the match. */
+  line: number;
+  /** 1-based column where the match starts on the line. */
+  column: number;
+  /** Full text of the matched line (trimmed at MAX_PREVIEW_LEN by the bridge). */
+  preview: string;
+  /** Character offset (within `preview`) where the match starts. */
+  matchStart: number;
+  /** Character offset (within `preview`) where the match ends, exclusive. */
+  matchEnd: number;
 }
 
 /**
@@ -154,6 +280,27 @@ export interface AgentSession {
   permissionMode: PermissionMode;
   subscribers: number;
   lastActivity: number;
+  /**
+   * Set to `true` once the bridge has either spawned this session
+   * successfully or completed a takeover of a desktop process holding it.
+   * Once claimed, the per-message conflict check is skipped — otherwise
+   * the SDK's Query iterator closing between turns (which flips `alive`
+   * back to `false`) would re-trigger `session_busy` against any lingering
+   * desktop `claude` pid even though the user already has ownership.
+   * Resets only if the bridge process restarts.
+   */
+  claimedByBridge: boolean;
+  /**
+   * Snapshot of the session's live activity (sdk status, most recent
+   * thinking text, pending-turns count). Optional — drivers that don't
+   * track this leave it undefined and re-attaching clients just get the
+   * regular live-event stream as it arrives.
+   */
+  getLiveActivity?(): {
+    sdkStatus: SdkRunStatus;
+    thinkingText: string | null;
+    pendingTurns: number;
+  };
   on<K extends keyof SessionLifecycleListeners>(event: K, listener: SessionLifecycleListeners[K]): this;
   off<K extends keyof SessionLifecycleListeners>(event: K, listener: SessionLifecycleListeners[K]): this;
   /** Synthesize an event to subscribers (used by the bridge to forward MCP-originated events). */

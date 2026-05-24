@@ -85,6 +85,80 @@ export const COMPACT_TRIGGER = {
 /** Mirror of the bridge's `CompactResult`. */
 export type CompactResult = 'success' | 'failed';
 
+/** Mirror of the bridge's `TreeEntryKind`. */
+export type TreeEntryKind = 'file' | 'dir' | 'symlink';
+export const TREE_ENTRY_KIND = {
+  file: 'file',
+  dir: 'dir',
+  symlink: 'symlink',
+} as const satisfies Record<TreeEntryKind, TreeEntryKind>;
+
+/** Mirror of the bridge's `TreeEntry`. Paths are relative to session cwd
+ *  and use POSIX separators on every platform. */
+export interface TreeEntry {
+  name: string;
+  path: string;
+  kind: TreeEntryKind;
+  size?: number;
+  modifiedMs?: number;
+  gitIgnored?: boolean;
+  hidden?: boolean;
+}
+
+/** Mirror of the bridge's `GitFileStatus`. */
+export type GitFileStatus =
+  | 'unmodified'
+  | 'modified'
+  | 'added'
+  | 'deleted'
+  | 'renamed'
+  | 'copied'
+  | 'untracked'
+  | 'ignored'
+  | 'typeChange'
+  | 'updatedButUnmerged';
+export const GIT_FILE_STATUS = {
+  unmodified: 'unmodified',
+  modified: 'modified',
+  added: 'added',
+  deleted: 'deleted',
+  renamed: 'renamed',
+  copied: 'copied',
+  untracked: 'untracked',
+  ignored: 'ignored',
+  typeChange: 'typeChange',
+  updatedButUnmerged: 'updatedButUnmerged',
+} as const satisfies Record<GitFileStatus, GitFileStatus>;
+
+export interface GitStatusEntry {
+  path: string;
+  renamedFrom?: string;
+  indexStatus: GitFileStatus;
+  worktreeStatus: GitFileStatus;
+  isUntracked: boolean;
+  isIgnored: boolean;
+}
+
+export interface GitStatusResult {
+  isRepo: boolean;
+  branch: string | null;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  entries: GitStatusEntry[];
+  incomplete?: boolean;
+}
+
+/** Mirror of the bridge's `SearchHit`. */
+export interface SearchHit {
+  path: string;
+  line: number;
+  column: number;
+  preview: string;
+  matchStart: number;
+  matchEnd: number;
+}
+
 /** Capability snapshot the bridge publishes on session attach. Mobile mirrors
  *  it into a per-(agent,sessionId) slice and gates chat-header controls,
  *  approval surfaces, and rewind/fork actions on the matching field. */
@@ -96,6 +170,14 @@ export interface AgentCapabilities {
   fileCheckpointing: boolean;
   sessionForking: boolean;
   interrupt: boolean;
+  /** Driver emits file_changed events itself. Required by the server today. */
+  nativeFileChanges?: boolean;
+  /** /tree endpoint supported — drives the @-mention picker and Files tab. */
+  projectBrowser?: boolean;
+  /** /git/status + /git/diff endpoints supported — drives the Files tab's git section. */
+  gitStatus?: boolean;
+  /** /search endpoint supported — drives the Files tab's search bar. */
+  projectSearch?: boolean;
 }
 
 export type AgentEvent =
@@ -131,7 +213,7 @@ export type ServerToClient =
   | { type: 'history_replay_start' }
   | { type: 'history_replay_end' }
   | { type: 'history_entry'; entry: HistoryEntry }
-  | { type: 'status'; status: SessionStatus; pid?: number }
+  | { type: 'status'; status: SessionStatus; pid?: number; pending?: number }
   | { type: 'error'; message: string }
   | { type: 'file_changed'; path: string; op: 'add' | 'change' | 'unlink' }
   | { type: 'session_busy'; pids: number[]; source: 'desktop' | 'other_bridge' }

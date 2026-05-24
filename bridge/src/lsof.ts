@@ -37,6 +37,20 @@ export async function getLiveClaudes(): Promise<LiveClaude[]> {
   return procs;
 }
 
+/**
+ * Explicitly drop the in-memory `ps` snapshot. Called by the takeover route
+ * after killing a desktop claude so the immediately-following user_message's
+ * conflict-check doesn't see the dead pid still listed in the cache.
+ *
+ * Without this, a quick "send → takeover → send again" sequence trips a
+ * false `session_busy` (the cache hasn't expired yet) and then a 409 on the
+ * second takeover (the pid is really dead by then). See the screenshot in
+ * the 2026-05-24 file-visibility chat thread for the user-visible bug.
+ */
+export function invalidateClaudeCache(): void {
+  cache = null;
+}
+
 async function listClaudeProcesses(): Promise<LiveClaude[]> {
   let stdout = '';
   try {

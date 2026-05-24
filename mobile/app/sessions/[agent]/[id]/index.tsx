@@ -1,8 +1,21 @@
 import { ApprovalSheet, type PendingApproval } from '@/components/chat/ApprovalSheet';
+import {
+  BubbleActionMenu,
+  copyAction,
+  rewindAction,
+  triggerOpenHaptic,
+  type BubbleAction,
+  type BubbleMenuAnchor,
+} from '@/components/chat/BubbleActionMenu';
+import { PressableBubble } from '@/components/chat/PressableBubble';
 import { ChatPreviewPager } from '@/components/chat/ChatPreviewPager';
 import { Markdown } from '@/components/chat/Markdown';
+import { MentionPicker } from '@/components/chat/MentionPicker';
 import { PreviewPane } from '@/components/chat/PreviewPane';
 import { ToolResultCard, ToolUseCard } from '@/components/chat/ToolCard';
+import { FilesPane } from '@/components/files/FilesPane';
+import { SessionsSidebar } from '@/components/SessionsSidebar';
+import { WorkspacePane } from '@/components/WorkspacePane';
 import {
   fetchHistory,
   fetchSessionInfo,
@@ -13,6 +26,10 @@ import {
   takeOwnership,
   type ConnectionState,
 } from '@/lib/bridge';
+import {
+  clearInlineDiffCacheForSession,
+  invalidateInlineDiffsForPath,
+} from '@/lib/diffCache';
 import {
   useHydratedSettings,
   useSessionCapabilities,
@@ -102,17 +119,23 @@ type ChatItem =
 // `<local-command-stdout>…</local-command-stdout>`. These artifacts live
 // in the JSONL transcript but are noise to display verbatim — surface them
 // as a small meta pill so the user sees "what happened" without the XML.
-const SLASH_CMD_WRAPPER_RE = /^\s*<command-name>([^<]+)<\/command-name>/;
-const LOCAL_STDOUT_WRAPPER_RE = /^\s*<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*$/;
+// Match anywhere in the text — not anchored — so wrappers that have leading
+// whitespace, surrounding blank lines, or unexpected sibling tags still get
+// caught. Claude Code's exact serialization has shifted at least once and
+// we want this filter to be robust against future small format changes.
+const SLASH_CMD_WRAPPER_RE = /<command-name>([^<]+)<\/command-name>/;
+const LOCAL_STDOUT_WRAPPER_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/;
 
 function slashCommandMeta(text: string, id: string): ChatItem | null {
   const cmd = text.match(SLASH_CMD_WRAPPER_RE);
   if (cmd) {
-    return { id, kind: 'meta', text: `Ran ${cmd[1].trim()}` };
+    const name = (cmd[1] ?? '').trim();
+    if (!name) return null;
+    return { id, kind: 'meta', text: `Ran ${name}` };
   }
   const out = text.match(LOCAL_STDOUT_WRAPPER_RE);
   if (out) {
-    const body = out[1].trim();
+    const body = (out[1] ?? '').trim();
     if (!body) return null;
     return { id, kind: 'meta', text: body };
   }
@@ -225,8 +248,6 @@ const MODE_LABEL: Record<PermissionMode, string> = {
   bypassPermissions: 'bypass',
 };
 
-/** Short label for the chat-header model chip — strips the long anthropic
- *  prefix so a full ID like `claude-opus-4-7-1m` collapses to `opus-4-7-1m`. */
 function modelDisplay(model: string): string {
   return model.replace(/^claude-/, '');
 }
@@ -281,6 +302,19 @@ export default function ChatScreen() {
   // text_delta, or tool_use) starts to land, and on result/process_exit. This
   // is the live preview — historical thinking blocks are not (yet) rendered.
   const [thinkingTicker, setThinkingTicker] = useState<string>('');
+  // Caret position in `draft`. Tracked via TextInput.onSelectionChange so the
+  // @-mention picker knows where the `@<token>` lives. Defaults to end-of-
+  // draft so picker-less typing still inserts in the right place.
+  const [draftCaret, setDraftCaret] = useState<number>(0);
+  // One-shot selection override: when non-null, the TextInput renders with
+  // this selection forced (used after the mention picker splices into the
+  // draft so the caret lands after the inserted token, not at end-of-text).
+  // Cleared as soon as the next selection event fires.
+  const [pendingSelection, setPendingSelection] = useState<{ start: number; end: number } | null>(null);
+  // Bumped on every `file_changed` event so the mention picker drops its
+  // cached tree on next open. The picker also honors a wall-clock TTL.
+  const [mentionRefreshKey, setMentionRefreshKey] = useState<number>(0);
+  const inputRef = useRef<TextInput>(null);
   const [modePickerOpen, setModePickerOpen] = useState(false);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   // Bumped when the app comes back to the foreground while the chat WS isn't
@@ -289,6 +323,11 @@ export default function ChatScreen() {
   // kills it during backgrounding and the next user action (approval tap,
   // message send) fails with "stream not open".
   const [reconnectNonce, setReconnectNonce] = useState(0);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [bubbleMenu, setBubbleMenu] = useState<{
+    anchor: BubbleMenuAnchor;
+    actions: BubbleAction[];
+  } | null>(null);
   const connStateRef = useRef<ConnectionState>('connecting');
   connStateRef.current = connState;
   const listRef = useRef<FlatList<ChatItem>>(null);
@@ -481,6 +520,13 @@ export default function ChatScreen() {
               break;
             case 'status':
               setStatus(msg.status);
+              // Bridge re-emits the in-flight turn count when we reattach
+              // mid-turn (user navigated away and back). Restore pending so
+              // the "Thinking…" footer shows immediately instead of waiting
+              // for the next event.
+              if (typeof msg.pending === 'number' && msg.pending > 0) {
+                setPendingTurns((n) => Math.max(n, msg.pending ?? 0));
+              }
               break;
             case 'session_busy':
               setItems((prev) => {
@@ -516,6 +562,14 @@ export default function ChatScreen() {
                 else next.set(msg.path, msg.op);
                 return next;
               });
+              // Invalidate the mention picker's cached tree — a newly-created
+              // file should show up on the next `@` and a deleted one should
+              // disappear without a stale TTL window.
+              setMentionRefreshKey((n) => n + 1);
+              // Invalidate any cached inline diff for the touched path so the
+              // next render of an Edit/Write card refetches against the
+              // freshly-modified file rather than reading a stale hunk set.
+              invalidateInlineDiffsForPath(msg.path);
               break;
             case 'process_exit':
               setPendingTurns((n) => Math.max(0, n - 1));
@@ -755,6 +809,9 @@ export default function ChatScreen() {
       handle.close();
       sendRef.current = null;
       clearCapabilities(agent, id);
+      // Drop any cached per-file diffs for this session so a dead session
+      // doesn't pin memory. The cache also has an LRU cap as a backstop.
+      clearInlineDiffCacheForSession(agent, id);
     };
   }, [settings.baseUrl, settings.token, agent, id, reconnectNonce, setCapabilities, clearCapabilities]);
 
@@ -815,6 +872,27 @@ export default function ChatScreen() {
   function onInterrupt() {
     sendRef.current?.({ type: 'interrupt' });
   }
+
+  // Splice `insertion` into the draft, replacing the `@<token>` the picker
+  // was anchored on. Append a trailing space so the next keystroke starts a
+  // new word — keeps the picker from re-opening immediately on the same
+  // token. The one-shot `pendingSelection` forces the caret past the
+  // inserted text on the very next render; React Native then releases
+  // control as soon as the user (or RN's own re-layout) emits the next
+  // selection event.
+  const onMentionPick = useCallback(
+    (insertion: string, range: { start: number; end: number }) => {
+      const inserted = `${insertion} `;
+      setDraft((prev) => prev.slice(0, range.start) + inserted + prev.slice(range.end));
+      const nextCaret = range.start + inserted.length;
+      setDraftCaret(nextCaret);
+      setPendingSelection({ start: nextCaret, end: nextCaret });
+      // Re-focus the input — on iOS the picker tap can momentarily steal
+      // focus even with keyboardShouldPersistTaps; this restores it.
+      requestAnimationFrame(() => inputRef.current?.focus());
+    },
+    [],
+  );
 
   async function onLoadOlder() {
     if (loadingOlder || !olderCursor.hasMore || !olderCursor.before) return;
@@ -1042,6 +1120,17 @@ export default function ChatScreen() {
           gestureEnabled: pagerIndex === 0,
           headerBackTitle: '',
           headerBackButtonDisplayMode: 'minimal',
+          // Burger opens an in-place sidebar drawer with the session list
+          // so the user can swap chats without losing the current screen's
+          // scroll position or stacking history.
+          headerLeft: () => (
+            <Pressable
+              onPress={() => setSidebarOpen(true)}
+              hitSlop={8}
+              style={styles.headerLeftButton}>
+              <Ionicons name="menu" size={fontSize['4xl']} color={t.accent.primary} />
+            </Pressable>
+          ),
           headerTitle: () => (
             <Pressable onPress={onRename} hitSlop={8} style={{ alignItems: 'center' }}>
               <Text
@@ -1208,10 +1297,17 @@ export default function ChatScreen() {
             <View style={styles.filesList}>
               {Array.from(changedFiles.entries()).map(([path, op]) => {
                 const o = opStyle(op, t);
+                const encoded = encodeURIComponent(path);
                 return (
                   <Pressable
                     key={path}
-                    onPress={() => router.push(`/sessions/${agent}/${id}/file?path=${encodeURIComponent(path)}`)}
+                    // Tap → per-file diff (Phase 2). Long-press → full file
+                    // viewer (the old default behavior, kept as an escape
+                    // hatch for "I want to see the current contents, not
+                    // just what changed").
+                    onPress={() => router.push(`/sessions/${agent}/${id}/diff?path=${encoded}`)}
+                    onLongPress={() => router.push(`/sessions/${agent}/${id}/file?path=${encoded}`)}
+                    delayLongPress={350}
                     style={styles.fileRow}>
                     <Text style={[styles.fileOp, { color: o.color }]}>{o.symbol}</Text>
                     <Text style={[styles.filePath, { color: t.text.primary }]} numberOfLines={1}>
@@ -1251,9 +1347,11 @@ export default function ChatScreen() {
               <ChatRow
                 item={item}
                 agent={agent}
+                sessionId={id}
                 onTakeover={onTakeover}
                 rewindEnabled={Boolean(capabilities?.fileCheckpointing)}
                 onRewindRequest={onRewindRequest}
+                onRequestMenu={(anchor, actions) => setBubbleMenu({ anchor, actions })}
               />
             </View>
           );
@@ -1315,6 +1413,16 @@ export default function ChatScreen() {
                 : 'Claude is thinking…'}
           </Text>
         </View>
+      ) : null}
+      {capabilities?.projectBrowser ? (
+        <MentionPicker
+          agent={agent}
+          sessionId={id}
+          draft={draft}
+          caret={draftCaret}
+          refreshKey={mentionRefreshKey}
+          onPick={onMentionPick}
+        />
       ) : null}
       {draft.startsWith('/') ? <SlashPicker draft={draft} onPick={(cmd) => setDraft(cmd + ' ')} /> : null}
       {attachments.length > 0 ? (
@@ -1392,8 +1500,21 @@ export default function ChatScreen() {
           )}
         </Pressable>
         <TextInput
+          ref={inputRef}
           value={draft}
-          onChangeText={setDraft}
+          onChangeText={(text) => {
+            setDraft(text);
+            // Keep the caret tracked even between selection events; typing
+            // at end-of-input doesn't always fire onSelectionChange first.
+            setDraftCaret(text.length);
+          }}
+          onSelectionChange={(e) => {
+            setDraftCaret(e.nativeEvent.selection.start);
+            // Release the one-shot selection override on the first natural
+            // selection event after a mention insertion.
+            if (pendingSelection) setPendingSelection(null);
+          }}
+          selection={pendingSelection ?? undefined}
           multiline
           placeholder={sending ? 'Queue your next message…' : 'Message your agent'}
           placeholderTextColor={t.text.placeholder}
@@ -1427,11 +1548,41 @@ export default function ChatScreen() {
   );
 
   return (
-    <ChatPreviewPager
-      chat={chatBody}
-      preview={(active) => <PreviewPane agent={agent} id={id} active={active} />}
-      onIndexChange={setPagerIndex}
-    />
+    <>
+      <ChatPreviewPager
+        chat={chatBody}
+        workspace={(active) => (
+          <WorkspacePane
+            active={active}
+            files={(filesActive) => (
+              <FilesPane
+                agent={agent}
+                sessionId={id}
+                active={filesActive}
+                sessionChanges={changedFiles}
+                capabilities={capabilities}
+              />
+            )}
+            preview={(previewActive) => (
+              <PreviewPane agent={agent} id={id} active={previewActive} />
+            )}
+          />
+        )}
+        onIndexChange={setPagerIndex}
+      />
+      <SessionsSidebar
+        visible={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        currentAgent={agent}
+        currentSessionId={id}
+      />
+      <BubbleActionMenu
+        visible={bubbleMenu !== null}
+        anchor={bubbleMenu?.anchor ?? null}
+        actions={bubbleMenu?.actions ?? []}
+        onClose={() => setBubbleMenu(null)}
+      />
+    </>
   );
 }
 
@@ -1475,40 +1626,67 @@ const ChatRow = memo(
   function ChatRow({
     item,
     agent,
+    sessionId,
     onTakeover,
     rewindEnabled,
     onRewindRequest,
+    onRequestMenu,
   }: {
     item: ChatItem;
     agent: string;
+    sessionId: string;
     onTakeover: (pendingMessage: string) => void;
     rewindEnabled: boolean;
     onRewindRequest: (messageId: string) => void;
+    onRequestMenu: (anchor: BubbleMenuAnchor, actions: BubbleAction[]) => void;
   }) {
     const t = useTheme();
 
     if (item.kind === 'user') {
       return (
-        <View style={[styles.bubbleUser, { backgroundColor: t.bubble.userBg }]}>
+        <PressableBubble
+          onLongPress={(e) => {
+            triggerOpenHaptic();
+            onRequestMenu(
+              { x: e.nativeEvent.pageX, y: e.nativeEvent.pageY },
+              [copyAction(item.text)],
+            );
+          }}
+          style={[styles.bubbleUser, { backgroundColor: t.bubble.userBg }]}>
           <Markdown text={item.text.trim()} color={t.bubble.userFg} />
-        </View>
+        </PressableBubble>
       );
     }
     if (item.kind === 'assistant') {
       const canRewind = rewindEnabled && Boolean(item.messageId);
       return (
-        <Pressable
-          onLongPress={() => {
-            if (canRewind && item.messageId) onRewindRequest(item.messageId);
+        <PressableBubble
+          onLongPress={(e) => {
+            triggerOpenHaptic();
+            const actions: BubbleAction[] = [copyAction(item.text)];
+            if (canRewind && item.messageId) {
+              actions.push(rewindAction(item.messageId, onRewindRequest));
+            }
+            onRequestMenu(
+              { x: e.nativeEvent.pageX, y: e.nativeEvent.pageY },
+              actions,
+            );
           }}
-          delayLongPress={450}
           style={[styles.bubbleAssistant, { backgroundColor: t.bubble.assistantBg }]}>
           <Markdown text={item.text.trim()} color={t.bubble.assistantFg} />
-        </Pressable>
+        </PressableBubble>
       );
     }
     if (item.kind === 'tool_use') {
-      return <ToolUseCard agent={agent} name={item.name} input={item.input} running={item.running} />;
+      return (
+        <ToolUseCard
+          agent={agent}
+          sessionId={sessionId}
+          name={item.name}
+          input={item.input}
+          running={item.running}
+        />
+      );
     }
     if (item.kind === 'tool_result') {
       return <ToolResultCard toolUseId={item.toolUseId} content={item.content} isError={item.isError} />;
@@ -1796,6 +1974,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: space[1],
+  },
+  headerLeftButton: {
+    paddingHorizontal: space[2],
+    paddingVertical: space[1],
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   headerBadge: {
     minWidth: 18,

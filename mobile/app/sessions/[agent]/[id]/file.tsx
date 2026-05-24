@@ -3,16 +3,31 @@ import { useHydratedSettings } from '@/lib/store';
 import { fontFamily, fontSize, space, useTheme } from '@/theme';
 import * as Clipboard from 'expo-clipboard';
 import { Stack, useLocalSearchParams } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
+/** Vertical line height used by the file viewer; kept in sync with
+ *  styles.code below so the scroll-to-line math is correct. */
+const LINE_HEIGHT = 18;
+
 export default function FileViewerScreen() {
-  const { agent, id, path } = useLocalSearchParams<{ agent: string; id: string; path: string }>();
+  const { agent, id, path, line: lineParam } = useLocalSearchParams<{
+    agent: string;
+    id: string;
+    path: string;
+    /** When set, the viewer scrolls to + highlights this 1-based line. */
+    line?: string;
+  }>();
+  const targetLine = (() => {
+    const n = typeof lineParam === 'string' ? Number.parseInt(lineParam, 10) : NaN;
+    return Number.isFinite(n) && n >= 1 ? n : null;
+  })();
   const settings = useHydratedSettings();
   const t = useTheme();
   const [file, setFile] = useState<ScopedFile | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const verticalScrollRef = useRef<ScrollView>(null);
 
   useEffect(() => {
     if (!settings.baseUrl || !agent || !id || !path) return;
@@ -31,6 +46,21 @@ export default function FileViewerScreen() {
 
   const lines = useMemo(() => (file ? file.contents.split('\n') : []), [file]);
   const numWidth = useMemo(() => String(lines.length).length, [lines.length]);
+
+  // Scroll-to-line on mount when `?line=N` is set. Runs once after the
+  // file lands (we need lines to exist for the math to be meaningful)
+  // and adds a small top margin so the target line isn't flush under
+  // the meta bar.
+  useEffect(() => {
+    if (!file || targetLine === null) return;
+    // Use a microtask so the ScrollView has rendered its inner content
+    // before we ask it to jump.
+    const handle = setTimeout(() => {
+      const y = Math.max(0, (targetLine - 1) * LINE_HEIGHT - 80);
+      verticalScrollRef.current?.scrollTo({ y, animated: false });
+    }, 50);
+    return () => clearTimeout(handle);
+  }, [file, targetLine]);
 
   if (error) {
     return (
@@ -75,19 +105,28 @@ export default function FileViewerScreen() {
           </Text>
         </Pressable>
       </View>
-      <ScrollView showsVerticalScrollIndicator>
+      <ScrollView ref={verticalScrollRef} showsVerticalScrollIndicator>
         <ScrollView horizontal showsHorizontalScrollIndicator>
           <View style={{ paddingVertical: space[2] }}>
-            {lines.map((line, i) => (
-              <View key={i} style={styles.row}>
-                <Text style={[styles.gutter, { color: t.code.gutter, width: numWidth * 9 + 12 }]}>
-                  {String(i + 1).padStart(numWidth, ' ')}
-                </Text>
-                <Text style={[styles.code, { color: t.code.fg }]} selectable>
-                  {line === '' ? ' ' : line}
-                </Text>
-              </View>
-            ))}
+            {lines.map((line, i) => {
+              const lineNo = i + 1;
+              const isTarget = targetLine === lineNo;
+              return (
+                <View
+                  key={i}
+                  style={[
+                    styles.row,
+                    isTarget ? { backgroundColor: t.diff.addBg } : null,
+                  ]}>
+                  <Text style={[styles.gutter, { color: t.code.gutter, width: numWidth * 9 + 12 }]}>
+                    {String(lineNo).padStart(numWidth, ' ')}
+                  </Text>
+                  <Text style={[styles.code, { color: t.code.fg }]} selectable>
+                    {line === '' ? ' ' : line}
+                  </Text>
+                </View>
+              );
+            })}
           </View>
         </ScrollView>
       </ScrollView>
