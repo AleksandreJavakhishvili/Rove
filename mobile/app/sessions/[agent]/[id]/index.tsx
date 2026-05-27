@@ -73,7 +73,9 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   AppState,
+  Easing,
   FlatList,
   Image,
   KeyboardAvoidingView,
@@ -1618,7 +1620,7 @@ export default function ChatScreen() {
             styles.liveStatusBar,
             { borderTopColor: t.border.subtle, backgroundColor: t.surface.sunken },
           ]}>
-          <ActivityIndicator size="small" color={t.text.secondary} />
+          <ThinkingDot color={t.text.secondary} />
           <Text
             style={[styles.liveStatusText, { color: t.text.secondary }]}
             numberOfLines={2}>
@@ -1858,6 +1860,37 @@ export default function ChatScreen() {
       />
     </>
   );
+}
+
+/**
+ * Soft 1.0 → 0.4 pulsing dot. Replaces the platform spinner in the
+ * "Claude is thinking…" footer — the native ActivityIndicator reads
+ * heavy next to a single line of italic text on mobile.
+ */
+function ThinkingDot({ color }: { color: string }) {
+  const pulse = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, {
+          toValue: 1,
+          duration: 600,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulse, {
+          toValue: 0,
+          duration: 600,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [pulse]);
+  const opacity = pulse.interpolate({ inputRange: [0, 1], outputRange: [1, 0.35] });
+  return <Animated.View style={[styles.thinkingDot, { backgroundColor: color, opacity }]} />;
 }
 
 function SlashPicker({ draft, onPick }: { draft: string; onPick: (cmd: string) => void }) {
@@ -2102,6 +2135,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: space[3],
     paddingVertical: space[2],
     borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  thinkingDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
   },
   liveStatusText: {
     flex: 1,

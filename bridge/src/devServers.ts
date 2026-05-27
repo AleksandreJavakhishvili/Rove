@@ -112,6 +112,7 @@ function frameworkLabel(cmd: string): string | null {
   if (/webpack-dev-server/.test(cmd)) return 'webpack';
   if (/\bparcel\b.*\bserve\b/.test(cmd)) return 'parcel';
   if (/\bbun\b.*--hot/.test(cmd)) return 'bun';
+  if (/@expo\/cli\b|\bexpo\b.*\b(start|run:|web)\b/.test(cmd)) return 'expo';
   if (/^\s*\S*\/?node\b/.test(cmd)) return 'node';
   return null;
 }

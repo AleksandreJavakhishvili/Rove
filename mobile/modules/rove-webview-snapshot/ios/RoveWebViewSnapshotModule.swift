@@ -25,7 +25,7 @@ public class RoveWebViewSnapshotModule: Module {
           promise.reject("ERR_NO_CONTEXT", "Expo app context is not available")
           return
         }
-        guard let view = appContext.findView(withTag: viewTag) else {
+        guard let view = appContext.findView(withTag: viewTag, ofType: UIView.self) else {
           promise.reject(
             "ERR_VIEW_NOT_FOUND",
             "No view registered with reactTag \(viewTag) — the WebView may have been unmounted"

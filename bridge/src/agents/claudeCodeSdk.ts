@@ -22,7 +22,7 @@ import { basename } from 'node:path';
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { config } from '../config.ts';
+import { config, runtimeState } from '../config.ts';
 import {
   cancelPendingForSession,
   getDispatch,
@@ -679,7 +679,20 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
           },
         ],
       },
-      env: { ...process.env, ROVE_BRIDGE: '1' },
+      env: {
+        ...process.env,
+        ROVE_BRIDGE: '1',
+        // Pin Metro's advertised host to our tailnet name so `expo start`
+        // spawned by the agent serves a manifest the phone can actually
+        // reach. Without this, Expo auto-detects the LAN IP and the
+        // bundle URL it embeds is unreachable from the phone on the
+        // tailnet. Only inject when (a) we're on a tailnet and (b) the
+        // user hasn't already pinned the var themselves — respect the
+        // operator's intent in either direction.
+        ...(runtimeState.tailscaleHostname && !process.env.REACT_NATIVE_PACKAGER_HOSTNAME
+          ? { REACT_NATIVE_PACKAGER_HOSTNAME: runtimeState.tailscaleHostname }
+          : {}),
+      },
       allowDangerouslySkipPermissions: this.permissionMode === 'bypassPermissions',
       pathToClaudeCodeExecutable: config.claudeBin,
       // Visual-feedback-loop + preview-handoff — `take_screenshot` and
@@ -1077,6 +1090,14 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       this.q = null;
       this.inputQueue = [];
       this.inputClosed = false;
+      // Clear live-activity state so a re-attaching client doesn't replay a
+      // stale "Thinking…" indicator. If the query threw between sendUserMessage
+      // (which bumps pendingTurns) and the SDK emitting a `result` event, the
+      // counter would otherwise stay at 1 forever and every fresh subscriber
+      // would see the live-status bar even though no turn is actually running.
+      this.liveActivity.pendingTurns = 0;
+      this.liveActivity.thinkingText = null;
+      this.liveActivity.sdkStatus = SDK_RUN_STATUS.idle;
       this.emit('exit', { code: 0, signal: null });
     }
   }

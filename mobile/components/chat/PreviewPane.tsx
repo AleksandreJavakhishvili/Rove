@@ -5,6 +5,7 @@ import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/the
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Linking,
   Modal,
   Pressable,
   ScrollView,
@@ -141,11 +142,15 @@ export function PreviewPane({ agent, id, active, captureRef, previewFrameRef }: 
       <View ref={captureRef} style={styles.body} collapsable={false}>
         {selected ? (
           selected.reachable && selected.url ? (
-            <PreviewFrame
-              ref={previewFrameRef}
-              url={selected.url}
-              backgroundColor={t.surface.base}
-            />
+            selected.framework === 'expo' ? (
+              <ExpoPanel url={selected.url} theme={t} />
+            ) : (
+              <PreviewFrame
+                ref={previewFrameRef}
+                url={selected.url}
+                backgroundColor={t.surface.base}
+              />
+            )
           ) : (
             <LocalhostWarning candidate={selected} theme={t} />
           )
@@ -269,6 +274,69 @@ function CandidatePicker({
         );
       })}
     </ScrollView>
+  );
+}
+
+function ExpoPanel({ url, theme }: { url: string; theme: Theme }) {
+  const styles = useStyles(theme);
+  const expUrl = url.replace(/^https?:\/\//, 'exp://');
+  const [copied, setCopied] = useState(false);
+
+  const openInExpoGo = () => {
+    Linking.openURL(expUrl).catch(() => undefined);
+  };
+  const copyUrl = async () => {
+    const Clipboard = await import('expo-clipboard');
+    await Clipboard.setStringAsync(expUrl);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <View style={styles.expoPanel}>
+      <View
+        style={[
+          styles.expoCard,
+          { backgroundColor: theme.surface.raised, borderColor: theme.border.subtle },
+        ]}>
+        <Text style={[styles.expoTitle, { color: theme.text.primary }]}>Expo dev server</Text>
+        <Text style={[styles.expoSubtitle, { color: theme.text.secondary }]}>
+          Metro is running but doesn’t serve a web page. Open the project in Expo Go (or your
+          development client) on this device.
+        </Text>
+
+        <Pressable
+          onPress={copyUrl}
+          style={({ pressed }) => [
+            styles.expoUrlRow,
+            {
+              backgroundColor: pressed ? theme.surface.pressed : theme.surface.base,
+              borderColor: theme.border.subtle,
+            },
+          ]}>
+          <Text style={[styles.expoUrl, { color: theme.text.primary }]} numberOfLines={1}>
+            {expUrl}
+          </Text>
+          <Text style={[styles.expoCopyHint, { color: theme.text.muted }]}>
+            {copied ? 'copied' : 'tap to copy'}
+          </Text>
+        </Pressable>
+
+        <Pressable
+          onPress={openInExpoGo}
+          style={({ pressed }) => [
+            styles.expoPrimary,
+            { backgroundColor: pressed ? theme.accent.pressed : theme.accent.primary },
+          ]}>
+          <Text style={[styles.expoPrimaryLabel, { color: theme.accent.fg }]}>Open in Expo Go</Text>
+        </Pressable>
+
+        <Text style={[styles.expoFootnote, { color: theme.text.muted }]}>
+          If you use a custom dev client, replace the scheme manually or scan the QR in the
+          terminal.
+        </Text>
+      </View>
+    </View>
   );
 }
 
@@ -436,6 +504,22 @@ function useStyles(t: Theme) {
         },
         editGlyph: { fontSize: fontSize.sm },
         body: { flex: 1 },
+        expoBar: {
+          flexDirection: 'row',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          paddingHorizontal: space[3],
+          paddingVertical: space[2],
+          gap: space[3],
+          borderBottomWidth: StyleSheet.hairlineWidth,
+        },
+        expoLabel: { fontFamily: fontFamily.sans, fontSize: fontSize.xs, flexShrink: 1 },
+        expoButton: {
+          paddingHorizontal: space[3],
+          paddingVertical: space[2],
+          borderRadius: radius.pill,
+        },
+        expoButtonLabel: { fontFamily: fontFamily.sans, fontSize: fontSize.sm, fontWeight: '600' },
         emptyState: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: space[5], gap: space[2] },
         emptyTitle: { fontFamily: fontFamily.sans, fontSize: fontSize.lg, fontWeight: '600' },
         emptyBody: { fontFamily: fontFamily.sans, fontSize: fontSize.sm, textAlign: 'center', lineHeight: 20 },
