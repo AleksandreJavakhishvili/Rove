@@ -18,6 +18,7 @@
   <a href="#quickstart"><strong>Quickstart</strong></a> &nbsp;·&nbsp;
   <a href="#why"><strong>Why</strong></a> &nbsp;·&nbsp;
   <a href="#live-preview"><strong>Live preview</strong></a> &nbsp;·&nbsp;
+  <a href="#visual-feedback"><strong>Visual feedback</strong></a> &nbsp;·&nbsp;
   <a href="#comparison-with-similar-projects"><strong>vs. Happy</strong></a>
 </p>
 
@@ -180,6 +181,14 @@ Caveats:
 - The dev server must bind to `0.0.0.0` (or `::`), not `127.0.0.1`. If it's localhost-only the pane shows a framework-specific hint instead of a broken WebView (`vite --host`, `next dev -H 0.0.0.0`, etc.).
 - The bridge sees what your user can see — don't run dev servers under `sudo`, they'll be invisible to `lsof`. Port 3000 etc. never needs root.
 - Requires `react-native-webview`, a native module — use a dev build (`npx expo run:ios` / `run:android`) or an EAS build. Expo Go can't load it.
+
+## Visual feedback
+
+The agent can verify its own frontend changes by capturing the dev-server preview directly. When Claude calls the `take_screenshot` MCP tool, the phone briefly takes over the screen — swaps to the Preview pane, optionally navigates to a path the agent specifies, captures the WebView, and returns the pixels as an image tool result. A "Verifying — `/path`" pill at the top of the screen makes the takeover visible and exposes a Cancel button; the mode auto-exits after a short debounce and restores wherever you were.
+
+Off by default. Flip **Settings → Visual feedback** to enable it. The first call per session goes through the usual permission sheet ("Allow once / Always allow / Deny"). A secondary **Always ask before each capture** switch in the same screen suppresses "Always allow" if you'd rather grant capture explicitly every time.
+
+Each `screenshot_result` echoes back the WebView's final URL alongside the image — so if the agent asks for `/admin` and the server bounces to `/login`, the redirect is visible to the model without it having to read the pixels. Path arguments are validated on the phone (no cross-origin, no `..` traversal).
 
 ## Adding a new agent
 
