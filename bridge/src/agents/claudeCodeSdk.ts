@@ -682,15 +682,22 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       env: { ...process.env, ROVE_BRIDGE: '1' },
       allowDangerouslySkipPermissions: this.permissionMode === 'bypassPermissions',
       pathToClaudeCodeExecutable: config.claudeBin,
-      // Visual-feedback-loop Phase 2 + preview-handoff — both
-      // `take_screenshot` and `prepare_preview` are registered as in-
-      // process MCP tools on the same server. They go through the
-      // same `canUseTool` gate as every other tool (first-call
-      // permission prompt, allow-always cache), then through the
-      // matching bridge↔mobile broker.
-      mcpServers: {
-        rove: this.buildVisualFeedbackMcpServer(),
-      },
+      // Visual-feedback-loop + preview-handoff — `take_screenshot` and
+      // `prepare_preview` are registered as in-process MCP tools on
+      // the same server, but ONLY when the user has opted into visual
+      // feedback (preview-takeover Phase 0). Skipping registration
+      // when off saves ~300 tokens of unused tool descriptions per
+      // turn and keeps the agent's tool palette clean.
+      //
+      // Lifecycle note: the SDK captures `mcpServers` once at query
+      // spawn time. Flipping the setting ON mid-session takes effect
+      // on the next turn boundary (the SDK Query closes between turns
+      // and `spawnIfNeeded` runs again with the updated check).
+      // Flipping OFF mid-turn still has the `isVisualFeedbackEnabled`
+      // handler gate as defense in depth.
+      ...(isVisualFeedbackEnabled(this.sessionId)
+        ? { mcpServers: { rove: this.buildVisualFeedbackMcpServer() } }
+        : {}),
     };
 
     this.q = query({ prompt: this.userMessageStream(), options });
