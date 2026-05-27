@@ -1,5 +1,13 @@
 import { space, useTheme } from '@/theme';
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { Keyboard, Platform, StyleSheet, useWindowDimensions, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
@@ -19,6 +27,28 @@ interface Props {
   workspace: (active: boolean) => ReactNode;
   /** Notified when the visible page changes (0 = chat, 1 = workspace). */
   onIndexChange?: (index: number) => void;
+  /**
+   * Per-page badge flags. When `true`, the matching dot pulses + uses
+   * the accent color to signal "there's something new here." Indexed
+   * by page (0 = chat, 1 = workspace). Used by the chat screen to
+   * surface a "files changed" hint on the workspace dot without
+   * cluttering the header. Pages whose badge is `false` (or absent)
+   * render the normal dot.
+   */
+  pageBadges?: boolean[];
+}
+
+/** Imperative handle exposed via ref. Used by the screenshot composer to
+ *  auto-swap back to the chat after the user hits Send so they see the
+ *  response come in without an extra swipe. The takeover controller
+ *  uses `setLocked` to suppress pan input during agent capture so the
+ *  user can't accidentally swipe out from under the WebView. */
+export interface ChatPreviewPagerHandle {
+  setIndex: (index: number) => void;
+  setLocked: (locked: boolean) => void;
+  /** Current pager index. Used by the takeover controller to snapshot
+   *  the user's prior position before forcing a swap to Preview. */
+  getIndex: () => number;
 }
 
 /**
@@ -32,12 +62,31 @@ interface Props {
  * win at the screen edge. On the rightmost page we only accept right
  * swipes.
  */
-export function ChatPreviewPager({ chat, workspace, onIndexChange }: Props) {
+export const ChatPreviewPager = forwardRef<ChatPreviewPagerHandle, Props>(function ChatPreviewPager(
+  { chat, workspace, onIndexChange, pageBadges },
+  ref,
+) {
   const { width } = useWindowDimensions();
   const t = useTheme();
   const translateX = useSharedValue(0);
   const [activeIndex, setActiveIndex] = useState(0);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
+  const [locked, setLocked] = useState(false);
+  const activeIndexRef = useRef(0);
+  activeIndexRef.current = activeIndex;
+
+  useImperativeHandle(ref, () => ({
+    setIndex: (index: number) => {
+      const clamped = Math.max(0, Math.min(pages.length - 1, index));
+      setActiveIndex(clamped);
+      translateX.value = withTiming(-clamped * width, {
+        duration: 220,
+        easing: Easing.out(Easing.cubic),
+      });
+    },
+    setLocked: (next: boolean) => setLocked(next),
+    getIndex: () => activeIndexRef.current,
+  }));
 
   const pages = useMemo(
     () => [
@@ -94,7 +143,7 @@ export function ChatPreviewPager({ chat, workspace, onIndexChange }: Props) {
   })();
 
   const pan = Gesture.Pan()
-    .enabled(!keyboardVisible)
+    .enabled(!keyboardVisible && !locked)
     .activeOffsetX(activeOffsetX)
     .failOffsetY([-12, 12])
     .onChange((e) => {
@@ -138,22 +187,33 @@ export function ChatPreviewPager({ chat, workspace, onIndexChange }: Props) {
         </Animated.View>
       </GestureDetector>
       <View pointerEvents="none" style={styles.dotsRow}>
-        {pages.map((p, i) => (
-          <View
-            key={p.key}
-            style={[
-              styles.dot,
-              {
-                backgroundColor: activeIndex === i ? t.text.primary : t.text.muted,
-                opacity: activeIndex === i ? 1 : 0.4,
-              },
-            ]}
-          />
-        ))}
+        {pages.map((p, i) => {
+          const badged = Boolean(pageBadges?.[i]);
+          // Inactive page with a badge → use accent color so the user
+          // notices "there's something new there." Active page always
+          // wins (the user is looking at it, no need to pulse).
+          const color =
+            activeIndex === i
+              ? t.text.primary
+              : badged
+                ? t.accent.primary
+                : t.text.muted;
+          const opacity = activeIndex === i ? 1 : badged ? 1 : 0.4;
+          return (
+            <View
+              key={p.key}
+              style={[
+                styles.dot,
+                badged && activeIndex !== i ? styles.dotBadged : null,
+                { backgroundColor: color, opacity },
+              ]}
+            />
+          );
+        })}
       </View>
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   dotsRow: {
@@ -169,5 +229,12 @@ const styles = StyleSheet.create({
     width: 6,
     height: 6,
     borderRadius: 3,
+  },
+  // Slightly larger than a normal dot so an inactive badged dot
+  // reads as "this has something new" without being shouty.
+  dotBadged: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
   },
 });

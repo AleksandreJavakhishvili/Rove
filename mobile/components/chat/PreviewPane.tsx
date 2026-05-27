@@ -13,7 +13,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { PreviewFrame } from './PreviewFrame';
+import { PreviewFrame, type PreviewFrameHandle } from './PreviewFrame';
 
 const POLL_MS = 3000;
 
@@ -22,9 +22,17 @@ interface Props {
   id: string;
   /** When false (offscreen), polling pauses to save battery. */
   active: boolean;
+  /** Attached to the View wrapping the WebView so external code
+   *  (useScreenshotCapture) can capture exactly the dev-server frame —
+   *  not the candidate picker, not the empty-state cards. Phase 1 of
+   *  the visual-feedback-loop SDD. */
+  captureRef?: React.RefObject<View | null>;
+  /** Handle the takeover controller uses to drive the WebView during
+   *  agent capture (path navigation, currentUrl echo). */
+  previewFrameRef?: React.RefObject<PreviewFrameHandle | null>;
 }
 
-export function PreviewPane({ agent, id, active }: Props) {
+export function PreviewPane({ agent, id, active, captureRef, previewFrameRef }: Props) {
   const t = useTheme();
   const settings = useHydratedSettings();
   const prefs = useHydratedPreviewPrefs();
@@ -130,10 +138,14 @@ export function PreviewPane({ agent, id, active }: Props) {
         />
       ) : null}
 
-      <View style={styles.body}>
+      <View ref={captureRef} style={styles.body} collapsable={false}>
         {selected ? (
           selected.reachable && selected.url ? (
-            <PreviewFrame url={selected.url} backgroundColor={t.surface.base} />
+            <PreviewFrame
+              ref={previewFrameRef}
+              url={selected.url}
+              backgroundColor={t.surface.base}
+            />
           ) : (
             <LocalhostWarning candidate={selected} theme={t} />
           )

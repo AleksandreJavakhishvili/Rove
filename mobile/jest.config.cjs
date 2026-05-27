@@ -10,7 +10,15 @@
 module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
-  testMatch: ['<rootDir>/lib/**/__tests__/**/*.test.ts'],
+  // Tests can live under `lib/**/__tests__/` (pure utility code) or
+  // `components/**/__tests__/` (component-adjacent pure logic — the
+  // takeover reducer in particular). Both must remain platform-
+  // agnostic; anything pulling in `react-native` imports needs the
+  // jest-expo preset which we deliberately keep out of this config.
+  testMatch: [
+    '<rootDir>/lib/**/__tests__/**/*.test.ts',
+    '<rootDir>/components/**/__tests__/**/*.test.ts',
+  ],
   transform: {
     '^.+\\.tsx?$': [
       'ts-jest',

@@ -49,6 +49,30 @@ async function postUpload(
 }
 
 /**
+ * Upload a PNG captured from the WebView (see useScreenshotCapture) via
+ * the same upload endpoint the photo / document pickers use. The
+ * resulting `UploadResult` slots into the chat composer's existing
+ * attachments array; from there the send path is identical to a
+ * camera-roll photo.
+ */
+export async function uploadScreenshotPng(
+  cfg: BridgeConfig,
+  agent: AgentKind,
+  id: string,
+  dataBase64: string,
+): Promise<UploadResult> {
+  const fileName = `screenshot-${Date.now()}.png`;
+  const result = await postUpload(cfg, agent, id, {
+    fileName,
+    mimeType: 'image/png',
+    dataBase64,
+  });
+  // Synthesize a data URL so the composer can render the thumbnail
+  // without going back to disk — the bytes are already in memory.
+  return { ...result, localUri: `data:image/png;base64,${dataBase64}` };
+}
+
+/**
  * Prompt the user to pick an image from the photo library, then upload it to
  * the bridge. Returns null if the user cancelled or permission was denied.
  */

@@ -12,12 +12,34 @@ interface Settings {
   baseUrl: string;
   token: string;
   hydrated: boolean;
+  /**
+   * Master switch for the visual-feedback feature (manual shutter +
+   * agent-initiated `take_screenshot` + `prepare_preview`). Default
+   * `false` so privacy-conscious users aren't surprised by the first
+   * capture request. See `docs/sdd/2026-05-25-preview-takeover/`.
+   */
+  enableVisualFeedback: boolean;
+  /**
+   * Sub-option (only meaningful when `enableVisualFeedback === true`).
+   * When `true`, the ApprovalSheet hides the "Always allow" button for
+   * the visual-feedback tools so the user is prompted on every call.
+   */
+  alwaysAskBeforeCapture: boolean;
+  /**
+   * Whether the first-run hint has already been shown to this device.
+   * Bumped once when the user first opens a chat session with
+   * `enableVisualFeedback === false`.
+   */
+  visualFeedbackOnboardingShown: boolean;
 }
 
 interface SettingsActions {
   load(): Promise<void>;
   setBaseUrl(url: string): Promise<void>;
   setToken(token: string): Promise<void>;
+  setEnableVisualFeedback(b: boolean): Promise<void>;
+  setAlwaysAskBeforeCapture(b: boolean): Promise<void>;
+  markVisualFeedbackOnboardingShown(): Promise<void>;
   reset(): Promise<void>;
 }
 
@@ -25,7 +47,16 @@ type SettingsStore = Settings & SettingsActions;
 
 const STORAGE_KEY = 'rove:settings:v1';
 
-async function persist(state: Pick<Settings, 'baseUrl' | 'token'>): Promise<void> {
+type PersistedSettings = Pick<
+  Settings,
+  | 'baseUrl'
+  | 'token'
+  | 'enableVisualFeedback'
+  | 'alwaysAskBeforeCapture'
+  | 'visualFeedbackOnboardingShown'
+>;
+
+async function persist(state: PersistedSettings): Promise<void> {
   await KV.setItemAsync(STORAGE_KEY, JSON.stringify(state));
 }
 
@@ -33,12 +64,24 @@ export const useSettings = create<SettingsStore>((set, get) => ({
   baseUrl: '',
   token: '',
   hydrated: false,
+  enableVisualFeedback: false,
+  alwaysAskBeforeCapture: false,
+  visualFeedbackOnboardingShown: false,
   async load() {
     try {
       const raw = await KV.getItemAsync(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
-        set({ baseUrl: parsed.baseUrl ?? '', token: parsed.token ?? '', hydrated: true });
+        set({
+          baseUrl: parsed.baseUrl ?? '',
+          token: parsed.token ?? '',
+          enableVisualFeedback: Boolean(parsed.enableVisualFeedback ?? false),
+          alwaysAskBeforeCapture: Boolean(parsed.alwaysAskBeforeCapture ?? false),
+          visualFeedbackOnboardingShown: Boolean(
+            parsed.visualFeedbackOnboardingShown ?? false,
+          ),
+          hydrated: true,
+        });
         return;
       }
     } catch (err) {
@@ -48,17 +91,49 @@ export const useSettings = create<SettingsStore>((set, get) => ({
   },
   async setBaseUrl(url) {
     set({ baseUrl: url });
-    await persist({ baseUrl: url, token: get().token });
+    await persist(snapshot(get(), { baseUrl: url }));
   },
   async setToken(token) {
     set({ token });
-    await persist({ baseUrl: get().baseUrl, token });
+    await persist(snapshot(get(), { token }));
+  },
+  async setEnableVisualFeedback(b) {
+    set({ enableVisualFeedback: b });
+    await persist(snapshot(get(), { enableVisualFeedback: b }));
+  },
+  async setAlwaysAskBeforeCapture(b) {
+    set({ alwaysAskBeforeCapture: b });
+    await persist(snapshot(get(), { alwaysAskBeforeCapture: b }));
+  },
+  async markVisualFeedbackOnboardingShown() {
+    if (get().visualFeedbackOnboardingShown) return;
+    set({ visualFeedbackOnboardingShown: true });
+    await persist(snapshot(get(), { visualFeedbackOnboardingShown: true }));
   },
   async reset() {
-    set({ baseUrl: '', token: '' });
+    set({
+      baseUrl: '',
+      token: '',
+      enableVisualFeedback: false,
+      alwaysAskBeforeCapture: false,
+      visualFeedbackOnboardingShown: false,
+    });
     await KV.removeItemAsync(STORAGE_KEY);
   },
 }));
+
+/** Build the persisted snapshot from the live store state, applying any
+ *  in-flight override. Keeps every `setX` action a one-liner. */
+function snapshot(state: Settings, override: Partial<PersistedSettings>): PersistedSettings {
+  return {
+    baseUrl: state.baseUrl,
+    token: state.token,
+    enableVisualFeedback: state.enableVisualFeedback,
+    alwaysAskBeforeCapture: state.alwaysAskBeforeCapture,
+    visualFeedbackOnboardingShown: state.visualFeedbackOnboardingShown,
+    ...override,
+  };
+}
 
 /** Convenience hook: ensures settings are loaded once on mount. */
 export function useHydratedSettings(): SettingsStore {

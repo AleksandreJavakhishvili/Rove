@@ -174,6 +174,29 @@ export function rewindAction(messageId: string, onRewind: (id: string) => void):
   };
 }
 
+/**
+ * Branch the current session into a new one at this exact message.
+ * The handler should call the bridge's `forkSession` with
+ * `{ atMessage: messageId }` and route the user into the new session
+ * (typically `router.replace(...)`).
+ *
+ * Discoverability: replaces the old header-menu "Fork session" item.
+ * Fork-from-here is strictly more useful — the user can pick the
+ * decision point — and reuses the long-press gesture that already
+ * carries Copy + Rewind.
+ */
+export function forkAction(
+  messageId: string,
+  onFork: (id: string) => void,
+): BubbleAction {
+  return {
+    key: 'fork',
+    label: 'Fork from here',
+    icon: 'git-branch-outline',
+    onPress: () => onFork(messageId),
+  };
+}
+
 /** Call from the press handler's `onLongPress` to play the open haptic. */
 export function triggerOpenHaptic() {
   if (Platform.OS === 'web') return;

@@ -209,7 +209,178 @@ export interface AgentCapabilities {
    * path or if both binaries are missing from PATH.
    */
   projectSearch?: boolean;
+  /**
+   * Driver exposes the `take_screenshot` MCP tool to the agent. When
+   * true, the agent can request a capture of the mobile client's live
+   * preview WebView at any point during a turn; the bridge brokers the
+   * round-trip and returns an image content block in the tool result.
+   * Reported false by drivers that can't host MCP tools or when image-
+   * modality input isn't supported by the agent.
+   */
+  screenshotCapture?: boolean;
 }
+
+/**
+ * Reasons a screenshot capture request can fail. Used by the visual-
+ * feedback-loop wire frames + the take_screenshot MCP tool's text-
+ * content fallback so the agent can pattern-match on the cause.
+ *
+ * Conventions:
+ *  - `no_client`         — no mobile client attached / web client.
+ *  - `disabled_by_user`  — per-session toggle is off.
+ *  - `permission_denied` — user denied the MCP tool via canUseTool.
+ *  - `rate_limited`      — request exceeds the per-session token bucket.
+ *  - `timeout`           — client failed to respond within the budget.
+ *  - `not_mounted`       — phone has no PreviewPane mounted right now.
+ *  - `capture_failed`    — captureRef threw on the phone.
+ *  - `upload_failed`     — phone-side upload pipeline rejected.
+ *  - `cancelled`         — session disconnected mid-request.
+ *  - `unsupported`       — running on a platform that can't capture
+ *                          (e.g., the web client).
+ */
+export type ScreenshotErrorReason =
+  | 'no_client'
+  | 'disabled_by_user'
+  | 'permission_denied'
+  | 'rate_limited'
+  | 'timeout'
+  | 'not_mounted'
+  | 'capture_failed'
+  | 'upload_failed'
+  | 'cancelled'
+  | 'unsupported';
+
+export const SCREENSHOT_ERROR_REASON = {
+  no_client: 'no_client',
+  disabled_by_user: 'disabled_by_user',
+  permission_denied: 'permission_denied',
+  rate_limited: 'rate_limited',
+  timeout: 'timeout',
+  not_mounted: 'not_mounted',
+  capture_failed: 'capture_failed',
+  upload_failed: 'upload_failed',
+  cancelled: 'cancelled',
+  unsupported: 'unsupported',
+} as const satisfies Record<ScreenshotErrorReason, ScreenshotErrorReason>;
+
+/** Tuple form of {@link SCREENSHOT_ERROR_REASON} for runtime validators
+ *  (Zod, JSON schema generators, …) that need an enum-array shape.
+ *  Single source of truth — bumped automatically as new reasons are
+ *  added to the const above. */
+export const SCREENSHOT_ERROR_REASONS = Object.values(
+  SCREENSHOT_ERROR_REASON,
+) as readonly ScreenshotErrorReason[];
+
+/** Maximum value the broker / SDK driver accept for the `waitMs`
+ *  argument on `take_screenshot`. Semantics: this is the *upper bound*
+ *  on how long the phone will wait for the page to become ready
+ *  (document.readyState complete + idle + painted) before capturing.
+ *  A fast page captures sooner; a slow page captures at the cap.
+ *  15s accommodates Next.js cold starts and other slow-to-hydrate
+ *  dev servers while still bounding worst-case latency. */
+export const SCREENSHOT_WAIT_MS_CAP = 15_000;
+/** Default `waitMs` when the agent doesn't specify one. Generous
+ *  enough that a typical SPA hydrate finishes in time; the
+ *  ready-state probe still resolves earlier on fast pages. */
+export const SCREENSHOT_DEFAULT_WAIT_MS = 3_000;
+/** End-to-end timeout for the bridge↔phone↔bridge round-trip. Must
+ *  be larger than `SCREENSHOT_WAIT_MS_CAP` plus capture + upload time,
+ *  otherwise the broker times out before a slow page can be captured. */
+export const SCREENSHOT_REQUEST_TIMEOUT_MS = 30_000;
+/** MCP tool surface — kept here so the bridge driver, the mobile
+ *  permission-prompt label lookup, and any future approval UI all
+ *  reference the same identifiers. */
+export const SCREENSHOT_MCP_TOOL_NAME = 'take_screenshot';
+export const SCREENSHOT_MCP_SERVER_NAME = 'rove';
+export const SCREENSHOT_MCP_SERVER_VERSION = '0.1.0';
+/** Full namespaced name the SDK emits to canUseTool — what the mobile
+ *  approval sheet receives. Matches the SDK's `mcp__<server>__<tool>`
+ *  convention. */
+export const SCREENSHOT_MCP_TOOL_QUALIFIED =
+  `mcp__${SCREENSHOT_MCP_SERVER_NAME}__${SCREENSHOT_MCP_TOOL_NAME}` as const;
+
+/** Preview-takeover Phase 2 — prefix on the text content block the
+ *  `take_screenshot` MCP tool returns alongside the image so the agent
+ *  can read the WebView's final URL with a stable, machine-friendly
+ *  marker. Format: `<prefix><url>` (or `(unknown)` when the phone
+ *  couldn't determine the URL). */
+export const SCREENSHOT_RESOLVED_URL_PREFIX = 'resolved_url: ';
+/** Sentinel rendered after the prefix when the phone didn't supply
+ *  `resolvedUrl`. Keeps the line shape consistent (always
+ *  `resolved_url: <something>`) so a string-matching agent can parse
+ *  it without checking for missing data. */
+export const SCREENSHOT_RESOLVED_URL_UNKNOWN = '(unknown)';
+
+/* -------------------------------------------------------------------
+ *  Preview-handoff (`prepare_preview`) — agent asks the user to set up
+ *  the preview state (log in, navigate, …) before the agent can
+ *  verify visually. See `docs/sdd/2026-05-25-preview-handoff/`.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Statuses the user can return from a `prepare_preview` round-trip.
+ *  - `ready`     — user got the preview to the requested state.
+ *  - `skipped`   — user opted out (preview was already there, or the
+ *                  agent can do without it). Optional free-text note.
+ *  - `cancelled` — user explicitly cancelled the request (or the
+ *                  session disconnected / app backgrounded).
+ *  - `timeout`   — broker fired the timeout before the user replied.
+ *  - `disabled_by_user` — global setting / per-session toggle is off.
+ *  - `no_client` — no mobile client attached to this session.
+ *  - `rate_limited` — too many handoffs in the rate-limit window.
+ */
+export type HandoffResultStatus =
+  | 'ready'
+  | 'skipped'
+  | 'cancelled'
+  | 'timeout'
+  | 'disabled_by_user'
+  | 'no_client'
+  | 'rate_limited';
+
+export const HANDOFF_RESULT_STATUS = {
+  ready: 'ready',
+  skipped: 'skipped',
+  cancelled: 'cancelled',
+  timeout: 'timeout',
+  disabled_by_user: 'disabled_by_user',
+  no_client: 'no_client',
+  rate_limited: 'rate_limited',
+} as const satisfies Record<HandoffResultStatus, HandoffResultStatus>;
+
+/** Tuple form for Zod's `z.enum(...)`. */
+export const HANDOFF_RESULT_STATUSES = Object.values(
+  HANDOFF_RESULT_STATUS,
+) as readonly HandoffResultStatus[];
+
+/** MCP tool surface — paired with `SCREENSHOT_MCP_*` so the two visual-
+ *  feedback tools share one server. */
+export const PREPARE_PREVIEW_MCP_TOOL_NAME = 'prepare_preview';
+export const PREPARE_PREVIEW_MCP_TOOL_QUALIFIED =
+  `mcp__${SCREENSHOT_MCP_SERVER_NAME}__${PREPARE_PREVIEW_MCP_TOOL_NAME}` as const;
+
+/** Default time the broker waits for a user reply before resolving
+ *  with `timeout`. Generous so the user has time to find their
+ *  password / two-factor device. */
+export const HANDOFF_DEFAULT_TIMEOUT_SECONDS = 5 * 60;
+/** Upper bound the agent can request via `timeoutSeconds`. */
+export const HANDOFF_MAX_TIMEOUT_SECONDS = 15 * 60;
+/** Cap on the `instructions` argument — keeps the modal body readable
+ *  and prevents an adversarial agent from flooding the UI. */
+export const HANDOFF_INSTRUCTIONS_MAX_LEN = 800;
+/** Cap on the optional `note` the user can attach to a `skipped` reply. */
+export const HANDOFF_NOTE_MAX_LEN = 400;
+/** Cross-direction grace window: after the user taps Done on a
+ *  handoff, the controller stays mounted for this long so a
+ *  follow-up `take_screenshot` can re-enter `engaging` directly
+ *  without an exit-then-re-engage flicker. */
+export const HANDOFF_TO_CAPTURE_GRACE_MS = 500;
+/** Sheet ↔ pill cross-fade duration. */
+export const HANDOFF_MODAL_FADE_MS = 250;
+/** End-to-end timeout for the bridge↔phone↔bridge handoff round-trip.
+ *  Derived from `HANDOFF_DEFAULT_TIMEOUT_SECONDS` * 1000; named so
+ *  the broker doesn't sprinkle `* 1000` arithmetic. */
+export const HANDOFF_DEFAULT_TIMEOUT_MS = HANDOFF_DEFAULT_TIMEOUT_SECONDS * 1000;
 
 /** Single match returned by `GET /sessions/:agent/:id/search`. */
 export interface SearchHit {

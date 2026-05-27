@@ -1,0 +1,7 @@
+{
+  "name": "rove-webview-snapshot",
+  "version": "0.1.0",
+  "description": "Pixel-accurate WKWebView snapshots via the native takeSnapshot API. iOS-only — Android falls back to view-shot at the JS layer because Android's WebView is in-process and view-shot works there.",
+  "main": "index.ts",
+  "private": true
+}

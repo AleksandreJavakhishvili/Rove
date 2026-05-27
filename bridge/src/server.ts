@@ -26,10 +26,33 @@ import { permissions } from './permissions.ts';
 import { preflight } from './preflight.ts';
 import { printConnectionQR } from './qr.ts';
 import { runtime } from './runtime.ts';
+import {
+  cancelPendingForSession,
+  registerDispatch,
+  resolveScreenshot,
+  setScreenshotAllowed,
+  setVisualFeedbackEnabled,
+  unregisterDispatch,
+} from './screenshotBroker.ts';
+import { cancelHandoffsForSession, resolveHandoff } from './handoffBroker.ts';
+import {
+  registerHandoffDispatch,
+  unregisterHandoffDispatch,
+} from './handoffDispatch.ts';
 import { sessionMeta } from './sessionMeta.ts';
 import { saveUpload } from './uploads.ts';
 import { getTailscaleCert, getTailscaleInfo, isTailscaleServeRunning } from './tailscale.ts';
-import { PERMISSION_MODES, type AgentEvent, type AgentKind } from './agents/types.ts';
+import {
+  HANDOFF_RESULT_STATUS,
+  HANDOFF_RESULT_STATUSES,
+  PERMISSION_MODES,
+  SCREENSHOT_ERROR_REASON,
+  SCREENSHOT_ERROR_REASONS,
+  type AgentEvent,
+  type AgentKind,
+  type HandoffResultStatus,
+  type ScreenshotErrorReason,
+} from './agents/types.ts';
 import type { ClientToServer, ServerToClient, SessionListItem } from './types.ts';
 
 const app = new Hono<{ Variables: { auth: { user: string; source: string } } }>();
@@ -618,6 +641,53 @@ const clientSchema = z.discriminatedUnion('type', [
     type: z.literal('rewind_to'),
     messageId: z.string().min(1),
   }),
+  // Visual-feedback-loop Phase 2. The cross-field constraint (uploadId
+  // present iff ok=true) is checked at the route handler — Zod's
+  // discriminatedUnion can only key on a top-level literal field, and
+  // .refine() returns ZodEffects which isn't compatible with the
+  // outer discriminator. The reason enum is derived from
+  // SCREENSHOT_ERROR_REASONS so adding a new reason to the constant
+  // automatically picks it up here.
+  z.object({
+    type: z.literal('screenshot_result'),
+    requestId: z.string().min(1),
+    ok: z.boolean(),
+    uploadId: z.string().min(1).optional(),
+    reason: z
+      .enum(
+        SCREENSHOT_ERROR_REASONS as readonly [ScreenshotErrorReason, ...ScreenshotErrorReason[]],
+      )
+      .optional(),
+    // Preview-takeover Phase 2 — WebView's final URL after capture
+    // (best-effort, only valid when `ok === true`). Surfaced to the
+    // agent as a `resolved_url:` text block.
+    resolvedUrl: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal('set_screenshot_allow'),
+    allow: z.boolean(),
+  }),
+  // Preview-takeover Phase 0 — phone mirrors the global enable
+  // setting up to the bridge so tool handlers can short-circuit
+  // before any WS round-trip. Independent of `set_screenshot_allow`
+  // (per-session header toggle).
+  z.object({
+    type: z.literal('set_visual_feedback_enabled'),
+    enabled: z.boolean(),
+  }),
+  // Preview-handoff Phase 1 — user reply to a `prepare_preview` call.
+  // Cross-field constraints (`finalUrl`/`note` only meaningful when
+  // status is ready/skipped) are checked at the route handler, same
+  // pattern as `screenshot_result`.
+  z.object({
+    type: z.literal('prepare_preview_result'),
+    requestId: z.string().min(1),
+    status: z.enum(
+      HANDOFF_RESULT_STATUSES as readonly [HandoffResultStatus, ...HandoffResultStatus[]],
+    ),
+    finalUrl: z.string().optional(),
+    note: z.string().optional(),
+  }),
 ]);
 
 app.get(
@@ -630,6 +700,20 @@ app.get(
     let onEvent: ((e: AgentEvent) => void) | null = null;
     let onExit: ((info: { code: number | null; signal: NodeJS.Signals | null }) => void) | null = null;
     let jsonlTail: JsonlTail | null = null;
+    // Captured here so onClose can unregister the exact dispatcher it
+    // registered — guards against a stale unmount clobbering a fresh
+    // reconnect that's already registered its own dispatcher.
+    let screenshotDispatcher:
+      | ((args: { requestId: string; path?: string; waitMs?: number }) => void)
+      | null = null;
+    let handoffDispatcher:
+      | ((args: {
+          requestId: string;
+          instructions: string;
+          suggestedPath?: string;
+          timeoutSeconds?: number;
+        }) => void)
+      | null = null;
     // The whole onOpen handler is async (history replay + attach), but a fast
     // client (e.g. the sessions-list one-shot approval helper) sends its first
     // frame the instant the socket reports `open` — which arrives BEFORE we've
@@ -715,6 +799,35 @@ app.get(
       // No external file watcher — every driver registered here is required
       // to advertise `nativeFileChanges: true` and feed `file_changed`
       // AgentEvents itself.
+
+      // Visual-feedback-loop Phase 2: register the dispatcher the SDK
+      // tool calls into. We send a `request_screenshot` frame to the
+      // phone; the phone replies with `screenshot_result` which the
+      // onMessage handler routes back into the screenshot broker.
+      screenshotDispatcher = (args) => {
+        send(ws, {
+          type: 'request_screenshot',
+          requestId: args.requestId,
+          ...(args.path !== undefined ? { path: args.path } : {}),
+          ...(args.waitMs !== undefined ? { waitMs: args.waitMs } : {}),
+        });
+      };
+      registerDispatch(id, screenshotDispatcher);
+
+      // Preview-handoff Phase 1: parallel dispatcher for the
+      // `prepare_preview` round-trip. Same pattern as screenshot —
+      // bridge → phone WS frame, phone → bridge reply routed to the
+      // handoff broker by the onMessage handler.
+      handoffDispatcher = (args) => {
+        send(ws, {
+          type: 'prepare_preview_request',
+          requestId: args.requestId,
+          instructions: args.instructions,
+          ...(args.suggestedPath !== undefined ? { suggestedPath: args.suggestedPath } : {}),
+          ...(args.timeoutSeconds !== undefined ? { timeoutSeconds: args.timeoutSeconds } : {}),
+        });
+      };
+      registerHandoffDispatch(id, handoffDispatcher);
     };
 
     const initialize = async (ws: WSContext): Promise<void> => {
@@ -873,6 +986,79 @@ app.get(
             case 'ping':
               send(ws, { type: 'event', event: { type: 'raw', payload: { pong: true } } });
               break;
+            case 'screenshot_result': {
+              // Cross-field guard the Zod schema can't express inside the
+              // outer discriminated union — see the schema comment.
+              const requestId = parsed.requestId;
+              if (typeof requestId !== 'string') {
+                send(ws, {
+                  type: 'error',
+                  message: 'screenshot_result missing requestId',
+                });
+                break;
+              }
+              if (parsed.ok === true && typeof parsed.uploadId === 'string') {
+                resolveScreenshot(requestId, {
+                  ok: true,
+                  uploadId: parsed.uploadId,
+                  ...(typeof parsed.resolvedUrl === 'string'
+                    ? { resolvedUrl: parsed.resolvedUrl }
+                    : {}),
+                });
+              } else if (parsed.ok === false && parsed.reason !== undefined) {
+                resolveScreenshot(requestId, {
+                  ok: false,
+                  reason: parsed.reason,
+                });
+              } else {
+                send(ws, {
+                  type: 'error',
+                  message: 'screenshot_result missing uploadId or reason',
+                });
+              }
+              break;
+            }
+            case 'set_screenshot_allow': {
+              if (typeof parsed.allow === 'boolean') {
+                setScreenshotAllowed(id, parsed.allow);
+              }
+              break;
+            }
+            case 'set_visual_feedback_enabled': {
+              if (typeof parsed.enabled === 'boolean') {
+                setVisualFeedbackEnabled(id, parsed.enabled);
+              }
+              break;
+            }
+            case 'prepare_preview_result': {
+              const requestId = parsed.requestId;
+              const status = parsed.status;
+              if (typeof requestId !== 'string' || status === undefined) {
+                send(ws, {
+                  type: 'error',
+                  message: 'prepare_preview_result missing requestId/status',
+                });
+                break;
+              }
+              // Treat `ready` + `skipped` as the success surface; the
+              // rest are failure modes (the broker resolves them as
+              // `ok: false` either way — the agent's tool result
+              // wrapper decides how to render).
+              if (
+                status === HANDOFF_RESULT_STATUS.ready ||
+                status === HANDOFF_RESULT_STATUS.skipped
+              ) {
+                resolveHandoff(requestId, {
+                  ok: true,
+                  status,
+                  ...(typeof parsed.finalUrl === 'string' ? { finalUrl: parsed.finalUrl } : {}),
+                  ...(typeof parsed.note === 'string' ? { note: parsed.note } : {}),
+                });
+              } else {
+                resolveHandoff(requestId, { ok: false, status });
+              }
+              break;
+            }
           }
         } catch (err) {
           console.error(`[bridge] message handler error:`, err);
@@ -889,6 +1075,26 @@ app.get(
           jsonlTail.stop();
           jsonlTail = null;
         }
+        // Visual-feedback-loop Phase 2: tear down the screenshot
+        // dispatcher and drain any in-flight requests with `cancelled`
+        // so the SDK's tool promise resolves instead of hanging until
+        // the 10s timeout.
+        if (screenshotDispatcher) {
+          unregisterDispatch(id, screenshotDispatcher);
+          screenshotDispatcher = null;
+        }
+        cancelPendingForSession(id, SCREENSHOT_ERROR_REASON.cancelled);
+        // Preview-handoff Phase 1: parallel teardown.
+        if (handoffDispatcher) {
+          unregisterHandoffDispatch(id, handoffDispatcher);
+          handoffDispatcher = null;
+        }
+        cancelHandoffsForSession(id, HANDOFF_RESULT_STATUS.cancelled);
+        // Per-session allow toggle (see setScreenshotAllowed / isScreenshotAllowed)
+        // intentionally persists across reconnects within the same process —
+        // sessions can outlive their WS subscribers (e.g. agent still running)
+        // and we don't want a transient disconnect to reset the user's
+        // explicit "no visual verification" choice.
       },
       onError: (err) => {
         console.error('[ws] error', err);

@@ -2,20 +2,33 @@ import { ApprovalSheet, type PendingApproval } from '@/components/chat/ApprovalS
 import {
   BubbleActionMenu,
   copyAction,
+  forkAction,
   rewindAction,
   triggerOpenHaptic,
   type BubbleAction,
   type BubbleMenuAnchor,
 } from '@/components/chat/BubbleActionMenu';
 import { PressableBubble } from '@/components/chat/PressableBubble';
-import { ChatPreviewPager } from '@/components/chat/ChatPreviewPager';
+import {
+  ChatPreviewPager,
+  type ChatPreviewPagerHandle,
+} from '@/components/chat/ChatPreviewPager';
+import { PreviewShutter, ShutterFlash } from '@/components/PreviewShutter';
+import { ScreenshotComposer } from '@/components/ScreenshotComposer';
+import { useScreenshotCapture } from '@/hooks/useScreenshotCapture';
 import { Markdown } from '@/components/chat/Markdown';
 import { MentionPicker } from '@/components/chat/MentionPicker';
 import { PreviewPane } from '@/components/chat/PreviewPane';
 import { ToolResultCard, ToolUseCard } from '@/components/chat/ToolCard';
 import { FilesPane } from '@/components/files/FilesPane';
 import { SessionsSidebar } from '@/components/SessionsSidebar';
-import { WorkspacePane } from '@/components/WorkspacePane';
+import {
+  TakeoverController,
+  type TakeoverFrameHandler,
+} from '@/components/takeover/TakeoverController';
+import { isVisualFeedbackTool } from '@/components/takeover/toolLabels';
+import { WorkspacePane, type WorkspacePaneHandle } from '@/components/WorkspacePane';
+import type { PreviewFrameHandle } from '@/components/chat/PreviewFrame';
 import {
   fetchHistory,
   fetchSessionInfo,
@@ -43,6 +56,8 @@ import {
 } from '@/lib/uploads';
 import {
   COMPACT_TRIGGER,
+  HANDOFF_RESULT_STATUS,
+  SCREENSHOT_ERROR_REASON,
   SDK_RUN_STATUS,
   type AgentEvent,
   type HistoryEntry,
@@ -328,6 +343,50 @@ export default function ChatScreen() {
     anchor: BubbleMenuAnchor;
     actions: BubbleAction[];
   } | null>(null);
+  // Visual-feedback-loop Phase 1: manual screenshot composer state. The
+  // capture itself lives on the hook below; this state only governs the
+  // sheet visibility + the freshly-uploaded attachment.
+  const [shotUpload, setShotUpload] = useState<UploadResult | null>(null);
+  const [shotComposerOpen, setShotComposerOpen] = useState(false);
+  const [shotFlashNonce, setShotFlashNonce] = useState(0);
+  // Per-session "allow autonomous screenshots" toggle. Bridge defaults
+  // to true on the server side; we mirror that so the chip in the
+  // header menu starts as on. Flipping it pushes a
+  // `set_screenshot_allow` frame so the next agent-initiated capture
+  // short-circuits to `disabled_by_user` without going to the phone.
+  const [allowVisualVerification, setAllowVisualVerification] = useState<boolean>(true);
+  // Preview-handoff Phase 2: while a user-direction handoff is active
+  // the controller asks us to disable the floating shutter so a manual
+  // capture doesn't race the agent's request.
+  const [manualShutterLocked, setManualShutterLocked] = useState(false);
+  const pagerRef = useRef<ChatPreviewPagerHandle | null>(null);
+  const workspaceRef = useRef<WorkspacePaneHandle | null>(null);
+  const previewFrameRef = useRef<PreviewFrameHandle | null>(null);
+  // Frame handler the TakeoverController registers on mount so the WS
+  // message switch can forward `request_screenshot` (and, after the
+  // handoff SDD lands, `prepare_preview_request`) into the state
+  // machine without the chat screen needing to know how the controller
+  // is structured. Initialised to a no-op so a frame arriving before
+  // mount is dropped cleanly rather than crashing.
+  const takeoverFrameHandler = useRef<TakeoverFrameHandler>(() => false);
+  const registerTakeoverFrameHandler = useCallback((handler: TakeoverFrameHandler) => {
+    takeoverFrameHandler.current = handler;
+  }, []);
+  // Capture primitive + ref applied to the PreviewPane's WebView wrapper.
+  // `previewFrameRef` lets the hook route iOS captures through the
+  // native `WKWebView.takeSnapshot` API (`rove-webview-snapshot`)
+  // instead of view-shot's stale-prone host-compositor read.
+  const screenshot = useScreenshotCapture(
+    { baseUrl: settings.baseUrl, token: settings.token },
+    agent,
+    id,
+    { previewFrameRef },
+  );
+  // Preview-takeover Phase 0 — read from a ref so the WS message switch
+  // (which doesn't re-subscribe between renders) sees the current value
+  // without having to re-open the socket on every settings flip.
+  const visualFeedbackEnabledRef = useRef<boolean>(settings.enableVisualFeedback);
+  visualFeedbackEnabledRef.current = settings.enableVisualFeedback;
   const connStateRef = useRef<ConnectionState>('connecting');
   connStateRef.current = connState;
   const listRef = useRef<FlatList<ChatItem>>(null);
@@ -577,6 +636,41 @@ export default function ChatScreen() {
               setThinkingTicker('');
               setSdkStatus(SDK_RUN_STATUS.idle);
               break;
+            case 'request_screenshot':
+              // Visual-feedback-loop Phase 2 — agent asked the bridge to
+              // capture the live preview. The takeover controller owns
+              // the full flow now (state machine, indicator, pager swap,
+              // capture, restore); the chat screen just forwards.
+              //
+              // Preview-takeover Phase 0: if the global setting is off,
+              // drop the frame on the floor and reply `disabled_by_user`
+              // immediately — keeps the wire model consistent if the
+              // bridge mirror somehow lagged behind.
+              if (!visualFeedbackEnabledRef.current) {
+                sendRef.current?.({
+                  type: 'screenshot_result',
+                  requestId: msg.requestId,
+                  ok: false,
+                  reason: SCREENSHOT_ERROR_REASON.disabled_by_user,
+                });
+                break;
+              }
+              takeoverFrameHandler.current(msg);
+              break;
+            case 'prepare_preview_request':
+              // Preview-handoff Phase 1 — agent asked the user to set
+              // up the preview. Same Phase 0 gate as above; the
+              // controller's reducer owns the rest.
+              if (!visualFeedbackEnabledRef.current) {
+                sendRef.current?.({
+                  type: 'prepare_preview_result',
+                  requestId: msg.requestId,
+                  status: HANDOFF_RESULT_STATUS.disabled_by_user,
+                });
+                break;
+              }
+              takeoverFrameHandler.current(msg);
+              break;
           }
         },
       },
@@ -815,6 +909,41 @@ export default function ChatScreen() {
     };
   }, [settings.baseUrl, settings.token, agent, id, reconnectNonce, setCapabilities, clearCapabilities]);
 
+  // Preview-takeover Phase 0 — mirror the persisted master switch up to
+  // the bridge any time it changes (and on every fresh connect). Runs
+  // after the stream effect above creates `sendRef.current`. Connection
+  // state is part of the dep array so we re-send on every reconnect.
+  useEffect(() => {
+    if (connState !== 'open') return;
+    if (!settings.hydrated) return;
+    sendRef.current?.({
+      type: 'set_visual_feedback_enabled',
+      enabled: settings.enableVisualFeedback,
+    });
+  }, [connState, settings.hydrated, settings.enableVisualFeedback]);
+
+  // Preview-takeover Phase 0 — one-time onboarding hint. Shows on the
+  // first chat session a user opens with the master switch still off.
+  // Marked-shown is persisted so we never show it again on this device.
+  useEffect(() => {
+    if (!settings.hydrated) return;
+    if (settings.enableVisualFeedback) return;
+    if (settings.visualFeedbackOnboardingShown) return;
+    setItems((prev) => [
+      ...prev,
+      {
+        id: `meta-vf-onboarding-${Date.now()}`,
+        kind: 'meta',
+        text:
+          'Visual feedback is off — enable it in Settings if you want Claude to ' +
+          'verify changes by capturing your preview.',
+      },
+    ]);
+    void settings.markVisualFeedbackOnboardingShown();
+    // Only on the very first session-mount for a fresh device.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.hydrated]);
+
   function onSend() {
     const userText = draft.trim();
     if (!userText && attachments.length === 0) return;
@@ -845,6 +974,73 @@ export default function ChatScreen() {
         { id: `meta-${Date.now()}`, kind: 'meta', text: `Send failed: ${String((err as Error).message)}` },
       ]);
     }
+  }
+
+  // Visual-feedback-loop Phase 2 / preview-takeover Phase 1 —
+  // agent-initiated capture is now driven by the TakeoverController
+  // (`mobile/components/takeover/`). The chat screen forwards the WS
+  // frame via `takeoverFrameHandler.current(msg)` and the controller
+  // owns the rest (state machine, indicator, pager swap, capture,
+  // restore). No inline `handleScreenshotRequest` lives here anymore.
+
+  // Shutter handler — captures the PreviewPane WebView, uploads the PNG,
+  // and opens the composer. The composer renders a spinner until the
+  // upload resolves; on Send we route through sendScreenshot, on Cancel
+  // we just discard the upload reference (the file lives on the bridge
+  // but isn't referenced anywhere; existing upload-GC handles it).
+  async function onShutterPress() {
+    if (!screenshot.supported) {
+      Alert.alert(
+        'Screenshot unavailable',
+        'Capturing the preview is only supported on the iOS / Android app, not the web client.',
+      );
+      return;
+    }
+    // Open the composer in loading state immediately so the user sees
+    // the affordance even if upload takes a beat.
+    setShotComposerOpen(true);
+    setShotUpload(null);
+    setShotFlashNonce((n) => n + 1);
+    try {
+      const { upload } = await screenshot.captureAndUpload();
+      setShotUpload(upload);
+    } catch (err) {
+      const msg = String((err as Error).message ?? err);
+      setShotComposerOpen(false);
+      setItems((prev) => [
+        ...prev,
+        { id: `meta-${Date.now()}`, kind: 'meta', text: `Screenshot failed: ${msg}` },
+      ]);
+    }
+  }
+
+  // Send the captured screenshot as a normal multimodal user turn — same
+  // wire shape as the chat composer's photo-attachment path, just
+  // pre-built so the composer's only job is the note.
+  function sendScreenshot({ note, upload }: { note: string; upload: UploadResult }) {
+    if (!sendRef.current) return;
+    const attachLine = `[Attached image: ${upload.rel}]`;
+    const composed = note ? `${attachLine}\n\n${note}` : attachLine;
+    setPendingTurns((n) => n + 1);
+    setItems((prev) => [
+      ...prev,
+      { id: `local-u-${Date.now()}`, kind: 'user', text: composed, live: true },
+    ]);
+    stickToBottomRef.current = true;
+    requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
+    try {
+      sendRef.current({ type: 'user_message', content: composed });
+    } catch (err) {
+      setPendingTurns((n) => Math.max(0, n - 1));
+      setItems((prev) => [
+        ...prev,
+        { id: `meta-${Date.now()}`, kind: 'meta', text: `Send failed: ${String((err as Error).message)}` },
+      ]);
+    }
+    setShotComposerOpen(false);
+    setShotUpload(null);
+    // Auto-swap pager to chat so the user sees Claude's response come in.
+    pagerRef.current?.setIndex(0);
   }
 
   async function runUpload(kind: 'image' | 'photo' | 'document') {
@@ -984,11 +1180,13 @@ export default function ChatScreen() {
     [settings.baseUrl, settings.token, agent, id],
   );
 
-  const onFork = useCallback(() => {
-    Alert.alert(
-      'Fork this session?',
-      'Creates a copy of the conversation as a new session. The original is unchanged.',
-      [
+  const onFork = useCallback(
+    (atMessage?: string) => {
+      const title = atMessage ? 'Fork from here?' : 'Fork this session?';
+      const body = atMessage
+        ? 'Creates a copy of the conversation branching at this message. The original is unchanged.'
+        : 'Creates a copy of the conversation as a new session. The original is unchanged.';
+      Alert.alert(title, body, [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Fork',
@@ -998,6 +1196,7 @@ export default function ChatScreen() {
                 { baseUrl: settings.baseUrl, token: settings.token },
                 agent,
                 id,
+                atMessage ? { atMessage } : undefined,
               );
               router.replace(`/sessions/${agent}/${res.sessionId}`);
             } catch (err) {
@@ -1005,38 +1204,52 @@ export default function ChatScreen() {
             }
           },
         },
-      ],
-    );
+      ]);
   }, [settings.baseUrl, settings.token, agent, id]);
 
-  const onHeaderMenu = useCallback(() => {
-    // Single overflow trigger — keeps the native header to one slot instead
-    // of crowding multiple text buttons that clip on smaller devices. The
-    // file-change count rides on the trigger itself ("··· (3)") so the user
-    // still sees there's something to look at without opening the sheet.
-    const diffLabel =
-      changedFiles.size > 0 ? `Open diff (${changedFiles.size} changed)` : 'Open diff';
-    const buttons: Array<{
+  // Per-session "Disable visual verification" is the only action that
+  // still lives behind the header overflow. "Open diff" moved to the
+  // Files pane (tap a row in "Changed this session" → per-file diff)
+  // and "Fork session" moved to the long-press bubble menu as
+  // `forkAction(messageId)` — fork-from-here is strictly more useful
+  // than fork-from-head. When this list ends up empty (most users,
+  // most of the time) the header trigger hides entirely.
+  const headerMenuItems = useMemo<
+    Array<{ text: string; onPress: () => void; style?: 'cancel' | 'default' | 'destructive' }>
+  >(() => {
+    const items: Array<{
       text: string;
-      onPress?: () => void;
+      onPress: () => void;
       style?: 'cancel' | 'default' | 'destructive';
-    }> = [
-      { text: diffLabel, onPress: () => router.push(`/sessions/${agent}/${id}/diff`) },
-    ];
-    if (capabilities?.sessionForking) {
-      buttons.push({ text: 'Fork session', onPress: onFork });
+    }> = [];
+    if (capabilities?.screenshotCapture && settings.enableVisualFeedback) {
+      items.push({
+        text: allowVisualVerification
+          ? 'Disable visual verification'
+          : 'Allow visual verification',
+        onPress: () => {
+          const next = !allowVisualVerification;
+          setAllowVisualVerification(next);
+          sendRef.current?.({ type: 'set_screenshot_allow', allow: next });
+        },
+      });
     }
-    buttons.push({ text: 'Cancel', style: 'cancel' });
-    Alert.alert(sessionLabel ?? sessionProject ?? 'Session', undefined, buttons);
+    return items;
   }, [
-    agent,
-    id,
-    changedFiles.size,
-    capabilities?.sessionForking,
-    sessionLabel,
-    sessionProject,
-    onFork,
+    capabilities?.screenshotCapture,
+    settings.enableVisualFeedback,
+    allowVisualVerification,
   ]);
+
+  const showHeaderMenu = headerMenuItems.length > 0;
+
+  const onHeaderMenu = useCallback(() => {
+    if (headerMenuItems.length === 0) return;
+    Alert.alert(sessionLabel ?? sessionProject ?? 'Session', undefined, [
+      ...headerMenuItems,
+      { text: 'Cancel', style: 'cancel' as const, onPress: () => undefined },
+    ]);
+  }, [headerMenuItems, sessionLabel, sessionProject]);
 
   const onRewindRequest = useCallback(
     (messageId: string) => {
@@ -1145,25 +1358,24 @@ export default function ChatScreen() {
               ) : null}
             </Pressable>
           ),
-          headerRight: () => (
-            <Pressable
-              onPress={onHeaderMenu}
-              hitSlop={8}
-              style={styles.headerRightButton}>
-              <Ionicons
-                name="ellipsis-horizontal-circle"
-                size={fontSize['4xl']}
-                color={t.accent.primary}
-              />
-              {changedFiles.size > 0 ? (
-                <View style={[styles.headerBadge, { backgroundColor: t.accent.primary }]}>
-                  <Text style={[styles.headerBadgeText, { color: t.accent.fg }]}>
-                    {changedFiles.size}
-                  </Text>
-                </View>
-              ) : null}
-            </Pressable>
-          ),
+          // Hide the overflow trigger entirely when there's nothing to
+          // show. "Files changed" no longer rides on the badge — that
+          // moved to the workspace dot in <ChatPreviewPager> (see
+          // `pageBadges`). Fork moved to long-press → "Fork from here."
+          headerRight: showHeaderMenu
+            ? () => (
+                <Pressable
+                  onPress={onHeaderMenu}
+                  hitSlop={8}
+                  style={styles.headerRightButton}>
+                  <Ionicons
+                    name="ellipsis-horizontal-circle"
+                    size={fontSize['4xl']}
+                    color={t.accent.primary}
+                  />
+                </Pressable>
+              )
+            : undefined,
         }}
       />
       <View style={[styles.statusBar, { borderBottomColor: t.border.subtle }]}>
@@ -1286,9 +1498,11 @@ export default function ChatScreen() {
             <Text style={[styles.filesPaneLabel, { color: t.text.primary }]}>
               📂 {changedFiles.size} file{changedFiles.size === 1 ? '' : 's'} changed
             </Text>
-            <Pressable onPress={() => router.push(`/sessions/${agent}/${id}/diff`)} hitSlop={8}>
-              <Text style={[styles.filesPaneAction, { color: t.accent.primary }]}>View diff</Text>
-            </Pressable>
+            {/* "View diff" (all-files diff page) link removed — the
+                workspace Files tab is one swipe away with the same
+                "Changed this session" list, and tapping a row in the
+                accordion below already opens the per-file diff which
+                is the view most users actually want. */}
             <Text style={[styles.filesPaneToggle, { color: t.text.secondary }]}>
               {filesPaneOpen ? '▲' : '▼'}
             </Text>
@@ -1351,6 +1565,8 @@ export default function ChatScreen() {
                 onTakeover={onTakeover}
                 rewindEnabled={Boolean(capabilities?.fileCheckpointing)}
                 onRewindRequest={onRewindRequest}
+                forkEnabled={Boolean(capabilities?.sessionForking)}
+                onForkRequest={(mid) => onFork(mid)}
                 onRequestMenu={(anchor, actions) => setBubbleMenu({ anchor, actions })}
               />
             </View>
@@ -1542,7 +1758,19 @@ export default function ChatScreen() {
         </Pressable>
       </View>
       {capabilities?.permissionPrompts !== false ? (
-        <ApprovalSheet approval={approval} onDecision={onApprovalDecision} />
+        <ApprovalSheet
+          approval={approval}
+          onDecision={onApprovalDecision}
+          // Preview-takeover Phase 0: when the user has opted into
+          // "Always ask before each capture," hide the "Always allow"
+          // button for visual-feedback tools so the user is prompted on
+          // every call. Other tools are unaffected.
+          suppressAllowAlways={
+            settings.alwaysAskBeforeCapture &&
+            approval !== null &&
+            isVisualFeedbackTool(approval.tool)
+          }
+        />
       ) : null}
     </KeyboardAvoidingView>
   );
@@ -1550,9 +1778,11 @@ export default function ChatScreen() {
   return (
     <>
       <ChatPreviewPager
+        ref={pagerRef}
         chat={chatBody}
         workspace={(active) => (
           <WorkspacePane
+            ref={workspaceRef}
             active={active}
             files={(filesActive) => (
               <FilesPane
@@ -1564,11 +1794,46 @@ export default function ChatScreen() {
               />
             )}
             preview={(previewActive) => (
-              <PreviewPane agent={agent} id={id} active={previewActive} />
+              <PreviewPane
+                agent={agent}
+                id={id}
+                active={previewActive}
+                captureRef={screenshot.targetRef}
+                previewFrameRef={previewFrameRef}
+              />
             )}
+            previewOverlay={
+              screenshot.supported && settings.enableVisualFeedback ? (
+                <>
+                  <ShutterFlash nonce={shotFlashNonce} />
+                  <PreviewShutter
+                    onCapture={onShutterPress}
+                    disabled={shotComposerOpen || manualShutterLocked}
+                  />
+                </>
+              ) : null
+            }
           />
         )}
         onIndexChange={setPagerIndex}
+        // Files-side dot pulses in the accent color whenever this
+        // session has touched files but the user isn't currently on
+        // the workspace pane. Replaces the old "N changed" badge that
+        // used to ride on the header overflow trigger.
+        pageBadges={[false, changedFiles.size > 0]}
+      />
+      {/* Preview-takeover Phase 1 — the controller subscribes to the
+          frame handler we register here and drives the state machine,
+          imperative ref calls, and indicator. The chat screen stays
+          oblivious to the takeover-mode internals. */}
+      <TakeoverController
+        pagerRef={pagerRef}
+        workspaceRef={workspaceRef}
+        previewFrameRef={previewFrameRef}
+        screenshot={screenshot}
+        sendFrame={(m) => sendRef.current?.(m)}
+        registerFrameHandler={registerTakeoverFrameHandler}
+        onManualShutterAvailability={setManualShutterLocked}
       />
       <SessionsSidebar
         visible={sidebarOpen}
@@ -1581,6 +1846,15 @@ export default function ChatScreen() {
         anchor={bubbleMenu?.anchor ?? null}
         actions={bubbleMenu?.actions ?? []}
         onClose={() => setBubbleMenu(null)}
+      />
+      <ScreenshotComposer
+        visible={shotComposerOpen}
+        upload={shotUpload}
+        onSend={sendScreenshot}
+        onCancel={() => {
+          setShotComposerOpen(false);
+          setShotUpload(null);
+        }}
       />
     </>
   );
@@ -1630,6 +1904,8 @@ const ChatRow = memo(
     onTakeover,
     rewindEnabled,
     onRewindRequest,
+    forkEnabled,
+    onForkRequest,
     onRequestMenu,
   }: {
     item: ChatItem;
@@ -1638,18 +1914,29 @@ const ChatRow = memo(
     onTakeover: (pendingMessage: string) => void;
     rewindEnabled: boolean;
     onRewindRequest: (messageId: string) => void;
+    /** Capability-gated `sessionForking` on the agent. When true and
+     *  the bubble has a messageId, long-press surfaces "Fork from
+     *  here." Replaces the old header-menu "Fork session" item which
+     *  could only fork from HEAD. */
+    forkEnabled: boolean;
+    onForkRequest: (messageId: string) => void;
     onRequestMenu: (anchor: BubbleMenuAnchor, actions: BubbleAction[]) => void;
   }) {
     const t = useTheme();
 
     if (item.kind === 'user') {
+      const canFork = forkEnabled && Boolean(item.messageId);
       return (
         <PressableBubble
           onLongPress={(e) => {
             triggerOpenHaptic();
+            const actions: BubbleAction[] = [copyAction(item.text)];
+            if (canFork && item.messageId) {
+              actions.push(forkAction(item.messageId, onForkRequest));
+            }
             onRequestMenu(
               { x: e.nativeEvent.pageX, y: e.nativeEvent.pageY },
-              [copyAction(item.text)],
+              actions,
             );
           }}
           style={[styles.bubbleUser, { backgroundColor: t.bubble.userBg }]}>
@@ -1659,6 +1946,7 @@ const ChatRow = memo(
     }
     if (item.kind === 'assistant') {
       const canRewind = rewindEnabled && Boolean(item.messageId);
+      const canFork = forkEnabled && Boolean(item.messageId);
       return (
         <PressableBubble
           onLongPress={(e) => {
@@ -1666,6 +1954,9 @@ const ChatRow = memo(
             const actions: BubbleAction[] = [copyAction(item.text)];
             if (canRewind && item.messageId) {
               actions.push(rewindAction(item.messageId, onRewindRequest));
+            }
+            if (canFork && item.messageId) {
+              actions.push(forkAction(item.messageId, onForkRequest));
             }
             onRequestMenu(
               { x: e.nativeEvent.pageX, y: e.nativeEvent.pageY },
@@ -1861,7 +2152,6 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   filesPaneLabel: { flex: 1, fontSize: fontSize.base, fontWeight: '600' },
-  filesPaneAction: { fontSize: fontSize.base, fontWeight: '600' },
   filesPaneToggle: { fontSize: fontSize.sm },
   filesList: { paddingHorizontal: space[3], paddingBottom: space[2], gap: 4 },
   fileRow: { flexDirection: 'row', alignItems: 'center', gap: space[2], paddingVertical: 4 },
@@ -1981,16 +2271,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  headerBadge: {
-    minWidth: 18,
-    height: 18,
-    borderRadius: 9,
-    paddingHorizontal: space[1],
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  headerBadgeText: {
-    fontSize: fontSize.xs,
-    fontWeight: '700',
-  },
+  // headerBadge / headerBadgeText were the "N changed files" pill on
+  // the header overflow trigger. The signal moved to the workspace
+  // pager dot via `pageBadges` so we no longer need them.
 });

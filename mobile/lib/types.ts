@@ -178,6 +178,11 @@ export interface AgentCapabilities {
   gitStatus?: boolean;
   /** /search endpoint supported — drives the Files tab's search bar. */
   projectSearch?: boolean;
+  /** Driver exposes the `take_screenshot` MCP tool — gates the agent-
+   *  initiated capture path. The manual shutter is gated on the client's
+   *  own capability (`clientCanCapture`) rather than this field; this
+   *  flag governs whether the bridge will register the MCP tool. */
+  screenshotCapture?: boolean;
 }
 
 export type AgentEvent =
@@ -217,7 +222,82 @@ export type ServerToClient =
   | { type: 'error'; message: string }
   | { type: 'file_changed'; path: string; op: 'add' | 'change' | 'unlink' }
   | { type: 'session_busy'; pids: number[]; source: 'desktop' | 'other_bridge' }
-  | { type: 'process_exit'; code: number | null; signal: NodeJS.Signals | null };
+  | { type: 'process_exit'; code: number | null; signal: NodeJS.Signals | null }
+  // Visual-feedback-loop Phase 2: bridge asks the phone to capture its
+  // PreviewPane WebView and reply with a `screenshot_result` frame
+  // correlated by `requestId`.
+  | {
+      type: 'request_screenshot';
+      requestId: string;
+      path?: string;
+      waitMs?: number;
+    }
+  // Preview-handoff Phase 1: bridge asks the user to set the preview
+  // to a specific state. Phone replies with `prepare_preview_result`.
+  | {
+      type: 'prepare_preview_request';
+      requestId: string;
+      instructions: string;
+      suggestedPath?: string;
+      timeoutSeconds?: number;
+    };
+
+/** Reasons a screenshot capture can fail. Mirrors the bridge constant
+ *  in `bridge/src/agents/types.ts`. */
+export type ScreenshotErrorReason =
+  | 'no_client'
+  | 'disabled_by_user'
+  | 'permission_denied'
+  | 'rate_limited'
+  | 'timeout'
+  | 'not_mounted'
+  | 'capture_failed'
+  | 'upload_failed'
+  | 'cancelled'
+  | 'unsupported';
+
+export const SCREENSHOT_ERROR_REASON = {
+  no_client: 'no_client',
+  disabled_by_user: 'disabled_by_user',
+  permission_denied: 'permission_denied',
+  rate_limited: 'rate_limited',
+  timeout: 'timeout',
+  not_mounted: 'not_mounted',
+  capture_failed: 'capture_failed',
+  upload_failed: 'upload_failed',
+  cancelled: 'cancelled',
+  unsupported: 'unsupported',
+} as const satisfies Record<ScreenshotErrorReason, ScreenshotErrorReason>;
+
+/** Mirror of the bridge's `HandoffResultStatus`. See preview-handoff
+ *  SDD + `bridge/src/agents/types.ts`. */
+export type HandoffResultStatus =
+  | 'ready'
+  | 'skipped'
+  | 'cancelled'
+  | 'timeout'
+  | 'disabled_by_user'
+  | 'no_client'
+  | 'rate_limited';
+
+export const HANDOFF_RESULT_STATUS = {
+  ready: 'ready',
+  skipped: 'skipped',
+  cancelled: 'cancelled',
+  timeout: 'timeout',
+  disabled_by_user: 'disabled_by_user',
+  no_client: 'no_client',
+  rate_limited: 'rate_limited',
+} as const satisfies Record<HandoffResultStatus, HandoffResultStatus>;
+
+/** Default cushion the handoff controller waits after a `ready` reply
+ *  before exiting, so a follow-up `take_screenshot` can re-enter the
+ *  takeover mode without flickering chrome. */
+export const HANDOFF_TO_CAPTURE_GRACE_MS = 500;
+/** Cross-fade duration on the handoff sheet ↔ pill transitions. */
+export const HANDOFF_MODAL_FADE_MS = 250;
+/** Cap on the optional skip-note the user attaches to a `skipped` reply. */
+export const HANDOFF_NOTE_MAX_LEN = 400;
 
 export interface ClientToServer {
   type:
@@ -227,13 +307,42 @@ export interface ClientToServer {
     | 'ping'
     | 'set_mode'
     | 'set_model'
-    | 'rewind_to';
+    | 'rewind_to'
+    // Visual-feedback-loop Phase 2 — phone replies to a screenshot
+    // request, or flips the per-session allow toggle.
+    | 'screenshot_result'
+    | 'set_screenshot_allow'
+    // Preview-takeover Phase 0 — phone mirrors the global
+    // `enableVisualFeedback` setting up to the bridge so the
+    // `take_screenshot` / `prepare_preview` MCP tools can short-
+    // circuit before any WS round-trip when the master switch is off.
+    | 'set_visual_feedback_enabled'
+    // Preview-handoff Phase 1 — phone's reply to a `prepare_preview`
+    // request. `status` carries the user's decision.
+    | 'prepare_preview_result';
   content?: string;
   toolUseId?: string;
   decision?: 'allow' | 'allow_always' | 'deny';
   mode?: PermissionMode;
   model?: string;
   messageId?: string;
+  // screenshot_result fields. uploadId present iff ok=true; reason
+  // present iff ok=false. Also carries the optional resolvedUrl echo
+  // (preview-takeover Phase 2).
+  requestId?: string;
+  ok?: boolean;
+  uploadId?: string;
+  reason?: ScreenshotErrorReason;
+  resolvedUrl?: string;
+  // set_screenshot_allow field.
+  allow?: boolean;
+  // set_visual_feedback_enabled field.
+  enabled?: boolean;
+  // prepare_preview_result fields. `status` is required; `finalUrl` +
+  // `note` are only meaningful when status is ready/skipped.
+  status?: HandoffResultStatus;
+  finalUrl?: string;
+  note?: string;
 }
 
 export interface DevServerCandidate {

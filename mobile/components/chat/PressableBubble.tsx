@@ -7,6 +7,13 @@ import {
   type ViewStyle,
 } from 'react-native';
 
+// Animatable Pressable so the press-scale transform and the bubble's
+// layout styles (alignSelf, maxWidth, padding, background) live on the
+// same element. Splitting them across two views broke the maxWidth: 85%
+// resolution — the inner element's percent reference was the unsized
+// outer Pressable, collapsing the bubble to a single column of letters.
+const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
+
 interface PressableBubbleProps {
   onLongPress: (event: GestureResponderEvent) => void;
   /** Visual styling of the bubble (background, padding, radius, alignSelf). */
@@ -50,13 +57,14 @@ export function PressableBubble({
   };
 
   return (
-    <Pressable
+    <AnimatedPressable
       onPress={onPress}
       onLongPress={onLongPress}
       onPressIn={() => animateTo(0.97)}
       onPressOut={() => animateTo(1)}
-      delayLongPress={delayLongPress}>
-      <Animated.View style={[style, { transform: [{ scale }] }]}>{children}</Animated.View>
-    </Pressable>
+      delayLongPress={delayLongPress}
+      style={[style, { transform: [{ scale }] }]}>
+      {children}
+    </AnimatedPressable>
   );
 }

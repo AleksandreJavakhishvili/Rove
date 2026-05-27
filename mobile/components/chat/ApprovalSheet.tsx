@@ -1,3 +1,4 @@
+import { lookupToolLabel } from '@/components/takeover/toolLabels';
 import { fontFamily, fontSize, radius, space, useTheme } from '@/theme';
 import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
@@ -10,6 +11,14 @@ export interface PendingApproval {
 interface ApprovalSheetProps {
   approval: PendingApproval | null;
   onDecision: (decision: 'allow' | 'allow_always' | 'deny') => void;
+  /**
+   * When true, suppress the "Always allow" button — the user is forced to
+   * decide on every call. Wired to the Settings "Always ask before each
+   * capture" sub-option for visual-feedback tools (preview-takeover
+   * Phase 0). Independent of allow-always rules already cached from
+   * previous sessions; those live in the bridge and are unaffected.
+   */
+  suppressAllowAlways?: boolean;
 }
 
 function summarize(tool: string, input: unknown): string {
@@ -45,12 +54,19 @@ function dangerLevel(tool: string, input: unknown): 'low' | 'medium' | 'high' {
   return 'low';
 }
 
-export function ApprovalSheet({ approval, onDecision }: ApprovalSheetProps) {
+export function ApprovalSheet({ approval, onDecision, suppressAllowAlways }: ApprovalSheetProps) {
   const t = useTheme();
   if (!approval) return null;
   const danger = dangerLevel(approval.tool, approval.input);
   const dangerColor =
     danger === 'high' ? t.status.danger : danger === 'medium' ? t.status.warning : t.accent.primary;
+
+  // Preview-takeover Phase 2 — visual-feedback tools render with
+  // friendly copy ("Allow Claude to view your live preview?") instead
+  // of the raw MCP tool name. Falls back to the default rendering for
+  // any unrecognised tool.
+  const friendly = lookupToolLabel(approval.tool);
+  const titleLabel = friendly?.label ?? approval.tool;
 
   return (
     <Modal animationType="slide" transparent onRequestClose={() => onDecision('deny')}>
@@ -58,18 +74,21 @@ export function ApprovalSheet({ approval, onDecision }: ApprovalSheetProps) {
         <View style={[styles.sheet, { backgroundColor: t.surface.raised }]}>
           <View style={[styles.handle, { backgroundColor: t.text.muted }]} />
           <Text style={[styles.title, { color: t.text.primary }]}>
-            Allow <Text style={{ color: dangerColor }}>{approval.tool}</Text>?
+            Allow <Text style={{ color: dangerColor }}>{titleLabel}</Text>?
           </Text>
           <Text style={[styles.subtitle, { color: t.text.secondary }]}>
-            {danger === 'high'
-              ? 'This command looks destructive — review carefully.'
-              : 'Your agent wants to run a tool that modifies state.'}
+            {friendly?.summary ??
+              (danger === 'high'
+                ? 'This command looks destructive — review carefully.'
+                : 'Your agent wants to run a tool that modifies state.')}
           </Text>
-          <ScrollView style={[styles.argsBox, { borderColor: t.border.subtle }]}>
-            <Text selectable style={[styles.argsText, { color: t.text.primary }]}>
-              {summarize(approval.tool, approval.input)}
-            </Text>
-          </ScrollView>
+          {friendly ? null : (
+            <ScrollView style={[styles.argsBox, { borderColor: t.border.subtle }]}>
+              <Text selectable style={[styles.argsText, { color: t.text.primary }]}>
+                {summarize(approval.tool, approval.input)}
+              </Text>
+            </ScrollView>
+          )}
           <View style={styles.buttons}>
             <Pressable
               onPress={() => onDecision('deny')}
@@ -79,14 +98,16 @@ export function ApprovalSheet({ approval, onDecision }: ApprovalSheetProps) {
               ]}>
               <Text style={[styles.btnLabel, { color: t.status.danger }]}>Deny</Text>
             </Pressable>
-            <Pressable
-              onPress={() => onDecision('allow_always')}
-              style={({ pressed }) => [
-                styles.btn,
-                { backgroundColor: t.surface.pressed, opacity: pressed ? 0.7 : 1 },
-              ]}>
-              <Text style={[styles.btnLabel, { color: t.text.primary }]}>Always</Text>
-            </Pressable>
+            {suppressAllowAlways ? null : (
+              <Pressable
+                onPress={() => onDecision('allow_always')}
+                style={({ pressed }) => [
+                  styles.btn,
+                  { backgroundColor: t.surface.pressed, opacity: pressed ? 0.7 : 1 },
+                ]}>
+                <Text style={[styles.btnLabel, { color: t.text.primary }]}>Always</Text>
+              </Pressable>
+            )}
             <Pressable
               onPress={() => onDecision('allow')}
               style={({ pressed }) => [

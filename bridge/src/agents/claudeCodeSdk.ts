@@ -1,9 +1,11 @@
 import {
+  createSdkMcpServer,
   forkSession as sdkForkSession,
   getSessionInfo as sdkGetSessionInfo,
   getSessionMessages as sdkGetSessionMessages,
   listSessions as sdkListSessions,
   query,
+  tool as sdkTool,
   type CanUseTool,
   type Options as SdkOptions,
   type PermissionMode as SdkPermissionMode,
@@ -17,8 +19,36 @@ import {
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { basename } from 'node:path';
-import { existsSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync } from 'node:fs';
+import { join } from 'node:path';
+import { z } from 'zod';
 import { config } from '../config.ts';
+import {
+  cancelPendingForSession,
+  getDispatch,
+  isScreenshotAllowed,
+  isVisualFeedbackEnabled,
+  requestScreenshot,
+  type ScreenshotOutcome,
+} from '../screenshotBroker.ts';
+import { requestHandoff, type HandoffOutcome } from '../handoffBroker.ts';
+import { getHandoffDispatch } from '../handoffDispatch.ts';
+import { checkAndConsume } from '../screenshotRateLimit.ts';
+import {
+  HANDOFF_INSTRUCTIONS_MAX_LEN,
+  HANDOFF_MAX_TIMEOUT_SECONDS,
+  HANDOFF_RESULT_STATUS,
+  PREPARE_PREVIEW_MCP_TOOL_NAME,
+  SCREENSHOT_ERROR_REASON,
+  SCREENSHOT_MCP_SERVER_NAME,
+  SCREENSHOT_MCP_SERVER_VERSION,
+  SCREENSHOT_MCP_TOOL_NAME,
+  SCREENSHOT_RESOLVED_URL_PREFIX,
+  SCREENSHOT_RESOLVED_URL_UNKNOWN,
+  SCREENSHOT_WAIT_MS_CAP,
+  type HandoffResultStatus,
+  type ScreenshotErrorReason,
+} from './types.ts';
 import { getHeadSha } from '../git.ts';
 import { requestPermissionFromUser } from '../permissions.ts';
 import { runtime } from '../runtime.ts';
@@ -77,6 +107,87 @@ const RESULT_SUBTYPE_SUCCESS = 'success';
  *  long. Generous (10 min) — the goal is just to keep stale entries from
  *  haunting the chat forever if something goes wrong server-side. */
 const PENDING_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Build the standard text-content tool result the `take_screenshot`
+ * handler returns on every failure mode. The text starts with a stable
+ * machine-readable prefix (`<reason>: <details>`) so the agent can
+ * pattern-match the cause without parsing prose.
+ */
+function textToolResult(reason: ScreenshotErrorReason, details: string) {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: `${reason}: ${details}`,
+      },
+    ],
+    isError: true,
+  };
+}
+
+/** Human-readable detail line for each failure reason. Total coverage
+ *  is enforced by the `Record<ScreenshotErrorReason, string>` type so
+ *  any new reason added to the constant produces a compile error here
+ *  until it's documented. */
+const REASON_DETAILS: Record<ScreenshotErrorReason, string> = {
+  no_client: 'No mobile client is attached to this session.',
+  disabled_by_user: 'User has disabled visual verification for this session.',
+  permission_denied: 'User denied the take_screenshot permission prompt.',
+  rate_limited: 'Too many captures in the rate-limit window.',
+  timeout: 'Phone did not respond within the timeout window.',
+  not_mounted: 'Preview pane is not currently mounted on the phone.',
+  capture_failed: 'captureRef threw on the phone — the WebView may not be drawn yet.',
+  upload_failed: 'Phone-side upload pipeline rejected the screenshot.',
+  cancelled: 'Session disconnected mid-capture.',
+  unsupported: 'Client platform does not support screenshot capture.',
+};
+
+function reasonDetails(reason: ScreenshotErrorReason): string {
+  return REASON_DETAILS[reason];
+}
+
+/**
+ * Build the text-content tool result the `prepare_preview` handler
+ * returns. Format: `<status>: <details>` so the agent can pattern-
+ * match the status without parsing prose. On `ready` the final URL
+ * (if the phone supplied one) is included so the agent knows where
+ * the user left the preview.
+ */
+function handoffTextResult(
+  status: HandoffResultStatus,
+  details: string,
+  extras?: { finalUrl?: string; note?: string },
+) {
+  const lines = [`${status}: ${details}`];
+  if (extras?.finalUrl) lines.push(`final_url: ${extras.finalUrl}`);
+  if (extras?.note) lines.push(`note: ${extras.note}`);
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: lines.join('\n'),
+      },
+    ],
+    // Only `ready` + `skipped` are treated as successful tool outcomes;
+    // every other status reads as an error so the agent's tool loop
+    // can branch.
+    isError:
+      status !== HANDOFF_RESULT_STATUS.ready && status !== HANDOFF_RESULT_STATUS.skipped,
+  };
+}
+
+/** Human-readable detail line for each handoff status. Total coverage
+ *  enforced by the `Record<HandoffResultStatus, string>` type. */
+const HANDOFF_DETAILS: Record<HandoffResultStatus, string> = {
+  ready: 'User reports the preview is ready for verification.',
+  skipped: 'User skipped the handoff.',
+  cancelled: 'User cancelled the handoff (or the session disconnected).',
+  timeout: 'User did not respond within the timeout window.',
+  disabled_by_user: 'Visual feedback is disabled for this session.',
+  no_client: 'No mobile client is attached to this session.',
+  rate_limited: 'Too many handoffs in the rate-limit window.',
+};
 
 function envMode(): PermissionMode {
   const raw = process.env.PERMISSION_MODE;
@@ -504,6 +615,13 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       // so we don't need to fail the capability if rg is missing; the
       // grep fallback covers it on every macOS / Linux box.
       projectSearch: existsSync(this.cwd),
+      // Phase 1 of visual-feedback-loop (see
+      // docs/sdd/2026-05-25-visual-feedback-loop/) ships the *manual*
+      // capture only — the agent-side MCP tool wiring is Phase 2. We
+      // advertise the capability up front so the mobile client knows
+      // the feature is on the roadmap for this driver; the actual
+      // bridge-side MCP tool registration follows in Phase 2.
+      screenshotCapture: true,
     };
   }
 
@@ -564,6 +682,15 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       env: { ...process.env, ROVE_BRIDGE: '1' },
       allowDangerouslySkipPermissions: this.permissionMode === 'bypassPermissions',
       pathToClaudeCodeExecutable: config.claudeBin,
+      // Visual-feedback-loop Phase 2 + preview-handoff — both
+      // `take_screenshot` and `prepare_preview` are registered as in-
+      // process MCP tools on the same server. They go through the
+      // same `canUseTool` gate as every other tool (first-call
+      // permission prompt, allow-always cache), then through the
+      // matching bridge↔mobile broker.
+      mcpServers: {
+        rove: this.buildVisualFeedbackMcpServer(),
+      },
     };
 
     this.q = query({ prompt: this.userMessageStream(), options });
@@ -587,6 +714,275 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
    * list chip, and allow-always rule persistence stay byte-identical with the
    * legacy CLI/MCP path from the user's perspective.
    */
+  /**
+   * Build the in-process MCP server that hosts the two visual-feedback
+   * tools (`take_screenshot` + `prepare_preview`). The SDK invokes each
+   * handler the same way it would any other MCP tool; both go through
+   * `canUseTool` first.
+   *
+   * All failure paths resolve to a `text` content block with a stable
+   * machine-readable prefix so the agent can pattern-match the cause
+   * and decide whether to retry, fall back, or proceed.
+   */
+  private buildVisualFeedbackMcpServer() {
+    return createSdkMcpServer({
+      name: SCREENSHOT_MCP_SERVER_NAME,
+      version: SCREENSHOT_MCP_SERVER_VERSION,
+      tools: [
+        sdkTool(
+          SCREENSHOT_MCP_TOOL_NAME,
+          'Capture the live preview from the user\'s mobile client and ' +
+            'receive it as an image. Use this to visually verify ' +
+            'frontend changes (layout, colors, alignment) instead of ' +
+            'asking the user to describe what they see. The phone ' +
+            'waits for the page to be ready (document.readyState ' +
+            'complete + browser idle + painted) before capturing — ' +
+            'fast pages capture quickly, slow ones get up to `waitMs` ' +
+            'of headroom. If the result shows a loading spinner or ' +
+            'incomplete UI, retry with a larger `waitMs`.',
+          {
+            path: z
+              .string()
+              .optional()
+              .describe(
+                'Optional dev-server-relative path to navigate to before capturing. ' +
+                  'Must start with a single "/" (no protocol, no traversal segments). ' +
+                  'Omit to capture whatever is currently shown.',
+              ),
+            waitMs: z
+              .number()
+              .int()
+              .min(0)
+              .max(SCREENSHOT_WAIT_MS_CAP)
+              .optional()
+              .describe(
+                `Maximum time (ms) to wait for the page to become ready before capturing. ` +
+                  `Default ~3000ms. For Next.js / heavy SPA cold starts pass 8000–15000ms. ` +
+                  `Capped server-side at ${SCREENSHOT_WAIT_MS_CAP}ms; the phone may capture ` +
+                  `sooner if the page is ready.`,
+              ),
+          },
+          async (args) => {
+            return await this.handleTakeScreenshot({
+              path: args.path,
+              waitMs: args.waitMs,
+            });
+          },
+        ),
+        sdkTool(
+          PREPARE_PREVIEW_MCP_TOOL_NAME,
+          'Ask the user to prepare the live preview for visual verification — ' +
+            'log in, navigate to a screen, dismiss a modal, etc. Use this ' +
+            'before `take_screenshot` when the route requires user setup ' +
+            '(auth, multi-step flows). The tool returns `ready` once the ' +
+            'user signals they\'re done, `skipped` if they declined with ' +
+            'an explanation, `cancelled` if they aborted, or `timeout` if ' +
+            'they didn\'t respond.',
+          {
+            instructions: z
+              .string()
+              .min(1)
+              .max(HANDOFF_INSTRUCTIONS_MAX_LEN)
+              .describe(
+                'Short, plain-language description of what the user should do ' +
+                  '(e.g. "Log in to /admin"). Shown verbatim in a sheet on the ' +
+                  'phone.',
+              ),
+            suggestedPath: z
+              .string()
+              .optional()
+              .describe(
+                'Optional dev-server-relative path the phone navigates to when ' +
+                  'the user taps "Open Preview". Validated client-side.',
+              ),
+            timeoutSeconds: z
+              .number()
+              .int()
+              .min(1)
+              .max(HANDOFF_MAX_TIMEOUT_SECONDS)
+              .optional()
+              .describe('How long to wait for the user. Server-capped.'),
+          },
+          async (args) => {
+            return await this.handlePreparePreview({
+              instructions: args.instructions,
+              suggestedPath: args.suggestedPath,
+              timeoutSeconds: args.timeoutSeconds,
+            });
+          },
+        ),
+      ],
+    });
+  }
+
+  private async handleTakeScreenshot(args: { path?: string; waitMs?: number }) {
+    // Outermost gate (preview-takeover Phase 0) — mirrors the mobile
+    // app's `enableVisualFeedback` master switch. When the user hasn't
+    // opted into the feature, the entire surface short-circuits: no
+    // WS frame goes to the phone, no permission prompt fires.
+    if (!isVisualFeedbackEnabled(this.sessionId)) {
+      return textToolResult(
+        SCREENSHOT_ERROR_REASON.disabled_by_user,
+        reasonDetails(SCREENSHOT_ERROR_REASON.disabled_by_user),
+      );
+    }
+
+    // Per-session kill switch — set by the user via the chat header
+    // menu. Defaults to true; once flipped off, every call short-
+    // circuits until the user re-enables.
+    if (!isScreenshotAllowed(this.sessionId)) {
+      return textToolResult(
+        SCREENSHOT_ERROR_REASON.disabled_by_user,
+        'User has disabled visual verification for this session.',
+      );
+    }
+
+    // No mobile client attached — return immediately so we don't
+    // register a Promise that's guaranteed to time out.
+    const dispatch = getDispatch(this.sessionId);
+    if (!dispatch) {
+      return textToolResult(
+        SCREENSHOT_ERROR_REASON.no_client,
+        'No mobile client is currently attached to this session.',
+      );
+    }
+
+    // Per-session token bucket — protect the user from a runaway agent
+    // burning image-input tokens.
+    const rate = checkAndConsume(this.agent, this.sessionId);
+    if (!rate.ok) {
+      return textToolResult(
+        SCREENSHOT_ERROR_REASON.rate_limited,
+        `Retry in ${rate.retryAfterSeconds}s.`,
+      );
+    }
+
+    let outcome: ScreenshotOutcome;
+    try {
+      outcome = await requestScreenshot(
+        this.sessionId,
+        { path: args.path, waitMs: args.waitMs },
+        dispatch,
+      );
+    } catch (err) {
+      // requestScreenshot never rejects in normal flow; this branch
+      // only triggers on a programming error.
+      return textToolResult(
+        SCREENSHOT_ERROR_REASON.capture_failed,
+        String((err as Error).message ?? err),
+      );
+    }
+
+    if (!outcome.ok) {
+      return textToolResult(outcome.reason, reasonDetails(outcome.reason));
+    }
+
+    // The phone sent back the absolute desktop path of the just-
+    // uploaded PNG (the bridge gave it to the phone during upload).
+    // Read the bytes, return as an MCP image content block.
+    try {
+      const bytes = readFileSync(outcome.uploadId);
+      const base64 = bytes.toString('base64');
+      // Preview-takeover Phase 2 — append the WebView's final URL as a
+      // text block so the agent can spot redirects (auth, 404) without
+      // having to inspect the screenshot. Format is stable
+      // (`resolved_url: <url>` or `resolved_url: (unknown)`) so an
+      // agent string-matching the prefix doesn't have to worry about
+      // missing data.
+      const resolvedUrl = outcome.resolvedUrl ?? SCREENSHOT_RESOLVED_URL_UNKNOWN;
+      return {
+        content: [
+          {
+            type: 'image' as const,
+            data: base64,
+            mimeType: 'image/png',
+          },
+          {
+            type: 'text' as const,
+            text: `${SCREENSHOT_RESOLVED_URL_PREFIX}${resolvedUrl}`,
+          },
+        ],
+      };
+    } catch (err) {
+      return textToolResult(
+        SCREENSHOT_ERROR_REASON.upload_failed,
+        String((err as Error).message ?? err),
+      );
+    }
+  }
+
+  /**
+   * Handle a `prepare_preview` MCP call. Gate chain mirrors
+   * `handleTakeScreenshot`:
+   *   1. Global `enableVisualFeedback` (preview-takeover Phase 0).
+   *   2. Per-session "Allow visual verification" header toggle.
+   *   3. Dispatcher attached (no_client otherwise).
+   *   4. Rate limiter (shared bucket — protects against either tool
+   *      runaway-burning the user's UI).
+   *   5. Broker round-trip → format the typed text result.
+   */
+  private async handlePreparePreview(args: {
+    instructions: string;
+    suggestedPath?: string;
+    timeoutSeconds?: number;
+  }) {
+    if (!isVisualFeedbackEnabled(this.sessionId)) {
+      return handoffTextResult(
+        HANDOFF_RESULT_STATUS.disabled_by_user,
+        HANDOFF_DETAILS[HANDOFF_RESULT_STATUS.disabled_by_user],
+      );
+    }
+    if (!isScreenshotAllowed(this.sessionId)) {
+      return handoffTextResult(
+        HANDOFF_RESULT_STATUS.disabled_by_user,
+        HANDOFF_DETAILS[HANDOFF_RESULT_STATUS.disabled_by_user],
+      );
+    }
+    const dispatch = getHandoffDispatch(this.sessionId);
+    if (!dispatch) {
+      return handoffTextResult(
+        HANDOFF_RESULT_STATUS.no_client,
+        HANDOFF_DETAILS[HANDOFF_RESULT_STATUS.no_client],
+      );
+    }
+    const rate = checkAndConsume(this.agent, this.sessionId);
+    if (!rate.ok) {
+      return handoffTextResult(
+        HANDOFF_RESULT_STATUS.rate_limited,
+        `Retry in ${rate.retryAfterSeconds}s.`,
+      );
+    }
+
+    let outcome: HandoffOutcome;
+    try {
+      outcome = await requestHandoff(
+        this.sessionId,
+        {
+          instructions: args.instructions,
+          ...(args.suggestedPath !== undefined ? { suggestedPath: args.suggestedPath } : {}),
+          ...(args.timeoutSeconds !== undefined
+            ? { timeoutMs: args.timeoutSeconds * 1000 }
+            : {}),
+        },
+        dispatch,
+      );
+    } catch (err) {
+      return handoffTextResult(
+        HANDOFF_RESULT_STATUS.cancelled,
+        String((err as Error).message ?? err),
+      );
+    }
+
+    const details = HANDOFF_DETAILS[outcome.status];
+    if (outcome.ok) {
+      return handoffTextResult(outcome.status, details, {
+        ...(outcome.finalUrl !== undefined ? { finalUrl: outcome.finalUrl } : {}),
+        ...(outcome.note !== undefined ? { note: outcome.note } : {}),
+      });
+    }
+    return handoffTextResult(outcome.status, details);
+  }
+
   private makeCanUseTool(): CanUseTool {
     return async (toolName, input, opts) => {
       try {
@@ -854,11 +1250,69 @@ function sdkSessionToListItem(
 }
 
 /**
+ * Resolve a session's "first" cwd by reading the head of its on-disk JSONL.
+ * The SDK's `getSessionInfo().cwd` returns whatever the most recent record
+ * carries, which drifts whenever the session is resumed from a different
+ * directory (typical of mobile takeover after a `cd subdir`). Drift makes
+ * the session invisible to desktop `claude --resume`, which filters by the
+ * project hash of the current cwd. Anchoring to the first recorded cwd
+ * matches the CLI's resume behavior and keeps the session findable from
+ * the directory it was originally started in.
+ *
+ * `permission-mode` and `file-history-snapshot` entries are written before
+ * the first message and don't carry a cwd, so we skip them and pick the
+ * first cwd-bearing line.
+ */
+function readFirstRecordedCwd(sessionId: string): string | null {
+  let projectDirs: string[];
+  try {
+    projectDirs = readdirSync(config.projectsDir);
+  } catch {
+    return null;
+  }
+  let path: string | null = null;
+  for (const proj of projectDirs) {
+    const candidate = join(config.projectsDir, proj, `${sessionId}.jsonl`);
+    if (existsSync(candidate)) {
+      path = candidate;
+      break;
+    }
+  }
+  if (!path) return null;
+
+  // 64KB is comfortably more than the head needs — the first real record
+  // sits within the first few entries, never more than a couple of KB in.
+  let head: string;
+  try {
+    const fd = openSync(path, 'r');
+    try {
+      const buf = Buffer.alloc(64 * 1024);
+      const n = readSync(fd, buf, 0, buf.length, 0);
+      head = buf.toString('utf8', 0, n);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  for (const line of head.split('\n')) {
+    if (!line) continue;
+    try {
+      const obj = JSON.parse(line) as { cwd?: unknown };
+      if (typeof obj.cwd === 'string' && obj.cwd) return obj.cwd;
+    } catch {
+      // Partial last line or malformed entry — keep scanning.
+    }
+  }
+  return null;
+}
+
+/**
  * Claude-code driver, fully SDK-backed. Session reads (`listSessions`,
  * `findSession`, `readHistory`) delegate to the SDK's session-management
- * functions; we keep zero hand-rolled JSONL parsing on the bridge side. The
- * only non-SDK helper is `desktopPids.ts` (ps-scan) because the SDK can't see
- * processes it didn't spawn.
+ * functions. The one exception is `readFirstRecordedCwd` (see above), which
+ * peeks at the JSONL head to anchor a session's cwd to its origin instead
+ * of letting it drift across resumes.
  */
 export class ClaudeCodeSdkDriver implements AgentDriver {
   readonly kind = CLAUDE_CODE_AGENT;
@@ -898,7 +1352,8 @@ export class ClaudeCodeSdkDriver implements AgentDriver {
       return null;
     }
     if (!info) return null;
-    return { cwd: info.cwd ?? '' };
+    const firstCwd = readFirstRecordedCwd(id);
+    return { cwd: firstCwd ?? info.cwd ?? '' };
   }
 
   async readHistory(id: string, opts: ReadHistoryOptions = {}): Promise<HistoryEntry[]> {
