@@ -7,7 +7,8 @@ import {
 import { useHydratedSettings, usePendingPermissions } from '@/lib/store';
 import type { SessionListItem } from '@/lib/types';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
-import { router } from 'expo-router';
+import { Ionicons } from '@expo/vector-icons';
+import { router, Stack } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
@@ -22,6 +23,16 @@ import {
 
 function pendingKey(agent: string, sessionId: string): string {
   return `${agent}:${sessionId}`;
+}
+
+/** Strip the scheme so the nav-bar title shows just the tailnet host
+ *  (`mymac.tail1234.ts.net`) rather than the full `https://…` URL. */
+function prettyHost(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).host;
+  } catch {
+    return baseUrl.replace(/^https?:\/\//, '');
+  }
 }
 
 function statusBadge(s: SessionListItem, t: Theme) {
@@ -160,32 +171,48 @@ export default function SessionsScreen() {
     );
   }
 
+  // Connection-status dot for the nav-bar title: loading → muted,
+  // failed fetch → danger, otherwise we're talking to the bridge.
+  const connDot =
+    sessions === null ? t.text.muted : error ? t.status.danger : t.sessionStatus.desktop;
+
   return (
-    <FlatList
-      style={{ backgroundColor: t.surface.base }}
-      contentContainerStyle={{ paddingVertical: 4 }}
-      data={sessions ?? []}
-      keyExtractor={(s) => `${s.agent}:${s.id}`}
-      refreshControl={
-        <RefreshControl
-          refreshing={refreshing}
-          onRefresh={async () => {
-            setRefreshing(true);
-            await load();
-            setRefreshing(false);
-          }}
-          tintColor={t.text.primary}
-        />
-      }
-      ListHeaderComponent={
-        <View>
-          <View style={styles.header}>
-            <Text style={[styles.headerHost, { color: t.text.secondary }]}>{settings.baseUrl}</Text>
-            <Pressable onPress={() => router.push('/settings')}>
-              <Text style={[styles.headerEdit, { color: t.accent.primary }]}>Edit</Text>
+    <>
+      <Stack.Screen
+        options={{
+          headerTitleAlign: 'left',
+          headerTitle: () => (
+            <Pressable
+              onPress={() => router.push('/settings')}
+              hitSlop={10}
+              style={styles.titleButton}>
+              <View style={[styles.titleDot, { backgroundColor: connDot }]} />
+              <Text numberOfLines={1} style={[styles.titleHost, { color: t.text.primary }]}>
+                {prettyHost(settings.baseUrl)}
+              </Text>
+              <Ionicons name="chevron-down" size={fontSize.sm} color={t.text.muted} />
             </Pressable>
-          </View>
-          {totalPending > 0 ? (
+          ),
+        }}
+      />
+      <FlatList
+        style={{ backgroundColor: t.surface.base }}
+        contentContainerStyle={{ paddingVertical: 4 }}
+        data={sessions ?? []}
+        keyExtractor={(s) => `${s.agent}:${s.id}`}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={async () => {
+              setRefreshing(true);
+              await load();
+              setRefreshing(false);
+            }}
+            tintColor={t.text.primary}
+          />
+        }
+        ListHeaderComponent={
+          totalPending > 0 ? (
             <View
               style={[
                 styles.banner,
@@ -202,9 +229,8 @@ export default function SessionsScreen() {
                 Tap a highlighted session to act on it.
               </Text>
             </View>
-          ) : null}
-        </View>
-      }
+          ) : null
+        }
       ListEmptyComponent={
         sessions === null ? (
           <View style={styles.centered}>
@@ -404,7 +430,8 @@ export default function SessionsScreen() {
           </View>
         );
       }}
-    />
+      />
+    </>
   );
 }
 
@@ -419,17 +446,12 @@ const styles = StyleSheet.create({
     borderRadius: radius.lg + 2,
   },
   primaryButtonLabel: { fontSize: fontSize.xl, fontWeight: '600' },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: space[4],
-    paddingVertical: space[2] + 2,
-  },
-  headerHost: { fontSize: fontSize.sm, flex: 1 },
-  headerEdit: { fontSize: fontSize.md, fontWeight: '500' },
+  titleButton: { flexDirection: 'row', alignItems: 'center', gap: space[2], maxWidth: 280 },
+  titleDot: { width: 8, height: 8, borderRadius: 4 },
+  titleHost: { fontSize: fontSize.lg, fontWeight: '600', flexShrink: 1 },
   banner: {
     marginHorizontal: space[3],
+    marginTop: space[2],
     marginBottom: space[2],
     paddingHorizontal: space[3],
     paddingVertical: space[2],
