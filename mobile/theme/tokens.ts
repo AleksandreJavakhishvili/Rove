@@ -74,6 +74,20 @@ export interface Theme {
     inlineBg: string;
     fg: string;
     gutter: string;
+    /** Syntax-highlight token colors, mapped from Prism token classes. */
+    syntax: {
+      keyword: string;
+      string: string;
+      comment: string;
+      number: string;
+      func: string;
+      tag: string;
+      attr: string;
+      punctuation: string;
+      operator: string;
+      builtin: string;
+      regex: string;
+    };
   };
 
   diff: {
@@ -153,6 +167,19 @@ const dark: Theme = {
     inlineBg: 'rgba(255,255,255,0.08)',
     fg: '#E2E4E7',
     gutter: '#555555',
+    syntax: {
+      keyword: '#c678dd',
+      string: '#98c379',
+      comment: '#7f848e',
+      number: '#d19a66',
+      func: '#61afef',
+      tag: '#e06c75',
+      attr: '#e5c07b',
+      punctuation: '#abb2bf',
+      operator: '#56b6c2',
+      builtin: '#e5c07b',
+      regex: '#98c379',
+    },
   },
   diff: {
     addBg: 'rgba(34,197,94,0.12)',
@@ -223,6 +250,19 @@ const light: Theme = {
     inlineBg: 'rgba(0,0,0,0.06)',
     fg: '#22272e',
     gutter: '#aaaaaa',
+    syntax: {
+      keyword: '#a626a4',
+      string: '#50a14f',
+      comment: '#a0a1a7',
+      number: '#986801',
+      func: '#4078f2',
+      tag: '#e45649',
+      attr: '#c18401',
+      punctuation: '#383a42',
+      operator: '#0184bc',
+      builtin: '#c18401',
+      regex: '#50a14f',
+    },
   },
   diff: {
     addBg: 'rgba(34,197,94,0.18)',

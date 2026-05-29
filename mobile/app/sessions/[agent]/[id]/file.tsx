@@ -1,14 +1,13 @@
+import { Markdown } from '@/components/chat/Markdown';
+import { CODE_LINE_HEIGHT, HighlightedCode } from '@/components/highlight/HighlightedCode';
+import { languageForPath } from '@/components/highlight/languages';
 import { fetchFile, type ScopedFile } from '@/lib/bridge';
 import { useHydratedSettings } from '@/lib/store';
-import { fontFamily, fontSize, space, useTheme } from '@/theme';
+import { fontSize, space, useTheme } from '@/theme';
 import * as Clipboard from 'expo-clipboard';
 import { Stack, useLocalSearchParams } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-
-/** Vertical line height used by the file viewer; kept in sync with
- *  styles.code below so the scroll-to-line math is correct. */
-const LINE_HEIGHT = 18;
 
 export default function FileViewerScreen() {
   const { agent, id, path, line: lineParam } = useLocalSearchParams<{
@@ -44,23 +43,27 @@ export default function FileViewerScreen() {
     };
   }, [settings.baseUrl, settings.token, agent, id, path]);
 
-  const lines = useMemo(() => (file ? file.contents.split('\n') : []), [file]);
-  const numWidth = useMemo(() => String(lines.length).length, [lines.length]);
+  const lineCount = useMemo(() => (file ? file.contents.split('\n').length : 0), [file]);
+  const language = useMemo(
+    () => (file ? languageForPath(file.rel || file.path) : null),
+    [file],
+  );
+  const isMarkdown = language === 'markdown';
 
   // Scroll-to-line on mount when `?line=N` is set. Runs once after the
   // file lands (we need lines to exist for the math to be meaningful)
   // and adds a small top margin so the target line isn't flush under
   // the meta bar.
   useEffect(() => {
-    if (!file || targetLine === null) return;
+    if (!file || targetLine === null || isMarkdown) return;
     // Use a microtask so the ScrollView has rendered its inner content
     // before we ask it to jump.
     const handle = setTimeout(() => {
-      const y = Math.max(0, (targetLine - 1) * LINE_HEIGHT - 80);
+      const y = Math.max(0, (targetLine - 1) * CODE_LINE_HEIGHT - 80);
       verticalScrollRef.current?.scrollTo({ y, animated: false });
     }, 50);
     return () => clearTimeout(handle);
-  }, [file, targetLine]);
+  }, [file, targetLine, isMarkdown]);
 
   if (error) {
     return (
@@ -91,7 +94,7 @@ export default function FileViewerScreen() {
       <Stack.Screen options={{ title, headerBackTitle: 'Back' }} />
       <View style={[styles.metaBar, { borderBottomColor: t.border.subtle }]}>
         <Text style={[styles.metaText, { color: t.text.secondary }]} numberOfLines={1}>
-          {file.rel || file.path} · {lines.length} lines · {Math.round(file.size / 1024)} KB
+          {file.rel || file.path} · {lineCount} lines · {Math.round(file.size / 1024)} KB
           {file.truncated ? ' · truncated' : ''}
         </Text>
         <Pressable hitSlop={8} onPress={copyAll}>
@@ -105,31 +108,19 @@ export default function FileViewerScreen() {
           </Text>
         </Pressable>
       </View>
-      <ScrollView ref={verticalScrollRef} showsVerticalScrollIndicator>
-        <ScrollView horizontal showsHorizontalScrollIndicator>
-          <View style={{ paddingVertical: space[2] }}>
-            {lines.map((line, i) => {
-              const lineNo = i + 1;
-              const isTarget = targetLine === lineNo;
-              return (
-                <View
-                  key={i}
-                  style={[
-                    styles.row,
-                    isTarget ? { backgroundColor: t.diff.addBg } : null,
-                  ]}>
-                  <Text style={[styles.gutter, { color: t.code.gutter, width: numWidth * 9 + 12 }]}>
-                    {String(lineNo).padStart(numWidth, ' ')}
-                  </Text>
-                  <Text style={[styles.code, { color: t.code.fg }]} selectable>
-                    {line === '' ? ' ' : line}
-                  </Text>
-                </View>
-              );
-            })}
-          </View>
+      {isMarkdown ? (
+        <ScrollView
+          contentContainerStyle={styles.markdownBody}
+          showsVerticalScrollIndicator>
+          <Markdown text={file.contents} color={t.text.primary} />
         </ScrollView>
-      </ScrollView>
+      ) : (
+        <ScrollView ref={verticalScrollRef} showsVerticalScrollIndicator>
+          <ScrollView horizontal showsHorizontalScrollIndicator>
+            <HighlightedCode code={file.contents} language={language} targetLine={targetLine} />
+          </ScrollView>
+        </ScrollView>
+      )}
     </View>
   );
 }
@@ -146,7 +137,5 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   metaText: { fontSize: fontSize.sm, flex: 1 },
-  row: { flexDirection: 'row', paddingHorizontal: 6 },
-  gutter: { fontFamily: fontFamily.mono, fontSize: fontSize.sm, lineHeight: 18, textAlign: 'right', paddingRight: 8 },
-  code: { fontFamily: fontFamily.mono, fontSize: fontSize.sm, lineHeight: 18 },
+  markdownBody: { paddingHorizontal: space[4], paddingVertical: space[3] },
 });

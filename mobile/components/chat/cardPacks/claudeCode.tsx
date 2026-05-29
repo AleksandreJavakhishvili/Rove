@@ -15,6 +15,22 @@ function previewPath(p: unknown): string {
   return p;
 }
 
+/** MCP tools follow the `mcp__<server>__<tool>` naming convention. Strip the
+ *  namespace and surface "<server> · <tool>" so a generic card reads cleanly
+ *  regardless of which MCP server emitted it — no per-tool special-casing.
+ *  Non-MCP names pass through unchanged. */
+function humanizeToolName(name: string): string {
+  if (name.startsWith('mcp__')) {
+    const parts = name.split('__').filter(Boolean);
+    if (parts.length >= 3) {
+      const server = parts[1].replace(/_/g, ' ');
+      const tool = parts.slice(2).join(' ').replace(/_/g, ' ');
+      return `${server} · ${tool}`;
+    }
+  }
+  return name;
+}
+
 function asText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -117,6 +133,33 @@ function CollapsibleMono({ text, max, t }: { text: string; max: number; t: Theme
       {!truncated && text.length === 0 ? (
         <Text style={[styles.dimmed, { color: t.text.secondary }]}>(empty)</Text>
       ) : null}
+    </View>
+  );
+}
+
+/** Tool input shown collapsed by default. For generic/MCP tools the raw args
+ *  are developer detail, not glanceable info — the tool name carries the
+ *  signal, so we keep the payload one tap away instead of dumping it. */
+function CollapsedInput({ text, t }: { text: string; t: Theme }) {
+  const [open, setOpen] = useState(false);
+  if (!text) return null;
+  if (!open) {
+    return (
+      <Pressable onPress={() => setOpen(true)} style={{ marginTop: 4 }}>
+        <Text style={[styles.expand, { color: t.accent.primary }]}>Show input</Text>
+      </Pressable>
+    );
+  }
+  return (
+    <View style={{ marginTop: 4 }}>
+      <ScrollView horizontal showsHorizontalScrollIndicator style={{ flexGrow: 0, flexShrink: 0 }}>
+        <Text style={[styles.mono, { color: t.text.primary }]} selectable>
+          {text}
+        </Text>
+      </ScrollView>
+      <Pressable onPress={() => setOpen(false)}>
+        <Text style={[styles.expand, { color: t.accent.primary }]}>Hide input</Text>
+      </Pressable>
     </View>
   );
 }
@@ -403,8 +446,8 @@ export const claudeCodeCards: Record<string, ToolCardRenderer> = {
 export function renderGenericCard(ctx: ToolCardContext) {
   return (
     <Card t={ctx.t}>
-      <Header t={ctx.t} label={ctx.name} running={ctx.running} />
-      <CollapsibleMono text={asText(ctx.input)} max={400} t={ctx.t} />
+      <Header t={ctx.t} label={humanizeToolName(ctx.name)} running={ctx.running} />
+      <CollapsedInput text={asText(ctx.input)} t={ctx.t} />
     </Card>
   );
 }

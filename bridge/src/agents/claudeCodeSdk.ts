@@ -67,9 +67,11 @@ import {
   type CompactResult,
   type CompactTrigger,
   type DriverSessionListItem,
+  type ModelOption,
   type PermissionMode,
   type ReadHistoryOptions,
   type SdkRunStatus,
+  type WorkflowTaskStatus,
 } from './types.ts';
 
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'default';
@@ -98,10 +100,44 @@ const SDK_SYSTEM_SUBTYPE = {
   status: 'status',
   compactBoundary: 'compact_boundary',
   localCommandOutput: 'local_command_output',
+  // Background-task lifecycle — the family the Claude 4.8 `/workflow` feature
+  // rides on (also used by Task-tool subagents / shell / monitor tasks).
+  taskStarted: 'task_started',
+  taskProgress: 'task_progress',
+  taskUpdated: 'task_updated',
+  taskNotification: 'task_notification',
 } as const;
+
+/** Set of `system` subtypes that describe a background task. */
+const TASK_SUBTYPES: ReadonlySet<string> = new Set([
+  SDK_SYSTEM_SUBTYPE.taskStarted,
+  SDK_SYSTEM_SUBTYPE.taskProgress,
+  SDK_SYSTEM_SUBTYPE.taskUpdated,
+  SDK_SYSTEM_SUBTYPE.taskNotification,
+]);
 
 /** Default `subtype` value the SDK emits when a turn completes cleanly. */
 const RESULT_SUBTYPE_SUCCESS = 'success';
+
+/**
+ * Slash commands the SDK advertised on its `init` message, cached at
+ * bridge-process (not session-instance) scope keyed by sessionId. The session
+ * object is evicted + recreated on idle / turn-end, which would otherwise wipe
+ * the list (an instance field) and leave a freshly-attached client falling back
+ * to the built-in command set until the next turn's init. Caching here lets
+ * `capabilities()` report the real list immediately on attach.
+ */
+const slashCommandCache = new Map<string, string[]>();
+
+/**
+ * Selectable models, discovered once per bridge process from the SDK's
+ * `Query.supportedModels()`. Install-wide (not session-specific), so a single
+ * module-level cache is enough. Populates `capabilities().modelSelection.available`
+ * so the mobile model picker offers real options instead of just the current
+ * model. (`/model` is a terminal-only interactive command and fails headlessly,
+ * so the picker — not the slash command — is how model switching works in Rove.)
+ */
+let availableModels: ModelOption[] = [];
 
 /** Drop in-flight user sends that the SDK still hasn't surfaced after this
  *  long. Generous (10 min) — the goal is just to keep stale entries from
@@ -332,9 +368,70 @@ function sessionMessageToEntries(msg: SessionMessage): HistoryEntry[] {
  * on-disk history replay (`sessionMessageToEntries`) but produces live
  * `AgentEvent`s instead of `HistoryEntry`s.
  */
+/**
+ * Translate one of the SDK's `task_*` system messages into our normalized
+ * `workflow_task` event. The four subtypes carry different fields; we fold
+ * them into a single shape keyed by `taskId` so a client can render one
+ * live-updating card (started → progress/updated → completed). Workflow runs
+ * are the tasks with `taskType === 'local_workflow'` / a `workflowName`;
+ * other task types (Task-tool subagents, etc.) flow through the same shape.
+ */
+function taskMessageToWorkflowEvent(msg: SDKMessage): AgentEvent {
+  const m = msg as unknown as {
+    subtype: string;
+    task_id: string;
+    description?: string;
+    subagent_type?: string;
+    task_type?: string;
+    workflow_name?: string;
+    skip_transcript?: boolean;
+    summary?: string;
+    status?: WorkflowTaskStatus;
+    patch?: { status?: WorkflowTaskStatus; description?: string; error?: string };
+  };
+  const base = { type: 'workflow_task' as const, taskId: m.task_id };
+  switch (m.subtype) {
+    case SDK_SYSTEM_SUBTYPE.taskStarted:
+      return {
+        ...base,
+        phase: 'started',
+        status: 'running',
+        ...(m.task_type ? { taskType: m.task_type } : {}),
+        ...(m.workflow_name ? { workflowName: m.workflow_name } : {}),
+        ...(m.subagent_type ? { subagentType: m.subagent_type } : {}),
+        ...(m.description ? { description: m.description } : {}),
+        ...(m.skip_transcript ? { skipTranscript: true } : {}),
+      };
+    case SDK_SYSTEM_SUBTYPE.taskProgress:
+      return {
+        ...base,
+        phase: 'progress',
+        status: 'running',
+        ...(m.subagent_type ? { subagentType: m.subagent_type } : {}),
+        ...(m.description ? { description: m.description } : {}),
+        ...(m.summary ? { summary: m.summary } : {}),
+      };
+    case SDK_SYSTEM_SUBTYPE.taskUpdated:
+      return {
+        ...base,
+        phase: 'updated',
+        ...(m.patch?.status ? { status: m.patch.status } : {}),
+        ...(m.patch?.description ? { description: m.patch.description } : {}),
+      };
+    case SDK_SYSTEM_SUBTYPE.taskNotification:
+    default:
+      return {
+        ...base,
+        phase: 'completed',
+        ...(m.status ? { status: m.status } : {}),
+        ...(m.summary ? { summary: m.summary } : {}),
+      };
+  }
+}
+
 function sdkMessageToEvents(
   msg: SDKMessage,
-  onSystemInit?: (info: { model?: string }) => void,
+  onSystemInit?: (info: { model?: string; slashCommands?: string[] }) => void,
 ): AgentEvent[] {
   const obj = msg as Record<string, unknown> & {
     parent_tool_use_id?: string | null;
@@ -345,8 +442,15 @@ function sdkMessageToEvents(
     msg.type === SDK_MESSAGE_TYPE.system &&
     (msg as { subtype?: string }).subtype === SDK_SYSTEM_SUBTYPE.init
   ) {
-    const init = msg as { model?: string };
-    onSystemInit?.({ model: init.model });
+    const init = msg as { model?: string; slash_commands?: string[]; skills?: string[] };
+    // The SDK splits invocable `/`-commands across two init arrays:
+    // `slash_commands` (built-ins like compact/model) and `skills` (which
+    // includes the Claude 4.8 workflow feature + any user skills). Both are
+    // typed in the `/` autocomplete, so merge them for the mobile picker.
+    const slash = init.slash_commands ?? [];
+    const skills = init.skills ?? [];
+    const commands = [...new Set([...slash, ...skills])];
+    onSystemInit?.({ model: init.model, slashCommands: commands });
     if (init.model) return [{ type: 'model', model: init.model }];
     return [];
   }
@@ -414,6 +518,17 @@ function sdkMessageToEvents(
     const content = (out.content ?? '').trim();
     if (!content) return [];
     return [{ type: 'slash_command_output', content }];
+  }
+
+  // Background-task lifecycle (Claude 4.8 workflows + Task-tool subagents).
+  // Normalize all four `task_*` subtypes into one `workflow_task` event so
+  // the client can render a single live-updating card instead of letting
+  // these fall through to the `raw` catch-all (where they were dropped).
+  if (
+    msg.type === SDK_MESSAGE_TYPE.system &&
+    TASK_SUBTYPES.has((msg as { subtype?: string }).subtype ?? '')
+  ) {
+    return [taskMessageToWorkflowEvent(msg)];
   }
 
   if (msg.type === SDK_MESSAGE_TYPE.assistant) {
@@ -557,10 +672,19 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
      *  in progress but no thinking text has arrived. */
     pendingTurns: number;
   } = { sdkStatus: SDK_RUN_STATUS.idle, thinkingText: null, pendingTurns: 0 };
-  /** Tracks the model the SDK reports in its `init` system message; '' until
-   *  the first turn so the capabilities snapshot can omit the model picker if
-   *  we never get one. */
+  /** The model we report to clients for the picker's "current" highlight + chip
+   *  label. Normally the value from the SDK `init` message, but when the user
+   *  explicitly picks an ALIAS (`default`/`sonnet`/`haiku`), we keep the alias
+   *  here instead of the concrete id the SDK resolves it to — otherwise the
+   *  picker can't highlight the row the user chose (e.g. `default` resolves to
+   *  `claude-opus-4-8[1m]`, which isn't a verbatim entry in supportedModels()).
+   *  '' until the first init so capabilities can omit the picker if we never
+   *  learn a model. */
   private currentModel = '';
+  /** Set to the value the user picked via `setModel` until the next `init`
+   *  reports its resolution; lets us keep displaying the chosen alias rather
+   *  than the resolved concrete id. Cleared once that init lands (or on error). */
+  private pendingSelectedModel: string | null = null;
 
   private q: SdkQuery | null = null;
   private inputQueue: Array<SDKUserMessage | null> = [];
@@ -591,11 +715,11 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       agent: this.agent,
       permissionPrompts: true,
       permissionModes: PERMISSION_MODES,
-      // `available` stays empty until Phase 3 wires the discovery; mobile
-      // hides the picker when the list is empty, the chip stays visible
-      // because `current` is non-empty as soon as the SDK reports one.
+      // `available` is populated from supportedModels() shortly after the first
+      // query spawns (empty for the brief window before that resolves); mobile
+      // shows just the current model until it lands, then the full list.
       modelSelection: this.currentModel
-        ? { current: this.currentModel, available: [] }
+        ? { current: this.currentModel, available: availableModels }
         : null,
       fileCheckpointing: true,
       sessionForking: true,
@@ -622,6 +746,12 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       // the feature is on the roadmap for this driver; the actual
       // bridge-side MCP tool registration follows in Phase 2.
       screenshotCapture: true,
+      // SDK-advertised slash commands (incl. any saved workflows). Omitted
+      // until an init message has been seen for this session so mobile keeps
+      // its built-in fallback list rather than showing an empty picker.
+      ...((slashCommandCache.get(this.sessionId)?.length ?? 0) > 0
+        ? { supportedCommands: slashCommandCache.get(this.sessionId)! }
+        : {}),
     };
   }
 
@@ -716,6 +846,26 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
     this.q = query({ prompt: this.userMessageStream(), options });
     this.lastActivity = Date.now();
     console.log(`[claude-sdk ${this.sessionId.slice(0, 8)}] query started cwd=${this.cwd}`);
+
+    // Discover selectable models once per bridge lifetime so the mobile model
+    // picker has real options. The init message only carries the *current*
+    // model; the full list comes from this dedicated SDK call.
+    if (availableModels.length === 0) {
+      this.q
+        .supportedModels()
+        .then((models) => {
+          if (!models.length) return;
+          availableModels = models.map((m) => ({
+            value: m.value,
+            label: m.displayName || m.value,
+            ...(m.description ? { description: m.description } : {}),
+          }));
+          this.emit('event', { type: 'capabilities', capabilities: this.capabilities() });
+        })
+        .catch((err) =>
+          console.error(`[claude-sdk] supportedModels failed:`, (err as Error).message),
+        );
+    }
 
     // Capture git baseline lazily on first spawn so the diff endpoint can show
     // "everything this session changed."
@@ -1069,11 +1219,26 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
     try {
       for await (const msg of q) {
         this.lastActivity = Date.now();
-        const events = sdkMessageToEvents(msg, ({ model }) => {
-          if (model && model !== this.currentModel) {
-            this.currentModel = model;
-            // Re-emit capabilities so the mobile chip refreshes the moment
-            // we learn what model the SDK is using.
+        const events = sdkMessageToEvents(msg, ({ model, slashCommands }) => {
+          let changed = false;
+          if (model) {
+            // If this init is resolving an alias the user just picked, keep the
+            // alias for display rather than the concrete id it resolved to.
+            const effective =
+              this.pendingSelectedModel !== null ? this.pendingSelectedModel : model;
+            this.pendingSelectedModel = null;
+            if (effective !== this.currentModel) {
+              this.currentModel = effective;
+              changed = true;
+            }
+          }
+          if (slashCommands && slashCommands.length && !slashCommandCache.has(this.sessionId)) {
+            slashCommandCache.set(this.sessionId, slashCommands);
+            changed = true;
+          }
+          // Re-emit capabilities so the mobile chips / slash picker refresh the
+          // moment we learn the model + command list from the init message.
+          if (changed) {
             this.emit('event', { type: 'capabilities', capabilities: this.capabilities() });
           }
         });
@@ -1233,6 +1398,9 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
 
   setModel(model: string): void {
     if (!model || model === this.currentModel) return;
+    // Remember the picked value so the next init keeps showing it (aliases like
+    // `default` resolve to concrete ids that aren't verbatim picker entries).
+    this.pendingSelectedModel = model;
     this.currentModel = model;
     // Mirror onto the per-session subscribers immediately so the mobile chip
     // updates without waiting for the SDK's next init frame. We also re-emit
@@ -1243,6 +1411,8 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
     this.emit('event', { type: 'capabilities', capabilities: this.capabilities() });
     if (this.q) {
       this.q.setModel(model).catch((err) => {
+        // Clear the pending alias so a later unrelated init isn't misattributed.
+        this.pendingSelectedModel = null;
         console.error(`[claude-sdk ${this.sessionId.slice(0, 8)}] setModel failed:`, err);
       });
     }

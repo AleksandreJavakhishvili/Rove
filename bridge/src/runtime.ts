@@ -10,6 +10,17 @@ function key(agent: AgentKind, sessionId: string): string {
 
 class SessionRuntime {
   private map = new Map<string, AgentSession>();
+  /**
+   * Session keys this bridge has claimed (spawned into or taken over) during
+   * its current lifetime. Lives OUTSIDE the session map on purpose: the
+   * per-session `claimedByBridge` flag rides on the ephemeral session object,
+   * which is evicted on turn-end / idle (see `reap` + the `exit` handler), and
+   * for the SDK driver `pid` is always undefined so eviction always hits the
+   * delete branch. Without this set, ownership would be forgotten on every
+   * idle cycle and the next message would re-run desktop-conflict detection —
+   * re-prompting "take over ownership" against the bridge's own SDK child.
+   */
+  private claimed = new Set<string>();
   private reaper: NodeJS.Timeout | null = null;
 
   startReaper(): void {
@@ -36,6 +47,18 @@ class SessionRuntime {
 
   get(agent: AgentKind, sessionId: string): AgentSession | undefined {
     return this.map.get(key(agent, sessionId));
+  }
+
+  /**
+   * Record that this bridge owns the session for the rest of its lifetime, and
+   * mirror the flag onto the live session if one is mounted. Survives session
+   * eviction so we never re-prompt "take over" for a session we already drive.
+   */
+  claim(agent: AgentKind, sessionId: string): void {
+    const k = key(agent, sessionId);
+    this.claimed.add(k);
+    const s = this.map.get(k);
+    if (s) s.claimedByBridge = true;
   }
 
   /**
@@ -78,6 +101,9 @@ class SessionRuntime {
     if (!located) throw new Error(`session not found: ${agent}/${sessionId}`);
 
     const session = driver.createSession(sessionId, located.cwd);
+    // Restore bridge ownership across eviction — a session we claimed earlier
+    // this lifetime stays claimed even though the object was recreated.
+    session.claimedByBridge = this.claimed.has(k);
     session.on('exit', () => {
       if (this.map.get(k) === session) this.map.delete(k);
     });

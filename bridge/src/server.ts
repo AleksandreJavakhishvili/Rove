@@ -256,8 +256,9 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
   // fact that the user explicitly asked to take over means they want the
   // bridge to own this session from here on. Subsequent user messages won't
   // re-trigger the conflict check.
-  const liveSession = runtime.get(agent, id);
-  if (liveSession) liveSession.claimedByBridge = true;
+  // Persist ownership for the bridge's lifetime (survives session eviction),
+  // and mirror onto the live session if one is mounted.
+  runtime.claim(agent, id);
 
   const foreign = await runtime.checkDesktopConflict(agent, id);
   if (!foreign || foreign.length === 0) {
@@ -920,8 +921,9 @@ app.get(
               try {
                 session.sendUserMessage(parsed.content!);
                 // Mark ownership the first time a send succeeds; subsequent
-                // turns skip the (often-stale) conflict check entirely.
-                session.claimedByBridge = true;
+                // turns skip the (often-stale) conflict check entirely. Persist
+                // it in the runtime so it survives session eviction on idle.
+                runtime.claim(agent, id);
                 console.log(`[bridge] forwarded user_message to subprocess pid=${session.pid}`);
               } catch (sendErr) {
                 console.error(`[bridge] sendUserMessage failed:`, sendErr);
@@ -960,7 +962,7 @@ app.get(
                 break;
               }
               const available = caps.modelSelection.available;
-              if (available.length > 0 && !available.includes(parsed.model!)) {
+              if (available.length > 0 && !available.some((m) => m.value === parsed.model)) {
                 send(ws, {
                   type: 'error',
                   message: `model ${parsed.model} not in agent's available list`,

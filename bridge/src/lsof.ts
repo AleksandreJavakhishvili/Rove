@@ -51,40 +51,68 @@ export function invalidateClaudeCache(): void {
   cache = null;
 }
 
+/**
+ * Walk `pid`'s parent chain; return true if `ancestor` appears anywhere above
+ * it. Used to recognize the bridge's OWN claude children (see below). The
+ * `seen` guard + `cur > 1` bound make a malformed ps snapshot (cycles, missing
+ * parents) terminate cleanly instead of looping.
+ */
+function isDescendantOf(pid: number, ancestor: number, parentOf: Map<number, number>): boolean {
+  let cur = parentOf.get(pid);
+  const seen = new Set<number>();
+  while (cur !== undefined && cur > 1 && !seen.has(cur)) {
+    if (cur === ancestor) return true;
+    seen.add(cur);
+    cur = parentOf.get(cur);
+  }
+  return false;
+}
+
 async function listClaudeProcesses(): Promise<LiveClaude[]> {
   let stdout = '';
   try {
-    ({ stdout } = await execP('ps -axo pid=,command=', { timeout: 2000, maxBuffer: 4_000_000 }));
+    ({ stdout } = await execP('ps -axo pid=,ppid=,command=', { timeout: 2000, maxBuffer: 4_000_000 }));
   } catch {
     return [];
   }
-  const out: LiveClaude[] = [];
   const selfPid = process.pid;
+  // Parent map across ALL processes (not just claude ones) so we can walk a
+  // claude process's ancestry up to the bridge.
+  const parentOf = new Map<number, number>();
+  const candidates: LiveClaude[] = [];
   for (const rawLine of stdout.split('\n')) {
     const line = rawLine.trim();
     if (!line) continue;
-    const m = line.match(/^(\d+)\s+(.+)$/);
+    const m = line.match(/^(\d+)\s+(\d+)\s+(.+)$/);
     if (!m) continue;
     const pid = Number(m[1]);
-    const args = m[2] ?? '';
+    const ppid = Number(m[2]);
+    const args = m[3] ?? '';
+    parentOf.set(pid, ppid);
     if (pid === selfPid) continue;
     // Match the claude CLI's last path segment: `.../claude`, `claude`, or `node .../claude.js`.
-    // Skip our own subprocess invocations (they include `CLAUDE_CODE_REMOTE_BRIDGE=1`, but env
-    // isn't visible in ps; we rely on PID matching done elsewhere).
     if (!/(?:^|\/)claude(?:\s|$)/.test(args) && !/claude-code/.test(args)) continue;
     // Ignore obvious non-claude lines (e.g., `grep claude`, our own `tsx ... claude.ts`).
     if (/\bgrep\b/.test(args)) continue;
     // Skip our own bridge subprocess (tsx running our server entry).
     if (/\btsx\b.*bridge\/src\/server/.test(args)) continue;
     const resumeMatch = args.match(/--resume(?:\s+|=)([0-9a-f-]{36})/i);
-    out.push({
+    candidates.push({
       pid,
       args,
       cwd: null,
       explicitSessionId: resumeMatch ? (resumeMatch[1] ?? null) : null,
     });
   }
-  return out;
+  // Exclude the bridge's OWN claude children. The Agent SDK spawns the real
+  // `claude` CLI as a subprocess (typically `--resume <id>`), which the
+  // attribution heuristic would otherwise flag as a competing desktop session —
+  // producing a bogus "take over ownership" prompt. Anything whose ancestry
+  // leads back to this bridge process is ours; a genuine desktop claude is a
+  // child of the user's shell, never of the bridge. (The old CLI driver
+  // excluded these by tracked pid, but the SDK driver doesn't expose its
+  // subprocess pid, so we identify them structurally instead.)
+  return candidates.filter((c) => !isDescendantOf(c.pid, selfPid, parentOf));
 }
 
 export interface ProcessInfo {

@@ -15,6 +15,35 @@ interface BridgeConfig {
   token?: string;
 }
 
+/** Coarse failure category so the UI can show a tailored error state (and
+ *  decide whether "Retry" or "Open settings" is the right action) instead of
+ *  dumping a raw `/sessions → 401`-style message. */
+export type BridgeErrorKind =
+  | 'network' // phone can't reach the bridge at all (DNS, offline, bridge down)
+  | 'timeout' // reached but no response in time
+  | 'auth' // 401 — missing / wrong token
+  | 'forbidden' // 403 — Tailscale identity not in ALLOWED_USERS
+  | 'mixed-content' // browser blocked HTTP-from-HTTPS
+  | 'http'; // any other non-OK status
+
+export class BridgeError extends Error {
+  readonly kind: BridgeErrorKind;
+  readonly status?: number;
+  constructor(kind: BridgeErrorKind, message: string, status?: number) {
+    super(message);
+    this.name = 'BridgeError';
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+/** Map a non-OK response to the right BridgeError. */
+function httpError(path: string, status: number): BridgeError {
+  if (status === 401) return new BridgeError('auth', `${path} → 401`, status);
+  if (status === 403) return new BridgeError('forbidden', `${path} → 403`, status);
+  return new BridgeError('http', `${path} → ${status}`, status);
+}
+
 function authHeaders(cfg: BridgeConfig): Record<string, string> {
   return cfg.token ? { Authorization: `Bearer ${cfg.token}` } : {};
 }
@@ -31,7 +60,8 @@ function isMixedContentBlocked(url: string): boolean {
 
 async function fetchWithTimeout(url: string, opts: RequestInit, timeoutMs = 7000): Promise<Response> {
   if (isMixedContentBlocked(url)) {
-    throw new Error(
+    throw new BridgeError(
+      'mixed-content',
       'Your browser blocked the connection: the bridge URL is HTTP but this page is HTTPS. ' +
         'Expose your bridge over HTTPS via `tailscale serve --bg --https=443 http://localhost:<port>` ' +
         'and use the resulting `https://<host>.<tailnet>.ts.net` URL. ' +
@@ -50,9 +80,14 @@ async function fetchWithTimeout(url: string, opts: RequestInit, timeoutMs = 7000
     const msg = (err as Error).message ?? String(err);
     console.log(`[bridge] ✕ ${url} (${Date.now() - started}ms): ${msg}`);
     if ((err as Error).name === 'AbortError') {
-      throw new Error(`request timed out after ${timeoutMs}ms — phone cannot reach the bridge`);
+      throw new BridgeError(
+        'timeout',
+        `Request timed out after ${timeoutMs}ms — the phone reached the network but the bridge didn't answer.`,
+      );
     }
-    throw err;
+    // fetch() rejects with a TypeError ("Network request failed") when the host
+    // is unreachable: offline, wrong URL, bridge not running, not on the tailnet.
+    throw new BridgeError('network', msg);
   } finally {
     clearTimeout(timer);
   }
@@ -66,7 +101,7 @@ export async function fetchHealth(cfg: BridgeConfig): Promise<{ ok: boolean; use
 
 export async function fetchSessions(cfg: BridgeConfig): Promise<SessionListItem[]> {
   const res = await fetchWithTimeout(`${cfg.baseUrl}/sessions`, { headers: authHeaders(cfg) });
-  if (!res.ok) throw new Error(`/sessions → ${res.status}`);
+  if (!res.ok) throw httpError('/sessions', res.status);
   const body = (await res.json()) as { sessions: SessionListItem[] };
   return body.sessions;
 }

@@ -162,11 +162,19 @@ export interface SearchHit {
 /** Capability snapshot the bridge publishes on session attach. Mobile mirrors
  *  it into a per-(agent,sessionId) slice and gates chat-header controls,
  *  approval surfaces, and rewind/fork actions on the matching field. */
+/** A selectable model, mirrored from the bridge. `value` → `set_model`;
+ *  `label` is the human name; `description` summarizes capabilities. */
+export interface ModelOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
 export interface AgentCapabilities {
   agent: AgentKind;
   permissionPrompts: boolean;
   permissionModes: PermissionMode[] | null;
-  modelSelection: { current: string; available: string[] } | null;
+  modelSelection: { current: string; available: ModelOption[] } | null;
   fileCheckpointing: boolean;
   sessionForking: boolean;
   interrupt: boolean;
@@ -183,7 +191,23 @@ export interface AgentCapabilities {
    *  own capability (`clientCanCapture`) rather than this field; this
    *  flag governs whether the bridge will register the MCP tool. */
   screenshotCapture?: boolean;
+  /** Slash commands the SDK advertised on init (no leading slash), incl.
+   *  /workflow + any saved workflows. Drives the slash-command picker when
+   *  present; falls back to a built-in list when undefined. */
+  supportedCommands?: string[];
 }
+
+/** Background-task lifecycle, mirrored from the bridge. Workflow runs are the
+ *  tasks with `taskType === 'local_workflow'` / a `workflowName`. */
+export type WorkflowTaskPhase = 'started' | 'progress' | 'updated' | 'completed';
+export type WorkflowTaskStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'killed'
+  | 'paused'
+  | 'stopped';
 
 export type AgentEvent =
   | { type: 'text'; role: 'assistant' | 'user'; text: string; messageId?: string; parentToolUseId?: string }
@@ -211,6 +235,18 @@ export type AgentEvent =
       compactError?: string;
     }
   | { type: 'slash_command_output'; content: string }
+  | {
+      type: 'workflow_task';
+      phase: WorkflowTaskPhase;
+      taskId: string;
+      taskType?: string;
+      workflowName?: string;
+      subagentType?: string;
+      status?: WorkflowTaskStatus;
+      description?: string;
+      summary?: string;
+      skipTranscript?: boolean;
+    }
   | { type: 'raw'; payload: unknown };
 
 export type ServerToClient =

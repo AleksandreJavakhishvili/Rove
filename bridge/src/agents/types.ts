@@ -39,6 +39,24 @@ export const SDK_RUN_STATUS = {
 } as const satisfies Record<SdkRunStatus, SdkRunStatus>;
 
 /**
+ * Background-task lifecycle, surfaced by the SDK's `task_*` system messages
+ * (SDKTaskStarted/Progress/Updated/Notification). The Claude 4.8 `/workflow`
+ * feature rides on these: a workflow run is a background task with
+ * `taskType === 'local_workflow'` and a `workflowName` (the `meta.name` from
+ * the workflow script). We normalize all four subtypes into one
+ * `workflow_task` AgentEvent keyed by `taskId`; clients merge updates by id.
+ */
+export type WorkflowTaskPhase = 'started' | 'progress' | 'updated' | 'completed';
+export type WorkflowTaskStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'killed'
+  | 'paused'
+  | 'stopped';
+
+/**
  * How a compact boundary was reached: `manual` is a user-typed /compact,
  * `auto` is the SDK's threshold-based auto-compact.
  */
@@ -167,6 +185,16 @@ export interface DriverSessionListItem {
  * matching capability is false; the server only invokes them when the
  * capability says it's safe.
  */
+/** A selectable model, mirrored from the SDK's `ModelInfo`. `value` is the id
+ *  sent to `setModel`; `label` is the human name; `description` summarizes the
+ *  model (e.g. "Smartest model for complex tasks"). Alias entries like
+ *  `default` resolve to a concrete model the description spells out. */
+export interface ModelOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
 export interface AgentCapabilities {
   /** Agent identifier — used by mobile to pick the right tool card pack. */
   agent: AgentKind;
@@ -174,8 +202,14 @@ export interface AgentCapabilities {
   permissionPrompts: boolean;
   /** Permission modes the agent supports; null/empty → no mode picker. */
   permissionModes: readonly PermissionMode[] | null;
-  /** Current model + selectable models; null → no model picker. */
-  modelSelection: { current: string; available: readonly string[] } | null;
+  /** Current model + selectable models; null → no model picker. `current` is
+   *  the active model's `value` (matches one of `available[].value` once the
+   *  list loads). Each option carries a human label + capability description
+   *  from the SDK so the picker can show "what is this / what's the default". */
+  modelSelection: {
+    current: string;
+    available: readonly ModelOption[];
+  } | null;
   /** Per-message file-checkpoint restore (Query.rewindFiles). */
   fileCheckpointing: boolean;
   /** Branch the session into a new one at a given point (forkSession). */
@@ -218,6 +252,14 @@ export interface AgentCapabilities {
    * modality input isn't supported by the agent.
    */
   screenshotCapture?: boolean;
+  /**
+   * Slash commands the SDK advertises on its `init` message (e.g.
+   * `compact`, `model`, `workflow`, plus any saved workflows / custom
+   * commands), WITHOUT the leading slash. Mobile's slash-command picker
+   * is driven from this when present, falling back to a built-in list.
+   * Undefined when the driver can't enumerate commands.
+   */
+  supportedCommands?: string[];
 }
 
 /**
@@ -430,6 +472,18 @@ export type AgentEvent =
       compactError?: string;
     }
   | { type: 'slash_command_output'; content: string }
+  | {
+      type: 'workflow_task';
+      phase: WorkflowTaskPhase;
+      taskId: string;
+      taskType?: string;
+      workflowName?: string;
+      subagentType?: string;
+      status?: WorkflowTaskStatus;
+      description?: string;
+      summary?: string;
+      skipTranscript?: boolean;
+    }
   | { type: 'raw'; payload: unknown };
 
 export interface SessionLifecycleListeners {

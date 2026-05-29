@@ -64,6 +64,7 @@ import {
   type PermissionMode,
   type SdkRunStatus,
   type SessionStatus,
+  type WorkflowTaskStatus,
 } from '@/lib/types';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
 import { Ionicons } from '@expo/vector-icons';
@@ -104,6 +105,32 @@ const SLASH_COMMANDS: SlashCmd[] = [
   { name: '/init', hint: 'Initialize a CLAUDE.md for the project' },
 ];
 
+// Friendly hints for SDK-advertised commands. Anything not listed (e.g. a
+// saved workflow) still shows with a generic hint so it's pickable.
+const SLASH_HINTS: Record<string, string> = {
+  compact: 'Summarize older turns to free context',
+  cost: 'Show token usage and spend',
+  model: 'Switch model',
+  help: 'List available commands',
+  agents: 'Manage agents',
+  mcp: 'Manage MCP servers',
+  clear: 'Reset conversation context',
+  init: 'Initialize a CLAUDE.md for the project',
+  workflow: 'Run a saved workflow',
+  workflows: 'Inspect live & completed workflow runs',
+};
+
+/** Build the slash-command list. When the bridge supplies the SDK's command
+ *  list (incl. /workflow + saved workflows) use it; otherwise fall back to the
+ *  built-in set so older bridges still get a picker. */
+function buildSlashCommands(supported?: string[]): SlashCmd[] {
+  if (!supported || supported.length === 0) return SLASH_COMMANDS;
+  return supported.map((raw) => {
+    const name = raw.startsWith('/') ? raw.slice(1) : raw;
+    return { name: `/${name}`, hint: SLASH_HINTS[name] ?? 'Slash command' };
+  });
+}
+
 type ChatItem =
   | { id: string; kind: 'user'; text: string; live?: boolean; parentToolUseId?: string; messageId?: string }
   | { id: string; kind: 'assistant'; text: string; live?: boolean; parentToolUseId?: string; messageId?: string }
@@ -127,6 +154,15 @@ type ChatItem =
       parentToolUseId?: string;
     }
   | { id: string; kind: 'meta'; text: string }
+  | {
+      id: string;
+      kind: 'workflow';
+      taskId: string;
+      workflowName?: string;
+      status?: WorkflowTaskStatus;
+      description?: string;
+      summary?: string;
+    }
   | { id: string; kind: 'takeover_prompt'; pids: number[]; pendingMessage: string };
 
 // Claude Code rewrites a user-typed slash command into a synthetic user
@@ -142,13 +178,43 @@ type ChatItem =
 // we want this filter to be robust against future small format changes.
 const SLASH_CMD_WRAPPER_RE = /<command-name>([^<]+)<\/command-name>/;
 const LOCAL_STDOUT_WRAPPER_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/;
+// Claude 4.8 injects a finished background task's result back into the
+// conversation as a synthetic user message wrapped in
+// `<task-notification>…</task-notification>` (carrying <task-id>, <status>,
+// <summary>, <result>). Like the slash-command wrappers above this is noise to
+// render verbatim — surface it as a workflow card with status + summary.
+const TASK_NOTIFICATION_RE = /<task-notification>([\s\S]*?)<\/task-notification>/;
+function taskField(block: string, tag: string): string {
+  return (block.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`))?.[1] ?? '').trim();
+}
+
+// Claude Code records an interrupt (user stopped the turn) as a synthetic
+// message whose text is `[Request interrupted by user]` (sometimes with a
+// trailing qualifier). Rendering it as a normal user bubble reads like the
+// user typed it — surface it as a centered "Interrupted" meta note instead.
+const INTERRUPTED_RE = /^\[Request interrupted by user/;
 
 function slashCommandMeta(text: string, id: string): ChatItem | null {
+  if (INTERRUPTED_RE.test(text.trim())) {
+    return { id, kind: 'meta', text: 'Interrupted' };
+  }
   const cmd = text.match(SLASH_CMD_WRAPPER_RE);
   if (cmd) {
     const name = (cmd[1] ?? '').trim();
     if (!name) return null;
     return { id, kind: 'meta', text: `Ran ${name}` };
+  }
+  const task = text.match(TASK_NOTIFICATION_RE);
+  if (task) {
+    const block = task[1] ?? '';
+    const status = taskField(block, 'status');
+    return {
+      id,
+      kind: 'workflow',
+      taskId: taskField(block, 'task-id') || id,
+      status: (status as WorkflowTaskStatus) || 'completed',
+      summary: taskField(block, 'summary') || undefined,
+    };
   }
   const out = text.match(LOCAL_STDOUT_WRAPPER_RE);
   if (out) {
@@ -896,7 +962,50 @@ export default function ChatScreen() {
           setThinkingTicker(lastLines);
           break;
         }
+        case 'workflow_task': {
+          // Live workflow lifecycle (Claude 4.8). Upsert a single card keyed by
+          // taskId so started → progress/updated → completed all land on one
+          // row. Ambient tasks (skipTranscript) and non-workflow background
+          // tasks (which already render via their own tool cards) are skipped.
+          if (ev.skipTranscript) break;
+          const itemId = `wf-${ev.taskId}`;
+          setItems((prev) => {
+            const exists = prev.some((it) => it.kind === 'workflow' && it.id === itemId);
+            if (!exists) {
+              const isWorkflow = Boolean(ev.workflowName) || ev.taskType === 'local_workflow';
+              if (!isWorkflow || ev.phase === 'completed') return prev;
+              return [
+                ...prev,
+                {
+                  id: itemId,
+                  kind: 'workflow',
+                  taskId: ev.taskId,
+                  workflowName: ev.workflowName,
+                  status: ev.status ?? 'running',
+                  description: ev.description,
+                },
+              ];
+            }
+            return prev.map((it) =>
+              it.kind === 'workflow' && it.id === itemId
+                ? {
+                    ...it,
+                    status: ev.status ?? it.status,
+                    description: ev.description ?? it.description,
+                    summary: ev.summary ?? it.summary,
+                    workflowName: ev.workflowName ?? it.workflowName,
+                  }
+                : it,
+            );
+          });
+          break;
+        }
         case 'raw':
+          // Unhandled event types are plumbing, not user-facing content, so we
+          // drop them. (Do NOT surface these as pills: high-frequency system
+          // frames like `thinking_tokens` stream continuously during a turn and
+          // would flood the transcript. Workflow task frames have their own
+          // typed `workflow_task` event; new SDK features should get the same.)
           break;
       }
     }
@@ -949,6 +1058,23 @@ export default function ChatScreen() {
   function onSend() {
     const userText = draft.trim();
     if (!userText && attachments.length === 0) return;
+    // `/model` and `/mode` are interactive terminal commands that fail
+    // headlessly ("isn't available in this environment"). Rove has native
+    // pickers for both, so intercept the command and open the picker instead
+    // of sending a doomed message.
+    if (attachments.length === 0) {
+      const cmd = userText.toLowerCase();
+      if (cmd === '/model' && capabilities?.modelSelection) {
+        setModelPickerOpen(true);
+        setDraft('');
+        return;
+      }
+      if (cmd === '/mode' && capabilities?.permissionModes && capabilities.permissionModes.length > 0) {
+        setModePickerOpen(true);
+        setDraft('');
+        return;
+      }
+    }
     if (!sendRef.current) return;
     // Prepend attachment references so Claude reads them with the Read tool
     // (which natively handles images as content blocks).
@@ -1391,7 +1517,11 @@ export default function ChatScreen() {
               hitSlop={6}
               style={[styles.modeChip, { borderColor: t.border.subtle, backgroundColor: t.surface.raised }]}>
               <Text style={[styles.modeChipLabel, { color: t.accent.primary }]} numberOfLines={1}>
-                model: {modelDisplay(capabilities.modelSelection.current)} ▾
+                model:{' '}
+                {capabilities.modelSelection.available.find(
+                  (m) => m.value === capabilities.modelSelection!.current,
+                )?.label ?? modelDisplay(capabilities.modelSelection.current)}{' '}
+                ▾
               </Text>
             </Pressable>
           ) : null}
@@ -1411,15 +1541,15 @@ export default function ChatScreen() {
         <View style={[styles.modePicker, { borderBottomColor: t.border.subtle, backgroundColor: t.surface.sunken }]}>
           {(capabilities.modelSelection.available.length > 0
             ? capabilities.modelSelection.available
-            : [capabilities.modelSelection.current]
+            : [{ value: capabilities.modelSelection.current, label: modelDisplay(capabilities.modelSelection.current) }]
           ).map((m) => {
-            const active = m === capabilities.modelSelection!.current;
+            const active = m.value === capabilities.modelSelection!.current;
             return (
               <Pressable
-                key={m}
+                key={m.value}
                 onPress={() => {
                   setModelPickerOpen(false);
-                  if (!active) sendRef.current?.({ type: 'set_model', model: m });
+                  if (!active) sendRef.current?.({ type: 'set_model', model: m.value });
                 }}
                 style={({ pressed }) => [
                   styles.modeOption,
@@ -1432,20 +1562,31 @@ export default function ChatScreen() {
                     borderColor: active ? t.accent.primary : t.border.subtle,
                   },
                 ]}>
-                <Text
-                  style={[
-                    styles.modeOptionLabel,
-                    { color: active ? t.accent.fg : t.text.primary },
-                  ]}>
-                  {m}
-                </Text>
+                <View style={styles.modeOptionHeader}>
+                  <Text
+                    style={[styles.modeOptionLabel, { color: active ? t.accent.fg : t.text.primary }]}>
+                    {m.label}
+                  </Text>
+                  {active ? (
+                    <Text style={[styles.modeOptionBadge, { color: t.accent.fg }]}>current</Text>
+                  ) : null}
+                </View>
+                {m.description ? (
+                  <Text
+                    style={[
+                      styles.modeOptionDescription,
+                      { color: active ? t.accent.fg : t.text.secondary },
+                    ]}
+                    numberOfLines={2}>
+                    {m.description}
+                  </Text>
+                ) : null}
               </Pressable>
             );
           })}
           {capabilities.modelSelection.available.length === 0 ? (
             <Text style={[styles.modeOptionDescription, { color: t.text.secondary }]} numberOfLines={2}>
-              No alternate models advertised. The bridge will accept any model ID the agent honors —
-              tap the chip again to switch back.
+              Loading available models… tap again in a moment.
             </Text>
           ) : null}
         </View>
@@ -1642,7 +1783,13 @@ export default function ChatScreen() {
           onPick={onMentionPick}
         />
       ) : null}
-      {draft.startsWith('/') ? <SlashPicker draft={draft} onPick={(cmd) => setDraft(cmd + ' ')} /> : null}
+      {draft.startsWith('/') ? (
+        <SlashPicker
+          draft={draft}
+          commands={buildSlashCommands(capabilities?.supportedCommands)}
+          onPick={(cmd) => setDraft(cmd + ' ')}
+        />
+      ) : null}
       {attachments.length > 0 ? (
         <ScrollView
           horizontal
@@ -1893,10 +2040,55 @@ function ThinkingDot({ color }: { color: string }) {
   return <Animated.View style={[styles.thinkingDot, { backgroundColor: color, opacity }]} />;
 }
 
-function SlashPicker({ draft, onPick }: { draft: string; onPick: (cmd: string) => void }) {
+/** Live/completed workflow run (Claude 4.8 /workflow). Reuses the pulsing
+ *  ThinkingDot while running; flips to a solid status dot when terminal. */
+function WorkflowCard({ item }: { item: Extract<ChatItem, { kind: 'workflow' }> }) {
+  const t = useTheme();
+  const status = item.status ?? 'running';
+  const running = status === 'running' || status === 'pending' || status === 'paused';
+  const failed = status === 'failed' || status === 'killed' || status === 'stopped';
+  const accent = failed ? t.status.danger : status === 'completed' ? t.status.success : t.accent.primary;
+  return (
+    <View
+      style={[
+        styles.workflowCard,
+        { backgroundColor: t.surface.raised, borderColor: t.border.subtle, borderLeftColor: accent },
+      ]}>
+      <View style={styles.workflowHeader}>
+        {running ? (
+          <ThinkingDot color={accent} />
+        ) : (
+          <View style={[styles.workflowDot, { backgroundColor: accent }]} />
+        )}
+        <Text style={[styles.workflowTitle, { color: t.text.primary }]} numberOfLines={1}>
+          Workflow{item.workflowName ? ` · ${item.workflowName}` : ''}
+        </Text>
+        <Text style={[styles.workflowStatus, { color: accent }]}>{status}</Text>
+      </View>
+      {item.description ? (
+        <Text style={[styles.workflowBody, { color: t.text.secondary }]} numberOfLines={4}>
+          {item.description}
+        </Text>
+      ) : null}
+      {item.summary ? (
+        <Text style={[styles.workflowBody, { color: t.text.secondary }]}>{item.summary}</Text>
+      ) : null}
+    </View>
+  );
+}
+
+function SlashPicker({
+  draft,
+  commands,
+  onPick,
+}: {
+  draft: string;
+  commands: SlashCmd[];
+  onPick: (cmd: string) => void;
+}) {
   const t = useTheme();
   const q = draft.trim().toLowerCase();
-  const matches = SLASH_COMMANDS.filter((c) => c.name.toLowerCase().startsWith(q));
+  const matches = commands.filter((c) => c.name.toLowerCase().startsWith(q));
   if (matches.length === 0) return null;
   return (
     <ScrollView
@@ -2022,6 +2214,9 @@ const ChatRow = memo(
         </View>
       );
     }
+    if (item.kind === 'workflow') {
+      return <WorkflowCard item={item} />;
+    }
     if (item.kind === 'takeover_prompt') {
       return (
         <View
@@ -2062,6 +2257,14 @@ const ChatRow = memo(
     if (prev.item.kind === 'tool_use' && next.item.kind === 'tool_use') {
       return prev.item.running === next.item.running;
     }
+    if (prev.item.kind === 'workflow' && next.item.kind === 'workflow') {
+      return (
+        prev.item.status === next.item.status &&
+        prev.item.description === next.item.description &&
+        prev.item.summary === next.item.summary &&
+        prev.item.workflowName === next.item.workflowName
+      );
+    }
     return true;
   },
 );
@@ -2101,6 +2304,8 @@ const styles = StyleSheet.create({
   },
   modeOptionLabel: { fontSize: fontSize.base, fontWeight: '700' },
   modeOptionDescription: { fontSize: fontSize.sm },
+  modeOptionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: space[2] },
+  modeOptionBadge: { fontSize: fontSize.xs, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.4 },
   bubbleUser: {
     alignSelf: 'flex-end',
     maxWidth: '85%',
@@ -2119,6 +2324,20 @@ const styles = StyleSheet.create({
   },
   metaRow: { alignSelf: 'center', paddingHorizontal: space[2] + 2, paddingVertical: 4 },
   metaText: { fontSize: fontSize.sm, textAlign: 'center' },
+  workflowCard: {
+    alignSelf: 'stretch',
+    marginVertical: 4,
+    padding: space[3],
+    borderRadius: radius.lg,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderLeftWidth: 3,
+    gap: space[2],
+  },
+  workflowHeader: { flexDirection: 'row', alignItems: 'center', gap: space[2] },
+  workflowDot: { width: 8, height: 8, borderRadius: 4 },
+  workflowTitle: { flex: 1, fontSize: fontSize.base, fontWeight: '600' },
+  workflowStatus: { fontSize: fontSize.xs, fontWeight: '700', textTransform: 'lowercase' },
+  workflowBody: { fontSize: fontSize.sm, lineHeight: 19 },
   thinkingRow: {
     flexDirection: 'row',
     alignItems: 'center',

@@ -1,7 +1,9 @@
 import {
+  BridgeError,
   fetchSessions,
   renameSession,
   sendApproval,
+  type BridgeErrorKind,
   type PendingPermissionSnapshot,
 } from '@/lib/bridge';
 import { useHydratedSettings, usePendingPermissions } from '@/lib/store';
@@ -54,6 +56,66 @@ function fmtAgo(ms: number): string {
   return `${Math.floor(diff / 86_400_000)}d ago`;
 }
 
+interface ErrorView {
+  icon: keyof typeof Ionicons.glyphMap;
+  title: string;
+  body: string;
+  /** Which primary action to offer. 'settings' for auth/config problems the
+   *  user fixes in settings; 'retry' for transient connectivity. */
+  action: 'retry' | 'settings';
+  /** Show a "Retry" secondary even when the primary is "Open settings". */
+  secondaryRetry?: boolean;
+}
+
+/** Turn a thrown error into a friendly, actionable error screen. Distinguishes
+ *  auth/permission problems (fix in settings) from connectivity (retry). */
+function describeError(err: unknown): ErrorView {
+  const kind: BridgeErrorKind | undefined = err instanceof BridgeError ? err.kind : undefined;
+  switch (kind) {
+    case 'auth':
+      return {
+        icon: 'key-outline',
+        title: 'Authentication failed',
+        body: "The bridge rejected your token (401). It may be wrong, expired, or missing. Re-scan the QR code from the bridge to refresh it.",
+        action: 'settings',
+        secondaryRetry: true,
+      };
+    case 'forbidden':
+      return {
+        icon: 'lock-closed-outline',
+        title: 'Access denied',
+        body: "Your Tailscale identity isn't in the bridge's allowed users (403). Add it via ALLOWED_USERS on the bridge, then retry.",
+        action: 'settings',
+        secondaryRetry: true,
+      };
+    case 'mixed-content':
+      return {
+        icon: 'warning-outline',
+        title: 'Connection blocked',
+        body: (err as Error).message,
+        action: 'settings',
+        secondaryRetry: true,
+      };
+    case 'timeout':
+      return {
+        icon: 'time-outline',
+        title: 'Bridge not responding',
+        body: "Reached the network but the bridge didn't answer in time. Make sure it's running, then retry.",
+        action: 'retry',
+        secondaryRetry: false,
+      };
+    case 'network':
+    default:
+      return {
+        icon: 'cloud-offline-outline',
+        title: "Can't reach the bridge",
+        body: "Couldn't connect. Check that you're on the same tailnet, the bridge is running, and the URL is correct.",
+        action: 'retry',
+        secondaryRetry: false,
+      };
+  }
+}
+
 /**
  * Produce a tight one-line description of a tool invocation for the inline
  * approval card. Optimized for the tools Claude actually prompts on — Bash and
@@ -83,7 +145,7 @@ export default function SessionsScreen() {
   const settings = useHydratedSettings();
   const t = useTheme();
   const [sessions, setSessions] = useState<SessionListItem[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [refreshing, setRefreshing] = useState(false);
   // Pending approvals are kept in a global store so the WS survives navigation
   // and we don't miss events fired while the user is inside a chat.
@@ -99,7 +161,7 @@ export default function SessionsScreen() {
       const data = await fetchSessions({ baseUrl: settings.baseUrl, token: settings.token });
       setSessions(data);
     } catch (err) {
-      setError(String((err as Error).message ?? err));
+      setError(err);
       setSessions([]);
     }
   }, [settings.baseUrl, settings.token]);
@@ -237,13 +299,36 @@ export default function SessionsScreen() {
             <ActivityIndicator />
           </View>
         ) : error ? (
-          <View style={styles.centered}>
-            <Text style={[styles.errorTitle, { color: t.text.primary }]}>Couldn&apos;t load sessions</Text>
-            <Text style={[styles.errorBody, { color: t.text.secondary }]}>{error}</Text>
-            <Pressable onPress={load} style={[styles.primaryButton, { backgroundColor: t.accent.primary }]}>
-              <Text style={[styles.primaryButtonLabel, { color: t.accent.fg }]}>Retry</Text>
-            </Pressable>
-          </View>
+          (() => {
+            const view = describeError(error);
+            return (
+              <View style={styles.centered}>
+                <View style={[styles.errorIcon, { backgroundColor: t.surface.raised }]}>
+                  <Ionicons name={view.icon} size={30} color={t.text.secondary} />
+                </View>
+                <Text style={[styles.errorTitle, { color: t.text.primary }]}>{view.title}</Text>
+                <Text style={[styles.errorBody, { color: t.text.secondary }]}>{view.body}</Text>
+                {view.action === 'settings' ? (
+                  <>
+                    <Pressable
+                      onPress={() => router.push('/settings')}
+                      style={[styles.primaryButton, { backgroundColor: t.accent.primary }]}>
+                      <Text style={[styles.primaryButtonLabel, { color: t.accent.fg }]}>Open settings</Text>
+                    </Pressable>
+                    {view.secondaryRetry ? (
+                      <Pressable onPress={load} hitSlop={8} style={styles.secondaryButton}>
+                        <Text style={[styles.secondaryButtonLabel, { color: t.accent.primary }]}>Retry</Text>
+                      </Pressable>
+                    ) : null}
+                  </>
+                ) : (
+                  <Pressable onPress={load} style={[styles.primaryButton, { backgroundColor: t.accent.primary }]}>
+                    <Text style={[styles.primaryButtonLabel, { color: t.accent.fg }]}>Retry</Text>
+                  </Pressable>
+                )}
+              </View>
+            );
+          })()
         ) : (
           <View style={styles.centered}>
             <Text style={{ color: t.text.secondary }}>No sessions yet.</Text>
@@ -480,8 +565,18 @@ const styles = StyleSheet.create({
   pendingChipLabel: { fontSize: fontSize.xs, fontWeight: '700' },
   statusLabel: { fontSize: fontSize.sm },
   agentLabel: { fontSize: fontSize.sm },
-  errorTitle: { fontSize: fontSize['2xl'], fontWeight: '600' },
-  errorBody: { fontSize: fontSize.base, textAlign: 'center', maxWidth: 320, lineHeight: 19 },
+  errorIcon: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: space[1],
+  },
+  errorTitle: { fontSize: fontSize['2xl'], fontWeight: '600', textAlign: 'center' },
+  errorBody: { fontSize: fontSize.base, textAlign: 'center', maxWidth: 320, lineHeight: 20 },
+  secondaryButton: { paddingVertical: space[2], paddingHorizontal: space[4] },
+  secondaryButtonLabel: { fontSize: fontSize.base, fontWeight: '600' },
   pendingPanel: {
     paddingHorizontal: space[3],
     paddingVertical: space[2],
