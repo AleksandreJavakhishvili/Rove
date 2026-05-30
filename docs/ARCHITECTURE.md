@@ -73,7 +73,8 @@ The mobile app is intentionally thin — a presentation layer for the normalized
 │   │       ├── CodeBlock.tsx      # Fenced-code with copy + collapse
 │   │       ├── Diff.tsx           # Inline unified diff for Edit tool cards
 │   │       ├── ToolCard.tsx       # Per-tool card layouts (Read/Edit/Bash/etc.)
-│   │       └── ApprovalSheet.tsx  # Bottom-sheet for permission_prompts
+│   │       ├── ApprovalSheet.tsx  # Bottom-sheet for the focused session's permission_prompts
+│   │       └── crossSession/      # Other sessions' approvals, in-chat (whisper → badge → tray)
 │   └── lib/
 │       ├── bridge.ts        # HTTP + WS transport (typed)
 │       ├── store.ts         # Zustand store (persisted via expo-sqlite/kv-store)
