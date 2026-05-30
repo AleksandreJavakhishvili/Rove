@@ -1,4 +1,5 @@
 import { lookupToolLabel } from '@/components/takeover/toolLabels';
+import { dangerLevel } from '@/lib/toolSummary';
 import { fontFamily, fontSize, radius, space, useTheme } from '@/theme';
 import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
@@ -39,19 +40,6 @@ function summarize(tool: string, input: unknown): string {
         return '';
       }
   }
-}
-
-function dangerLevel(tool: string, input: unknown): 'low' | 'medium' | 'high' {
-  if (tool === 'Bash') {
-    const cmd = String((input as any)?.command ?? '');
-    if (/\brm\s+-rf\b/.test(cmd) || /git\s+push\s+(-f|--force)/.test(cmd) || /sudo\b/.test(cmd)) {
-      return 'high';
-    }
-    return 'medium';
-  }
-  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit') return 'medium';
-  if (tool === 'WebFetch') return 'medium';
-  return 'low';
 }
 
 export function ApprovalSheet({ approval, onDecision, suppressAllowAlways }: ApprovalSheetProps) {
