@@ -1,4 +1,5 @@
 import { ApprovalSheet, type PendingApproval } from '@/components/chat/ApprovalSheet';
+import { CrossSessionApprovals } from '@/components/chat/crossSession/CrossSessionApprovals';
 import {
   BubbleActionMenu,
   copyAction,
@@ -2005,6 +2006,10 @@ export default function ChatScreen() {
           setShotUpload(null);
         }}
       />
+      {/* Cross-session approvals — surfaces *other* sessions' pending permission
+          requests (whisper → badge → tray) without leaving this chat. The
+          focused session's own requests stay on the ApprovalSheet above. */}
+      <CrossSessionApprovals currentAgent={agent} currentSessionId={id} />
     </>
   );
 }
