@@ -4,19 +4,12 @@ import { dangerLevel, summarizeToolInput } from '@/lib/toolSummary';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
 import { router } from 'expo-router';
 import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ownerLabel } from './labels';
 
 interface ApprovalTrayProps {
   open: boolean;
   requests: PendingPermissionSnapshot[];
   onClose: () => void;
-}
-
-/** Last path segment of a cwd, so a row reads `codex · my-repo` rather than
- *  the full absolute path. Falls back to the agent kind alone when cwd is null. */
-function repoLabel(cwd: string | null): string | null {
-  if (!cwd) return null;
-  const parts = cwd.replace(/[/\\]+$/, '').split(/[/\\]/).filter(Boolean);
-  return parts.length ? parts[parts.length - 1] : null;
 }
 
 function dangerColor(level: ReturnType<typeof dangerLevel>, t: Theme): string {
@@ -38,8 +31,7 @@ function Row({
   const summary = summarizeToolInput(p.tool, p.input);
   const level = dangerLevel(p.tool, p.input);
   const accent = dangerColor(level, t);
-  const repo = repoLabel(p.cwd);
-  const owner = repo ? `${p.agent} · ${repo}` : p.agent;
+  const owner = ownerLabel(p);
 
   return (
     <View style={[styles.row, { backgroundColor: t.surface.raised, borderColor: t.border.subtle }]}>
