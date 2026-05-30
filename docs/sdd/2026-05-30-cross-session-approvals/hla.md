@@ -35,8 +35,9 @@ Relevant existing types/functions:
 ChatScreen (app/sessions/[agent]/[id]/index.tsx)
   │
   └── <CrossSessionApprovals currentAgent={agent} currentSessionId={id} />   ← single mount point
-        │   subscribes: usePendingPermissions(byKey), useBadgePosition()
-        │   derives: othersPending = flatten(byKey) where key !== `${agent}:${id}`
+        │   subscribes: usePendingPermissions(byKey)
+        │   derives: selectOthersPending(byKey, agent, id)  (excludes focused key)
+        │   (ApprovalBadge subscribes to useHydratedBadgePosition() itself)
         │
         ├── <ApprovalWhisper request={latestArrival} onPress={openTray} />    (transient, top)
         ├── <ApprovalBadge count onPress={openTray} position draggable />     (persistent, edge)
@@ -48,7 +49,7 @@ A **single controller component** `CrossSessionApprovals` owns the whisper → b
 ### Component responsibilities
 
 - **`CrossSessionApprovals` (controller).**
-  - Selects `othersPending` from the store (memoized; excludes the focused session key).
+  - Selects `othersPending` via `selectOthersPending(byKey, agent, id)` (memoized with `useMemo` against `byKey`; excludes the focused session key). The selector lives in its own KV-free module `mobile/lib/pendingSelectors.ts` — **not** in `store.ts` — so it's unit-testable without pulling in the native KV/zustand deps; `store.ts` re-exports it for existing call sites.
   - Tracks "new arrivals" to drive the whisper: diff the incoming set against what's already been acknowledged, so re-renders don't re-whisper old requests.
   - Owns ephemeral UI state: `whisperRequest | null`, `trayOpen: boolean`. (Persistent badge position lives in the store — see below.)
   - Calls the shared `decide()` helper on resolve, which calls `sendApproval` + optimistic `removeOne`.
@@ -57,7 +58,8 @@ A **single controller component** `CrossSessionApprovals` owns the whisper → b
 
 - **`ApprovalBadge` (persistent, draggable).** Renders only when `count > 0`. Uses `react-native-gesture-handler` + `react-native-reanimated` (already used elsewhere in the app — verify in plan) for drag; on release, animates a snap to the nearer of the two edges and writes `{ side, y }` back to the persisted store. Tap vs. drag disambiguated by a movement threshold.
 
-- **`ApprovalTray` (bottom sheet).** Overlays the chat without unmounting it (sibling overlay / `Modal transparent` anchored to bottom, consistent with `ApprovalSheet`'s pattern). Renders one row per pending request across all background sessions, grouped or sorted by `createdAt`. Inline Allow/Always/Deny + swipe gestures + per-row "Open". Empty state when drained.
+- **`ApprovalTray` (bottom sheet).** Overlays the chat without unmounting it (sibling overlay / `Modal transparent` anchored to bottom, consistent with `ApprovalSheet`'s pattern). Renders one row per pending request across all background sessions, flat-sorted by `createdAt`. Inline Allow/Always/Deny + swipe gestures + per-row "Open". Empty state when drained.
+  - **`SwipeableRow` (as built).** Swipe handling lives in a `SwipeableRow` wrapper *inside* `ApprovalTray.tsx` (not a separate file): swipe right past 32% → Allow, left past 55% → Deny (deny deliberately harder), both disabled on high-risk rows and while busy. Each row is an `Animated.View` with `LinearTransition` + `FadeOut` so resolved rows animate out and the list reflows.
 
 ### Badge position persistence
 
@@ -73,11 +75,15 @@ interface BadgePositionState {
 
 `y` is stored as the drop position; the renderer clamps it into the safe band (below header, above composer) each mount, so a stored `y` from a taller screen degrades gracefully.
 
+> **As built.** A standalone `useBadgePosition` zustand slice in `store.ts` (`{ hydrated, side, y, setPosition }`), persisted via `KV` under `rove:badge-position:v1` and hydrated through `useHydratedBadgePosition()`, mirroring `useHydratedPreviewPrefs`. The badge seeds its resting position in an effect once layout + hydration are ready (a stored `y` of 0 = never-dragged defaults to the bottom of the safe band) and fades in via a shared `appear` value.
+
 ### Shared helpers (de-duplication)
 
 `summarize`/`summarizeToolInput`/`dangerLevel` exist in two places today. Extract them into one module (e.g. `mobile/lib/toolSummary.ts`) and have `ApprovalSheet`, the sessions list, and the new tray all import it. This keeps the risk heuristic and input summary identical across every approval surface — important because US-4 (no blind approvals) depends on the tray's risk cue matching what users already learned from `ApprovalSheet`. This is a small refactor bundled into the plan, not a separate effort.
 
 Likewise the `decide()` logic (busy-set + `sendApproval` + optimistic `removeOne` + error Alert) is currently inline in `index.tsx`. Extract a `usePermissionDecision()` hook (or plain async helper) shared by the list and the tray so both resolve identically.
+
+> **As built.** `summarizeToolInput` + `dangerLevel` → `mobile/lib/toolSummary.ts`; the decision flow → `usePermissionDecision()` in `mobile/lib/permissions.ts`. `ApprovalSheet` keeps its own *verbose* `summarize` (the multi-line args box) and now imports only the shared `dangerLevel`; the sessions list imports both shared helpers + the hook. `ownerLabel`/`repoLabel` (agent · repo from a cwd) live in `components/chat/crossSession/labels.ts`, shared by the tray and whisper.
 
 ## State machine (per controller)
 
@@ -107,15 +113,19 @@ Likewise the `decide()` logic (busy-set + `sendApproval` + optimistic `removeOne
 
 ## Risks & mitigations
 
-- **R1 — Left-edge drag collides with the back-swipe gesture.** The chat pager has `gestureEnabled` on the left edge. *Mitigation:* the badge consumes its own pan gesture (gesture-handler native handler with priority), so dragging the badge never triggers back-nav; the edge-swipe still works everywhere the badge isn't.
+- **R1 — Left-edge drag collides with the back-swipe gesture.** The chat pager has `gestureEnabled` on the left edge. *Mitigation (as built):* the badge owns its own `Gesture.Race(pan, tap)` detector with `activeOffsetX([-8, 8])`; because the touch starts on the badge, gesture-handler routes it to the badge's pan rather than the pager's back-swipe, which still works everywhere the badge isn't.
 - **R2 — Tap vs. drag misfire.** A sloppy tap could fling the badge, or a drag could register as "open tray." *Mitigation:* movement threshold (e.g. >8px = drag) before the pan takes over; below threshold on release = tap.
 - **R3 — Whisper storm.** Many sessions blocking at once could spam banners. *Mitigation:* single-banner invariant — new arrivals bump the badge count only; the whisper shows the most recent and resets its timer rather than stacking.
 - **R4 — Stale `y` across device rotation / different screen.** *Mitigation:* clamp stored `y` into the live safe band at render time.
 - **R5 — Race: request resolved elsewhere.** Same risk the list already handles. *Mitigation:* rely on the store's `permission_resolved` handling + optimistic `removeOne`; rows are keyed by `toolUseId` so a vanished request just drops.
 - **R6 — Overlay covers the composer / takeover prompt.** The chat screen already renders other overlays (takeover prompt, model picker, `ApprovalSheet`). *Mitigation:* define z-order and keep-out zones in the LLD; the tray uses the same bottom-sheet pattern as `ApprovalSheet` so only one bottom sheet is up at a time (foreground approval takes precedence).
 
-## Open questions (resolve in LLD / plan)
+## Open questions (resolved)
 
-- Does the app already depend on `react-native-gesture-handler` / `react-native-reanimated`, or do we add them? (Determines drag implementation; verify in plan Phase 0.)
-- Tray grouping: flat list sorted by `createdAt`, or grouped by session? Lean flat + sorted for simplicity unless one session dominates.
-- Should the whisper be suppressible via a setting ("don't interrupt me; just badge")? Out of scope for v1 unless trivial; note as a follow-on.
+- ~~Does the app already depend on `react-native-gesture-handler` / `react-native-reanimated`?~~ **Resolved:** both present (`~2.28.0` / `~4.1.1`), plus `expo-haptics` and `react-native-safe-area-context`. No new deps; the badge uses `Gesture.Race(pan, tap)` + reanimated springs, the whisper uses reanimated timing.
+- ~~Tray grouping: flat vs. grouped by session?~~ **Resolved:** flat list, sorted oldest-first by `createdAt` (`selectOthersPending`).
+- ~~Should the whisper be suppressible via a setting?~~ **Deferred:** out of scope for v1; tracked as a follow-on in the plan's "Out of scope" section.
+
+## Still pending (on-device QA)
+
+The behavioral checks in plan Phase 6 (multi-session whisper/badge, race with the sessions list, rotation `y`-clamp, and badge-position persistence across app restart) are code-complete but need a running app on a device/simulator to confirm. Static verification — `tsc`, `jest` (incl. the `selectOthersPending` suite), and `expo lint` — is green.
