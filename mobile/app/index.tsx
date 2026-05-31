@@ -2,11 +2,11 @@ import {
   BridgeError,
   fetchSessions,
   renameSession,
-  sendApproval,
   type BridgeErrorKind,
-  type PendingPermissionSnapshot,
 } from '@/lib/bridge';
+import { usePermissionDecision } from '@/lib/permissions';
 import { useHydratedSettings, usePendingPermissions } from '@/lib/store';
+import { summarizeToolInput } from '@/lib/toolSummary';
 import type { SessionListItem } from '@/lib/types';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
 import { Ionicons } from '@expo/vector-icons';
@@ -116,31 +116,6 @@ function describeError(err: unknown): ErrorView {
   }
 }
 
-/**
- * Produce a tight one-line description of a tool invocation for the inline
- * approval card. Optimized for the tools Claude actually prompts on — Bash and
- * the file-mutation set are the long tail; everything else falls back to a
- * compact JSON peek.
- */
-function summarizeToolInput(tool: string, input: unknown): string {
-  const o = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
-  if (tool === 'Bash' && typeof o.command === 'string') return o.command;
-  if (
-    (tool === 'Read' || tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit' || tool === 'NotebookEdit') &&
-    typeof o.file_path === 'string'
-  ) {
-    return o.file_path;
-  }
-  if (tool === 'WebFetch' && typeof o.url === 'string') return o.url;
-  if (tool === 'WebSearch' && typeof o.query === 'string') return o.query;
-  try {
-    const j = JSON.stringify(o);
-    return j.length > 120 ? j.slice(0, 117) + '…' : j;
-  } catch {
-    return '';
-  }
-}
-
 export default function SessionsScreen() {
   const settings = useHydratedSettings();
   const t = useTheme();
@@ -150,9 +125,8 @@ export default function SessionsScreen() {
   // Pending approvals are kept in a global store so the WS survives navigation
   // and we don't miss events fired while the user is inside a chat.
   const pending = usePendingPermissions((s) => s.byKey);
-  const removePending = usePendingPermissions((s) => s.removeOne);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [busy, setBusy] = useState<Set<string>>(new Set());
+  const { decide, isBusy } = usePermissionDecision();
 
   const load = useCallback(async () => {
     if (!settings.baseUrl) return;
@@ -169,42 +143,6 @@ export default function SessionsScreen() {
   useEffect(() => {
     if (settings.hydrated && settings.baseUrl) void load();
   }, [settings.hydrated, settings.baseUrl, load]);
-
-  const decide = useCallback(
-    async (
-      p: PendingPermissionSnapshot,
-      decision: 'allow' | 'allow_always' | 'deny',
-    ) => {
-      const key = `${p.agent}:${p.sessionId}:${p.toolUseId}`;
-      setBusy((prev) => {
-        const next = new Set(prev);
-        next.add(key);
-        return next;
-      });
-      try {
-        await sendApproval(
-          { baseUrl: settings.baseUrl, token: settings.token },
-          p.agent,
-          p.sessionId,
-          p.toolUseId,
-          decision,
-        );
-        // Drop locally as well — the bridge's permission_resolved echo will
-        // confirm shortly, but the user shouldn't see a stale chip in the
-        // meantime.
-        removePending(p.agent, p.sessionId, p.toolUseId);
-      } catch (err) {
-        Alert.alert('Approval failed', String((err as Error).message ?? err));
-      } finally {
-        setBusy((prev) => {
-          const next = new Set(prev);
-          next.delete(key);
-          return next;
-        });
-      }
-    },
-    [settings.baseUrl, settings.token],
-  );
 
   const totalPending = Object.values(pending).reduce((n, list) => n + list.length, 0);
   const sessionsWithPending = Object.keys(pending).length;
@@ -441,8 +379,7 @@ export default function SessionsScreen() {
                 ]}>
                 {itemsPending.map((p) => {
                   const summary = summarizeToolInput(p.tool, p.input);
-                  const busyKey = `${p.agent}:${p.sessionId}:${p.toolUseId}`;
-                  const isBusy = busy.has(busyKey);
+                  const rowBusy = isBusy(p);
                   return (
                     <View
                       key={p.toolUseId}
@@ -460,19 +397,19 @@ export default function SessionsScreen() {
                       ) : null}
                       <View style={styles.pendingActions}>
                         <Pressable
-                          disabled={isBusy}
+                          disabled={rowBusy}
                           onPress={() => decide(p, 'allow')}
                           style={({ pressed }) => [
                             styles.pendingButton,
                             {
                               backgroundColor: pressed ? t.accent.pressed : t.accent.primary,
-                              opacity: isBusy ? 0.5 : 1,
+                              opacity: rowBusy ? 0.5 : 1,
                             },
                           ]}>
                           <Text style={[styles.pendingButtonLabel, { color: t.accent.fg }]}>Allow</Text>
                         </Pressable>
                         <Pressable
-                          disabled={isBusy}
+                          disabled={rowBusy}
                           onPress={() => decide(p, 'allow_always')}
                           style={({ pressed }) => [
                             styles.pendingButton,
@@ -480,7 +417,7 @@ export default function SessionsScreen() {
                               backgroundColor: pressed ? t.surface.pressed : t.surface.raised,
                               borderWidth: StyleSheet.hairlineWidth,
                               borderColor: t.border.default,
-                              opacity: isBusy ? 0.5 : 1,
+                              opacity: rowBusy ? 0.5 : 1,
                             },
                           ]}>
                           <Text style={[styles.pendingButtonLabel, { color: t.text.primary }]}>
@@ -488,7 +425,7 @@ export default function SessionsScreen() {
                           </Text>
                         </Pressable>
                         <Pressable
-                          disabled={isBusy}
+                          disabled={rowBusy}
                           onPress={() => decide(p, 'deny')}
                           style={({ pressed }) => [
                             styles.pendingButton,
@@ -496,7 +433,7 @@ export default function SessionsScreen() {
                               backgroundColor: pressed ? t.status.dangerCardBg : 'transparent',
                               borderWidth: StyleSheet.hairlineWidth,
                               borderColor: t.status.danger,
-                              opacity: isBusy ? 0.5 : 1,
+                              opacity: rowBusy ? 0.5 : 1,
                             },
                           ]}>
                           <Text style={[styles.pendingButtonLabel, { color: t.status.danger }]}>Deny</Text>

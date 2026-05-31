@@ -234,7 +234,12 @@ export function useHydratedPreviewPrefs(): PreviewPrefsStore {
 // time the sessions list unmounts and any `permission_added` event fired while
 // the user is inside a chat is lost — exactly the bug we're fixing.
 
-export type PendingMap = Record<string, PendingPermissionSnapshot[]>;
+// `PendingMap` and the focused-session selector live in a KV-free module so the
+// pure selector is unit-testable without dragging in native deps; re-exported
+// here so existing call sites keep importing from `@/lib/store`.
+import { selectOthersPending, type PendingMap } from './pendingSelectors';
+export { selectOthersPending };
+export type { PendingMap };
 
 interface PendingPermissionsState {
   byKey: PendingMap;
@@ -331,6 +336,73 @@ export const usePendingPermissions = create<PendingPermissionsStore>((set, get) 
     });
   },
 }));
+
+// ─── Badge position (persisted UI pref for the cross-session approval badge) ──
+//
+// The floating "N waiting" badge is draggable and snaps to a screen edge. It's
+// transient — it only exists while background requests are pending — so its
+// position must persist outside the component, otherwise it would reset to the
+// default every time it reappeared. We store the dropped {side, y}; the badge
+// clamps `y` into the safe band (below header, above composer) at render time,
+// so a stored value from a taller screen degrades gracefully.
+
+export type BadgeSide = 'left' | 'right';
+
+interface BadgePositionState {
+  hydrated: boolean;
+  side: BadgeSide;
+  /** Vertical offset (px) from the top of the message area where it was dropped. */
+  y: number;
+}
+
+interface BadgePositionActions {
+  load(): Promise<void>;
+  setPosition(side: BadgeSide, y: number): Promise<void>;
+}
+
+type BadgePositionStore = BadgePositionState & BadgePositionActions;
+
+const BADGE_POSITION_KEY = 'rove:badge-position:v1';
+
+export const useBadgePosition = create<BadgePositionStore>((set, get) => ({
+  hydrated: false,
+  side: 'right',
+  y: 0,
+  async load() {
+    try {
+      const raw = await KV.getItemAsync(BADGE_POSITION_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        set({
+          side: parsed.side === 'left' ? 'left' : 'right',
+          y: typeof parsed.y === 'number' ? parsed.y : 0,
+          hydrated: true,
+        });
+        return;
+      }
+    } catch (err) {
+      console.warn('badge position load failed', err);
+    }
+    set({ hydrated: true });
+  },
+  async setPosition(side, y) {
+    set({ side, y });
+    try {
+      await KV.setItemAsync(BADGE_POSITION_KEY, JSON.stringify({ side, y }));
+    } catch (err) {
+      console.warn('badge position persist failed', err);
+    }
+  },
+}));
+
+/** Starts hydration on first use; mirrors `useHydratedPreviewPrefs`. */
+export function useHydratedBadgePosition(): BadgePositionStore {
+  const store = useBadgePosition();
+  useEffect(() => {
+    if (!store.hydrated) void store.load();
+  }, [store]);
+  return store;
+}
 
 // ─── Session capabilities (per-session, populated from WS `capabilities` frames) ─
 

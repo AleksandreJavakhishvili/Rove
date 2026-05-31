@@ -1,4 +1,5 @@
 import { ApprovalSheet, type PendingApproval } from '@/components/chat/ApprovalSheet';
+import { CrossSessionApprovals } from '@/components/chat/crossSession/CrossSessionApprovals';
 import {
   BubbleActionMenu,
   copyAction,
@@ -380,6 +381,11 @@ export default function ChatScreen() {
   // the user sees "Compacting context…" instead of the generic "thinking…"
   // line, which makes /compact feel like an action that's actually happening.
   const [sdkStatus, setSdkStatus] = useState<SdkRunStatus>(SDK_RUN_STATUS.idle);
+  // Seconds elapsed since compaction started. The SDK exposes no incremental
+  // compaction progress (only a binary `compacting` status and the final
+  // pre/post token counts on `compact_boundary`), so we surface a live elapsed
+  // timer to signal the operation is still running — mirroring the CLI.
+  const [compactSeconds, setCompactSeconds] = useState<number>(0);
   // Most recent extended-thinking text from the SDK, shown as a live ticker
   // right above the input row. Cleared as soon as real assistant output (text,
   // text_delta, or tool_use) starts to land, and on result/process_exit. This
@@ -486,6 +492,22 @@ export default function ChatScreen() {
     shellMapRef.current = new Map();
     toolNamesRef.current = new Map();
   }, [agent, id]);
+
+  // Tick the compaction elapsed timer once per second while `compacting`.
+  // Resets to 0 on entry so each compaction counts from its own start, and the
+  // interval is torn down the moment status leaves `compacting`.
+  useEffect(() => {
+    if (sdkStatus !== SDK_RUN_STATUS.compacting) {
+      setCompactSeconds(0);
+      return;
+    }
+    setCompactSeconds(0);
+    const started = Date.now();
+    const handle = setInterval(() => {
+      setCompactSeconds(Math.floor((Date.now() - started) / 1000));
+    }, 1000);
+    return () => clearInterval(handle);
+  }, [sdkStatus]);
 
   // Reconnect when the app returns to the foreground with a dead socket. iOS
   // and Android both kill long-lived WebSockets while the app is backgrounded;
@@ -1766,7 +1788,7 @@ export default function ChatScreen() {
             style={[styles.liveStatusText, { color: t.text.secondary }]}
             numberOfLines={2}>
             {sdkStatus === SDK_RUN_STATUS.compacting
-              ? 'Compacting conversation…'
+              ? `Compacting conversation… ${compactSeconds}s`
               : thinkingTicker
                 ? thinkingTicker
                 : 'Claude is thinking…'}
@@ -2005,6 +2027,10 @@ export default function ChatScreen() {
           setShotUpload(null);
         }}
       />
+      {/* Cross-session approvals — surfaces *other* sessions' pending permission
+          requests (whisper → badge → tray) without leaving this chat. The
+          focused session's own requests stay on the ApprovalSheet above. */}
+      <CrossSessionApprovals currentAgent={agent} currentSessionId={id} />
     </>
   );
 }
