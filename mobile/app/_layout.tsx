@@ -1,6 +1,7 @@
 import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
+import { useEffect } from 'react';
 import { Platform } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
@@ -23,6 +24,29 @@ export default function RootLayout() {
   // Keep the bridge-wide events stream alive as long as the app is mounted, so
   // permission requests fired while the user is inside a chat are not lost.
   useEnsurePendingPermissionsStream();
+
+  // Debug aid: log any uncaught JS error with a clear tag before the default
+  // handler runs. If the app hard-closes on an action and NOTHING tagged
+  // [global-error] appears in the JS log, the crash is native (UI thread /
+  // Reanimated / gesture-handler) and must be read from the native log.
+  useEffect(() => {
+    const g = globalThis as unknown as {
+      ErrorUtils?: {
+        getGlobalHandler(): (e: unknown, isFatal?: boolean) => void;
+        setGlobalHandler(h: (e: unknown, isFatal?: boolean) => void): void;
+      };
+    };
+    const eu = g.ErrorUtils;
+    if (!eu) return;
+    const prev = eu.getGlobalHandler();
+    eu.setGlobalHandler((error, isFatal) => {
+      const e = error as Error;
+      // eslint-disable-next-line no-console
+      console.error(`[global-error] fatal=${isFatal} ${e?.message}\n${e?.stack ?? ''}`);
+      prev(error, isFatal);
+    });
+    return () => eu.setGlobalHandler(prev);
+  }, []);
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>

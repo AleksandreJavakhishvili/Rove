@@ -558,40 +558,86 @@ export type PermissionEvent =
 export async function fetchPendingPermissions(
   cfg: BridgeConfig,
 ): Promise<PendingPermissionSnapshot[]> {
-  const res = await fetch(`${cfg.baseUrl}/permissions/pending`, {
-    headers: cfg.token ? { Authorization: `Bearer ${cfg.token}` } : undefined,
+  // Use the shared authed/timeout path so this matches `/sessions` exactly —
+  // the hand-rolled bare `fetch` here was the one call that could send a
+  // mismatched/missing Authorization header (and never time out), surfacing
+  // as a spurious 401 even when the rest of the app was authenticated fine.
+  const res = await fetchWithTimeout(`${cfg.baseUrl}/permissions/pending`, {
+    headers: authHeaders(cfg),
   });
-  if (!res.ok) throw new Error(`fetchPendingPermissions: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw httpError('/permissions/pending', res.status);
   const j = (await res.json()) as { pending: PendingPermissionSnapshot[] };
   return j.pending;
 }
 
 /**
  * Subscribes to bridge-wide events (currently: permission added / resolved
- * across all sessions). The sessions list uses this to badge rows with pending
- * approvals without having to open one WS per session.
+ * across all sessions). The cross-session approval badge + the sessions list
+ * use this to surface pending approvals without opening one WS per session.
+ *
+ * This is the only LONG-LIVED cross-session connection, so it self-heals:
+ * on close (bridge restart, network blip, socket suspended on backgrounding)
+ * it reconnects with capped exponential backoff. Without this the stream died
+ * permanently on the first disconnect — chats kept working (they reconnect on
+ * reopen) which masked it, but the "N waiting" badge silently stopped updating.
+ * On every (re)connect the server replays a fresh `permissions_snapshot`, so
+ * `byKey` is brought back in sync automatically.
+ *
+ * `onStatus` (optional) reports connectivity so callers can reflect a stale
+ * badge while reconnecting.
  */
 export function openEventsStream(
   cfg: BridgeConfig,
   onMessage: (msg: PermissionEvent) => void,
+  onStatus?: (connected: boolean) => void,
 ): { close(): void } {
   const wsUrl = cfg.baseUrl.replace(/^http(s?)/i, 'ws$1').replace(/\/+$/, '');
   const tokenParam = cfg.token ? `?token=${encodeURIComponent(cfg.token)}` : '';
   const fullUrl = `${wsUrl}/events${tokenParam}`;
-  let socket: WebSocket | null = new WebSocket(fullUrl);
-  socket.onmessage = (evt) => {
-    try {
-      const msg = JSON.parse(typeof evt.data === 'string' ? evt.data : '') as PermissionEvent;
-      onMessage(msg);
-    } catch (err) {
-      console.warn('[bridge events] invalid frame', err);
-    }
+
+  let socket: WebSocket | null = null;
+  let stopped = false;
+  let attempt = 0;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (stopped) return;
+    const sock = new WebSocket(fullUrl);
+    socket = sock;
+    sock.onopen = () => {
+      attempt = 0; // reset backoff; the server replays a snapshot right after
+    };
+    sock.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(typeof evt.data === 'string' ? evt.data : '') as PermissionEvent;
+        onMessage(msg);
+      } catch (err) {
+        console.warn('[bridge events] invalid frame', err);
+      }
+    };
+    sock.onerror = (evt) => {
+      console.log('[bridge events] error', (evt as any)?.message ?? evt);
+    };
+    sock.onclose = () => {
+      if (socket === sock) socket = null;
+      onStatus?.(false);
+      if (stopped) return;
+      const delay = Math.min(1000 * 2 ** attempt, 15000);
+      attempt += 1;
+      console.log(`[bridge events] disconnected — reconnecting in ${delay}ms`);
+      reconnectTimer = setTimeout(connect, delay);
+    };
   };
-  socket.onerror = (evt) => {
-    console.log('[bridge events] error', (evt as any)?.message ?? evt);
-  };
+
+  connect();
+
   return {
     close() {
+      stopped = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       if (socket) {
         try {
           socket.close();
