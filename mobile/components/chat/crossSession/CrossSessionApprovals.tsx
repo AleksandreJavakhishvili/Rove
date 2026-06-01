@@ -2,6 +2,7 @@ import type { PendingPermissionSnapshot } from '@/lib/bridge';
 import { selectOthersPending } from '@/lib/pendingSelectors';
 import { usePendingPermissions } from '@/lib/store';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { GestureType } from 'react-native-gesture-handler';
 import { ApprovalBadge } from './ApprovalBadge';
 import { ApprovalTray } from './ApprovalTray';
 import { ApprovalWhisper } from './ApprovalWhisper';
@@ -9,6 +10,9 @@ import { ApprovalWhisper } from './ApprovalWhisper';
 interface CrossSessionApprovalsProps {
   currentAgent: string;
   currentSessionId: string;
+  /** The chat pager's pan gesture, forwarded to the draggable badge so a
+   *  re-snap drag doesn't flip the page. See ApprovalBadge. */
+  pagerGestureRef?: React.MutableRefObject<GestureType | undefined>;
 }
 
 /**
@@ -19,7 +23,11 @@ interface CrossSessionApprovalsProps {
  *
  * `count === 0` is the single teardown condition: no badge, no tray, no whisper.
  */
-export function CrossSessionApprovals({ currentAgent, currentSessionId }: CrossSessionApprovalsProps) {
+export function CrossSessionApprovals({
+  currentAgent,
+  currentSessionId,
+  pagerGestureRef,
+}: CrossSessionApprovalsProps) {
   const byKey = usePendingPermissions((s) => s.byKey);
   const [trayOpen, setTrayOpen] = useState(false);
   const [whisperId, setWhisperId] = useState<string | null>(null);
@@ -70,7 +78,7 @@ export function CrossSessionApprovals({ currentAgent, currentSessionId }: CrossS
   return (
     <>
       <ApprovalWhisper request={whisper} onPress={openTray} onDismiss={() => setWhisperId(null)} />
-      <ApprovalBadge count={count} onPress={openTray} />
+      <ApprovalBadge count={count} onPress={openTray} pagerGestureRef={pagerGestureRef} />
       <ApprovalTray open={trayOpen} requests={others} onClose={() => setTrayOpen(false)} />
     </>
   );

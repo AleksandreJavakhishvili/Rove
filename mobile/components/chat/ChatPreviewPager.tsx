@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from 'react';
 import { Keyboard, Platform, StyleSheet, useWindowDimensions, View } from 'react-native';
-import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import { Gesture, GestureDetector, type GestureType } from 'react-native-gesture-handler';
 import Animated, {
   Easing,
   runOnJS,
@@ -36,6 +36,12 @@ interface Props {
    * render the normal dot.
    */
   pageBadges?: boolean[];
+  /**
+   * Filled with the pager's pan gesture so an overlaying draggable (the
+   * cross-session approval badge) can declare it blocks this gesture and own
+   * horizontal drags that start on it. Pass a stable ref from the screen.
+   */
+  panRef?: React.MutableRefObject<GestureType | undefined>;
 }
 
 /** Imperative handle exposed via ref. Used by the screenshot composer to
@@ -63,7 +69,7 @@ export interface ChatPreviewPagerHandle {
  * swipes.
  */
 export const ChatPreviewPager = forwardRef<ChatPreviewPagerHandle, Props>(function ChatPreviewPager(
-  { chat, workspace, onIndexChange, pageBadges },
+  { chat, workspace, onIndexChange, pageBadges, panRef },
   ref,
 ) {
   const { width } = useWindowDimensions();
@@ -143,6 +149,7 @@ export const ChatPreviewPager = forwardRef<ChatPreviewPagerHandle, Props>(functi
   })();
 
   const pan = Gesture.Pan()
+    .withRef(panRef ?? { current: undefined })
     .enabled(!keyboardVisible && !locked)
     .activeOffsetX(activeOffsetX)
     .failOffsetY([-12, 12])

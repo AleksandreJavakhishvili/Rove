@@ -12,7 +12,7 @@ import {
   View,
   type LayoutChangeEvent,
 } from 'react-native';
-import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
 import Animated, {
   FadeOut,
   LinearTransition,
@@ -22,6 +22,7 @@ import Animated, {
   withSpring,
   withTiming,
 } from 'react-native-reanimated';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { ownerLabel } from './labels';
 
 interface ApprovalTrayProps {
@@ -217,35 +218,43 @@ export function ApprovalTray({ open, requests, onClose }: ApprovalTrayProps) {
 
   return (
     <Modal visible={open} animationType="slide" transparent onRequestClose={onClose}>
-      <Pressable style={[styles.backdrop, { backgroundColor: t.surface.scrim }]} onPress={onClose}>
-        {/* Inner Pressable swallows taps so pressing a row doesn't dismiss. */}
-        <Pressable style={[styles.sheet, { backgroundColor: t.surface.base }]} onPress={() => {}}>
-          <View style={[styles.handle, { backgroundColor: t.text.muted }]} />
-          <Text style={[styles.title, { color: t.text.primary }]}>
-            {requests.length > 0 ? `Waiting on you · ${requests.length}` : 'All caught up'}
-          </Text>
-          {requests.length === 0 ? (
-            <Text style={[styles.empty, { color: t.text.secondary }]}>
-              No other sessions are waiting for approval.
-            </Text>
-          ) : (
-            <ScrollView style={styles.list} contentContainerStyle={{ gap: space[3] }}>
-              {requests.map((p) => (
-                <Row
-                  key={p.toolUseId}
-                  p={p}
-                  busy={isBusy(p)}
-                  onDecide={(d) => decide(p, d)}
-                  onOpen={() => {
-                    onClose();
-                    router.push(`/sessions/${p.agent}/${p.sessionId}`);
-                  }}
-                />
-              ))}
-            </ScrollView>
-          )}
+      {/* A Modal renders in its own native view tree, OUTSIDE the app-root
+          GestureHandlerRootView. The swipe-to-decide rows below use
+          GestureDetector, which throws unless it's under a root view — so the
+          tray hosts its own. Without this, opening the tray crashes the app. */}
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <Pressable style={[styles.backdrop, { backgroundColor: t.surface.scrim }]} onPress={onClose}>
+          {/* Inner Pressable swallows taps so pressing a row doesn't dismiss. */}
+          <Pressable style={[styles.sheet, { backgroundColor: t.surface.base }]} onPress={() => {}}>
+            <ErrorBoundary label="ApprovalTray">
+              <View style={[styles.handle, { backgroundColor: t.text.muted }]} />
+              <Text style={[styles.title, { color: t.text.primary }]}>
+                {requests.length > 0 ? `Waiting on you · ${requests.length}` : 'All caught up'}
+              </Text>
+              {requests.length === 0 ? (
+                <Text style={[styles.empty, { color: t.text.secondary }]}>
+                  No other sessions are waiting for approval.
+                </Text>
+              ) : (
+                <ScrollView style={styles.list} contentContainerStyle={{ gap: space[3] }}>
+                  {requests.map((p) => (
+                    <Row
+                      key={p.toolUseId}
+                      p={p}
+                      busy={isBusy(p)}
+                      onDecide={(d) => decide(p, d)}
+                      onOpen={() => {
+                        onClose();
+                        router.push(`/sessions/${p.agent}/${p.sessionId}`);
+                      }}
+                    />
+                  ))}
+                </ScrollView>
+              )}
+            </ErrorBoundary>
+          </Pressable>
         </Pressable>
-      </Pressable>
+      </GestureHandlerRootView>
     </Modal>
   );
 }

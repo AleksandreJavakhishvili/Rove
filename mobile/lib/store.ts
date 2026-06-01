@@ -294,7 +294,15 @@ export const usePendingPermissions = create<PendingPermissionsStore>((set, get) 
         }
         set({ byKey: next });
       })
-      .catch((err) => console.warn('[pending] hydrate failed', err));
+      .catch((err) => {
+        // Non-fatal: the /events `permissions_snapshot` opened below is the
+        // authoritative source and overwrites this. The HTTP call is only a
+        // pre-WS fast-path, so a failure here just means the badge appears a
+        // beat later, not that the feature is broken. Log quietly.
+        if (currentConnectionKey === connKey) {
+          console.log('[pending] pre-hydrate skipped, will sync via /events:', (err as Error).message);
+        }
+      });
 
     currentStream = openEventsStream({ baseUrl, token }, (msg) => {
       if (currentConnectionKey !== connKey) return;
@@ -313,6 +321,10 @@ export const usePendingPermissions = create<PendingPermissionsStore>((set, get) 
       } else if (msg.type === 'permission_resolved') {
         get().removeOne(msg.agent, msg.sessionId, msg.toolUseId);
       }
+    }, (connected) => {
+      // Reflect transient drops; the next snapshot (sent on every reconnect)
+      // flips this back to true and re-syncs byKey.
+      if (currentConnectionKey === connKey && !connected) set({ connected: false });
     });
   },
 

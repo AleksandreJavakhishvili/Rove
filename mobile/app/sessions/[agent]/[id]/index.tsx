@@ -14,6 +14,7 @@ import {
   ChatPreviewPager,
   type ChatPreviewPagerHandle,
 } from '@/components/chat/ChatPreviewPager';
+import type { GestureType } from 'react-native-gesture-handler';
 import { PreviewShutter, ShutterFlash } from '@/components/PreviewShutter';
 import { ScreenshotComposer } from '@/components/ScreenshotComposer';
 import { useScreenshotCapture } from '@/hooks/useScreenshotCapture';
@@ -434,6 +435,10 @@ export default function ChatScreen() {
   // capture doesn't race the agent's request.
   const [manualShutterLocked, setManualShutterLocked] = useState(false);
   const pagerRef = useRef<ChatPreviewPagerHandle | null>(null);
+  // Shared with the cross-session approval badge so it can block this gesture
+  // and own horizontal drags that start on it (otherwise the page swipes
+  // instead of the badge snapping to the other edge).
+  const pagerPanRef = useRef<GestureType | undefined>(undefined);
   const workspaceRef = useRef<WorkspacePaneHandle | null>(null);
   const previewFrameRef = useRef<PreviewFrameHandle | null>(null);
   // Frame handler the TakeoverController registers on mount so the WS
@@ -1950,6 +1955,7 @@ export default function ChatScreen() {
     <>
       <ChatPreviewPager
         ref={pagerRef}
+        panRef={pagerPanRef}
         chat={chatBody}
         workspace={(active) => (
           <WorkspacePane
@@ -2030,7 +2036,11 @@ export default function ChatScreen() {
       {/* Cross-session approvals — surfaces *other* sessions' pending permission
           requests (whisper → badge → tray) without leaving this chat. The
           focused session's own requests stay on the ApprovalSheet above. */}
-      <CrossSessionApprovals currentAgent={agent} currentSessionId={id} />
+      <CrossSessionApprovals
+        currentAgent={agent}
+        currentSessionId={id}
+        pagerGestureRef={pagerPanRef}
+      />
     </>
   );
 }
