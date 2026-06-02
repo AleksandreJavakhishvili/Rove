@@ -82,6 +82,7 @@ import {
   Easing,
   FlatList,
   Image,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -542,6 +543,31 @@ export default function ChatScreen() {
       }
     });
     return () => sub.remove();
+  }, []);
+
+  // Keep the newest messages in view when the keyboard opens. The
+  // KeyboardAvoidingView shrinks the list from the bottom as the keyboard
+  // animates in, which would otherwise tuck the latest message behind it.
+  // Guarded on stickToBottom so someone scrolled up to read older turns isn't
+  // yanked down when they tap the input.
+  //
+  // iOS: `keyboardWillShow` fires as the keyboard *starts* rising, but at that
+  // instant the KeyboardAvoidingView hasn't committed its padding yet — the
+  // list has no extra room and scrollToEnd is a no-op. Defer one frame so the
+  // padding (and thus the new max offset) is in place, while still being early
+  // enough in the keyboard animation to move in step with it (no post-anim
+  // lag). `keyboardDidShow` is a safety net if that frame lands before layout
+  // flushes. Android has no reliable `…WillShow`, so it uses `…DidShow` alone.
+  useEffect(() => {
+    const toEnd = () => {
+      if (!stickToBottomRef.current) return;
+      listRef.current?.scrollToEnd({ animated: true });
+    };
+    const subs = [Keyboard.addListener('keyboardDidShow', toEnd)];
+    if (Platform.OS === 'ios') {
+      subs.push(Keyboard.addListener('keyboardWillShow', () => requestAnimationFrame(toEnd)));
+    }
+    return () => subs.forEach((s) => s.remove());
   }, []);
 
   // Pull session metadata (label, project name) for the header title.
