@@ -10,6 +10,9 @@ import { ApprovalWhisper } from './ApprovalWhisper';
 interface CrossSessionApprovalsProps {
   currentAgent: string;
   currentSessionId: string;
+  /** The bridge the focused chat lives on — so the focused session is excluded
+   *  per machine (same agent/id on another machine is still "other"). */
+  currentBridgeId: string;
   /** The chat pager's pan gesture, forwarded to the draggable badge so a
    *  re-snap drag doesn't flip the page. See ApprovalBadge. */
   pagerGestureRef?: React.MutableRefObject<GestureType | undefined>;
@@ -26,6 +29,7 @@ interface CrossSessionApprovalsProps {
 export function CrossSessionApprovals({
   currentAgent,
   currentSessionId,
+  currentBridgeId,
   pagerGestureRef,
 }: CrossSessionApprovalsProps) {
   const byKey = usePendingPermissions((s) => s.byKey);
@@ -38,8 +42,8 @@ export function CrossSessionApprovals({
   const initialized = useRef(false);
 
   const others = useMemo(
-    () => selectOthersPending(byKey, currentAgent, currentSessionId),
-    [byKey, currentAgent, currentSessionId],
+    () => selectOthersPending(byKey, currentBridgeId, currentAgent, currentSessionId),
+    [byKey, currentBridgeId, currentAgent, currentSessionId],
   );
   const count = others.length;
 

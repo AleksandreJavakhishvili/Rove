@@ -1,8 +1,14 @@
+import { openEventsStream } from './bridge';
 import {
-  fetchPendingPermissions,
-  openEventsStream,
-  type PendingPermissionSnapshot,
-} from './bridge';
+  BRIDGE_AUTH_MODE,
+  DEFAULT_BRIDGE_ID,
+  bridgeToConfig,
+  getActiveBridge,
+  makeBridge,
+  useBridgesStore,
+  useHydratedBridges,
+  type Bridge,
+} from './bridges';
 import KV from './kv';
 import { useEffect } from 'react';
 import { create } from 'zustand';
@@ -47,10 +53,10 @@ type SettingsStore = Settings & SettingsActions;
 
 const STORAGE_KEY = 'rove:settings:v1';
 
+// Connection config (`baseUrl` / `token`) now lives in the Bridge[] store
+// (`./bridges`); only the visual-feedback prefs persist under this key.
 type PersistedSettings = Pick<
   Settings,
-  | 'baseUrl'
-  | 'token'
   | 'enableVisualFeedback'
   | 'alwaysAskBeforeCapture'
   | 'visualFeedbackOnboardingShown'
@@ -68,13 +74,20 @@ export const useSettings = create<SettingsStore>((set, get) => ({
   alwaysAskBeforeCapture: false,
   visualFeedbackOnboardingShown: false,
   async load() {
+    // Connection config lives in the Bridge[] store now. Hydrate it first
+    // (this also runs the one-time legacy `{ baseUrl, token }` → single-bridge
+    // migration), then mirror the active bridge into `baseUrl`/`token` so every
+    // existing `settings.baseUrl/token` reader keeps working unchanged.
+    const bridges = useBridgesStore.getState();
+    if (!bridges.hydrated) await bridges.load();
+    const active = getActiveBridge();
     try {
       const raw = await KV.getItemAsync(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         set({
-          baseUrl: parsed.baseUrl ?? '',
-          token: parsed.token ?? '',
+          baseUrl: active?.baseUrl ?? '',
+          token: active?.token ?? '',
           enableVisualFeedback: Boolean(parsed.enableVisualFeedback ?? false),
           alwaysAskBeforeCapture: Boolean(parsed.alwaysAskBeforeCapture ?? false),
           visualFeedbackOnboardingShown: Boolean(
@@ -87,15 +100,32 @@ export const useSettings = create<SettingsStore>((set, get) => ({
     } catch (err) {
       console.warn('settings load failed', err);
     }
-    set({ hydrated: true });
+    set({ baseUrl: active?.baseUrl ?? '', token: active?.token ?? '', hydrated: true });
   },
   async setBaseUrl(url) {
+    // Mirror locally for immediate UI, and write through to the active bridge
+    // (creating the single `default` bridge on first connect).
     set({ baseUrl: url });
-    await persist(snapshot(get(), { baseUrl: url }));
+    const bridges = useBridgesStore.getState();
+    const active = getActiveBridge();
+    const baseUrl = url.trim().replace(/\/+$/, '');
+    if (active) await bridges.updateBridge(active.id, { baseUrl });
+    else
+      await bridges.addBridge(
+        makeBridge({ id: DEFAULT_BRIDGE_ID, baseUrl, token: get().token || undefined }),
+      );
   },
   async setToken(token) {
     set({ token });
-    await persist(snapshot(get(), { token }));
+    const bridges = useBridgesStore.getState();
+    const active = getActiveBridge();
+    const trimmed = token.trim() || undefined;
+    const authMode = trimmed ? BRIDGE_AUTH_MODE.bearer : BRIDGE_AUTH_MODE.tailscale;
+    if (active) await bridges.updateBridge(active.id, { token: trimmed, authMode });
+    else
+      await bridges.addBridge(
+        makeBridge({ id: DEFAULT_BRIDGE_ID, baseUrl: get().baseUrl, token: trimmed }),
+      );
   },
   async setEnableVisualFeedback(b) {
     set({ enableVisualFeedback: b });
@@ -119,6 +149,7 @@ export const useSettings = create<SettingsStore>((set, get) => ({
       visualFeedbackOnboardingShown: false,
     });
     await KV.removeItemAsync(STORAGE_KEY);
+    await useBridgesStore.getState().reset();
   },
 }));
 
@@ -126,8 +157,6 @@ export const useSettings = create<SettingsStore>((set, get) => ({
  *  in-flight override. Keeps every `setX` action a one-liner. */
 function snapshot(state: Settings, override: Partial<PersistedSettings>): PersistedSettings {
   return {
-    baseUrl: state.baseUrl,
-    token: state.token,
     enableVisualFeedback: state.enableVisualFeedback,
     alwaysAskBeforeCapture: state.alwaysAskBeforeCapture,
     visualFeedbackOnboardingShown: state.visualFeedbackOnboardingShown,
@@ -234,111 +263,114 @@ export function useHydratedPreviewPrefs(): PreviewPrefsStore {
 // time the sessions list unmounts and any `permission_added` event fired while
 // the user is inside a chat is lost — exactly the bug we're fixing.
 
-// `PendingMap` and the focused-session selector live in a KV-free module so the
-// pure selector is unit-testable without dragging in native deps; re-exported
-// here so existing call sites keep importing from `@/lib/store`.
-import { selectOthersPending, type PendingMap } from './pendingSelectors';
+// `PendingMap` / `PendingItem` and the focused-session selector live in a
+// KV-free module so the pure selector is unit-testable without native deps;
+// re-exported here so existing call sites keep importing from `@/lib/store`.
+import {
+  pendingKey,
+  selectOthersPending,
+  type PendingItem,
+  type PendingMap,
+} from './pendingSelectors';
 export { selectOthersPending };
-export type { PendingMap };
+export type { PendingItem, PendingMap };
 
 interface PendingPermissionsState {
   byKey: PendingMap;
+  /** True once any bridge's stream has delivered a snapshot. */
   connected: boolean;
 }
 
 interface PendingPermissionsActions {
-  /** Open the bridge-wide events stream. Idempotent — repeated calls with the
-   *  same connection key are no-ops. Restarts when baseUrl/token change. */
-  ensureStreaming(baseUrl: string, token: string): void;
-  /** Close the stream — called when the user signs out / changes bridge. */
-  disconnect(): void;
-  /** Optimistically drop a request the user just decided on, so the UI updates
-   *  before the bridge's `permission_resolved` echo arrives. */
-  removeOne(agent: string, sessionId: string, toolUseId: string): void;
+  /** Open/refresh one `/events` stream per bridge; close streams for bridges
+   *  that were removed or whose URL/token changed. Idempotent. */
+  syncStreams(bridges: Bridge[]): void;
+  /** Close every stream and clear state. */
+  disconnectAll(): void;
+  /** Optimistically drop a request the user just decided on, before the
+   *  bridge's `permission_resolved` echo arrives. */
+  removeOne(bridgeId: string, agent: string, sessionId: string, toolUseId: string): void;
 }
 
 type PendingPermissionsStore = PendingPermissionsState & PendingPermissionsActions;
 
-function pendingKey(agent: string, sessionId: string): string {
-  return `${agent}:${sessionId}`;
+/** Drop every entry that came from `bridgeId` (filters by `item.bridgeId`, so
+ *  it's robust regardless of how the key string is composed). */
+function withoutBridge(byKey: PendingMap, bridgeId: string): PendingMap {
+  const out: PendingMap = {};
+  for (const [k, list] of Object.entries(byKey)) {
+    const kept = list.filter((p) => p.bridgeId !== bridgeId);
+    if (kept.length > 0) out[k] = kept;
+  }
+  return out;
 }
 
-let currentStream: { close(): void } | null = null;
-let currentConnectionKey: string | null = null;
+// One live `/events` stream per bridge, keyed by bridgeId. `connKey` guards
+// against reopening a stream when nothing actually changed.
+const streams = new Map<string, { connKey: string; close(): void }>();
 
 export const usePendingPermissions = create<PendingPermissionsStore>((set, get) => ({
   byKey: {},
   connected: false,
 
-  ensureStreaming(baseUrl: string, token: string) {
-    if (!baseUrl) return;
-    const connKey = `${baseUrl}::${token}`;
-    if (currentConnectionKey === connKey && currentStream) return;
-    // Settings changed — tear down the previous stream before opening a new one.
-    if (currentStream) {
-      currentStream.close();
-      currentStream = null;
-    }
-    currentConnectionKey = connKey;
-    set({ byKey: {}, connected: false });
-
-    // Hydrate via HTTP first; the snapshot frame from /events will then
-    // overwrite this with the authoritative server-side view.
-    fetchPendingPermissions({ baseUrl, token })
-      .then((list) => {
-        if (currentConnectionKey !== connKey) return; // settings changed mid-fetch
-        const next: PendingMap = {};
-        for (const p of list) {
-          const k = pendingKey(p.agent, p.sessionId);
-          (next[k] ??= []).push(p);
-        }
-        set({ byKey: next });
-      })
-      .catch((err) => {
-        // Non-fatal: the /events `permissions_snapshot` opened below is the
-        // authoritative source and overwrites this. The HTTP call is only a
-        // pre-WS fast-path, so a failure here just means the badge appears a
-        // beat later, not that the feature is broken. Log quietly.
-        if (currentConnectionKey === connKey) {
-          console.log('[pending] pre-hydrate skipped, will sync via /events:', (err as Error).message);
-        }
-      });
-
-    currentStream = openEventsStream({ baseUrl, token }, (msg) => {
-      if (currentConnectionKey !== connKey) return;
-      if (msg.type === 'permissions_snapshot') {
-        const next: PendingMap = {};
-        for (const p of msg.pending) {
-          const k = pendingKey(p.agent, p.sessionId);
-          (next[k] ??= []).push(p);
-        }
-        set({ byKey: next, connected: true });
-      } else if (msg.type === 'permission_added') {
-        const k = pendingKey(msg.pending.agent, msg.pending.sessionId);
-        set((s) => ({
-          byKey: { ...s.byKey, [k]: [...(s.byKey[k] ?? []), msg.pending] },
-        }));
-      } else if (msg.type === 'permission_resolved') {
-        get().removeOne(msg.agent, msg.sessionId, msg.toolUseId);
+  syncStreams(bridges: Bridge[]) {
+    const wanted = new Map(bridges.map((b) => [b.id, b]));
+    // Close streams for bridges that vanished or whose connection changed.
+    for (const [bridgeId, s] of [...streams]) {
+      const b = wanted.get(bridgeId);
+      const connKey = b ? `${b.baseUrl}::${b.token ?? ''}` : '';
+      if (!b || s.connKey !== connKey) {
+        s.close();
+        streams.delete(bridgeId);
+        set((st) => ({ byKey: withoutBridge(st.byKey, bridgeId) }));
       }
-    }, (connected) => {
-      // Reflect transient drops; the next snapshot (sent on every reconnect)
-      // flips this back to true and re-syncs byKey.
-      if (currentConnectionKey === connKey && !connected) set({ connected: false });
-    });
+    }
+    // Open streams for new / changed bridges. Each frame is tagged with the
+    // bridge it came from so the map stays partitioned by machine.
+    for (const b of bridges) {
+      if (streams.has(b.id)) continue;
+      const connKey = `${b.baseUrl}::${b.token ?? ''}`;
+      const handle = openEventsStream(
+        bridgeToConfig(b),
+        (msg) => {
+          if (streams.get(b.id)?.connKey !== connKey) return; // stale stream
+          if (msg.type === 'permissions_snapshot') {
+            set((st) => {
+              const byKey = withoutBridge(st.byKey, b.id);
+              for (const p of msg.pending) {
+                const k = pendingKey(b.id, p.agent, p.sessionId);
+                (byKey[k] ??= []).push({ ...p, bridgeId: b.id });
+              }
+              return { byKey, connected: true };
+            });
+          } else if (msg.type === 'permission_added') {
+            const k = pendingKey(b.id, msg.pending.agent, msg.pending.sessionId);
+            set((st) => ({
+              byKey: {
+                ...st.byKey,
+                [k]: [...(st.byKey[k] ?? []), { ...msg.pending, bridgeId: b.id }],
+              },
+            }));
+          } else if (msg.type === 'permission_resolved') {
+            get().removeOne(b.id, msg.agent, msg.sessionId, msg.toolUseId);
+          }
+        },
+        (connected) => {
+          if (connected) set({ connected: true });
+        },
+      );
+      streams.set(b.id, { connKey, close: handle.close });
+    }
   },
 
-  disconnect() {
-    if (currentStream) {
-      currentStream.close();
-      currentStream = null;
-    }
-    currentConnectionKey = null;
+  disconnectAll() {
+    for (const [, s] of streams) s.close();
+    streams.clear();
     set({ byKey: {}, connected: false });
   },
 
-  removeOne(agent: string, sessionId: string, toolUseId: string) {
-    const k = pendingKey(agent, sessionId);
+  removeOne(bridgeId: string, agent: string, sessionId: string, toolUseId: string) {
+    const k = pendingKey(bridgeId, agent, sessionId);
     set((s) => {
       const list = (s.byKey[k] ?? []).filter((p) => p.toolUseId !== toolUseId);
       const byKey = { ...s.byKey };
@@ -460,15 +492,14 @@ export function useSessionCapabilities(
 /** Hook that starts the stream once settings are hydrated. Mount this once at
  *  the app root so the connection survives navigation. */
 export function useEnsurePendingPermissionsStream(): void {
-  const settings = useHydratedSettings();
-  const ensure = usePendingPermissions((s) => s.ensureStreaming);
-  const disconnect = usePendingPermissions((s) => s.disconnect);
+  const { bridges, hydrated } = useHydratedBridges();
+  const sync = usePendingPermissions((s) => s.syncStreams);
+  // String key so the effect re-runs only when a bridge's id/url/token changes.
+  const key = bridges.map((b) => `${b.id}|${b.baseUrl}|${b.token ?? ''}`).join('§');
   useEffect(() => {
-    if (!settings.hydrated) return;
-    if (!settings.baseUrl) {
-      disconnect();
-      return;
-    }
-    ensure(settings.baseUrl, settings.token);
-  }, [settings.hydrated, settings.baseUrl, settings.token, ensure, disconnect]);
+    if (!hydrated) return;
+    // Streams persist across navigation; syncStreams diffs and closes only what
+    // actually went away, so no teardown on dependency change.
+    sync(bridges);
+  }, [hydrated, key, sync]); // eslint-disable-line react-hooks/exhaustive-deps
 }

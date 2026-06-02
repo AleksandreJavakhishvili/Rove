@@ -7,6 +7,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
 
 import { useEnsurePendingPermissionsStream } from '@/lib/store';
+import { usePeriodicDiscovery } from '@/lib/discovery';
 import { useWebBootstrap } from '@/lib/web-bootstrap';
 import { useTheme } from '@/theme';
 
@@ -24,6 +25,7 @@ export default function RootLayout() {
   // Keep the bridge-wide events stream alive as long as the app is mounted, so
   // permission requests fired while the user is inside a chat are not lost.
   useEnsurePendingPermissionsStream();
+  usePeriodicDiscovery();
 
   // Debug aid: log any uncaught JS error with a clear tag before the default
   // handler runs. If the app hard-closes on an action and NOTHING tagged
@@ -58,6 +60,7 @@ export default function RootLayout() {
             ...webScreenOptions,
           }}>
           <Stack.Screen name="index" options={{ title: 'Sessions' }} />
+          <Stack.Screen name="machines" options={{ title: 'Machines' }} />
           <Stack.Screen
             name="settings"
             options={{

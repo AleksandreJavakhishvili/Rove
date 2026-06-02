@@ -11,7 +11,9 @@ phases 1–2 are useful even before the mobile refactor lands (any
 client could call `/peers`), and the mobile refactor (phase 3) makes
 the existing single-bridge UX no worse.
 
-1. **Bridge: Tailscale identity middleware + capability flag**
+1. **Bridge: confirm serve auth + `/health` no-key signal** (most of the
+   auth is already shipping — see hla.md *Tradeoffs › Why reuse
+   `tailscale serve`*)
 2. **Bridge: `/peers` endpoint + `rove-bridge init` config**
 3. **Mobile: `Bridge[]` model + `bridgeId` threaded through every
    helper / route**
@@ -22,9 +24,10 @@ the existing single-bridge UX no worse.
 
 ## Definition of done (whole effort)
 
-- Bridge exposes `/peers` and accepts requests authenticated by
-  Tailscale identity OR bearer token; `tailscaleIdentity` capability
-  is `true` iff the local Tailscale socket responds to `whois`.
+- Bridge exposes `/peers` and accepts requests authenticated by the
+  `tailscale serve` identity header OR bearer token (existing
+  `bridge/src/auth.ts`); `GET /health` reports `bridgeId` and a
+  bridge-level `tailscaleServe` flag (not a per-agent capability).
 - `Bridge` type and `useBridges` store land in
   `mobile/lib/bridges.ts`; legacy single-bridge settings migrate
   on first load without user action.
@@ -43,64 +46,52 @@ the existing single-bridge UX no worse.
 - Existing single-bridge users see no flow change beyond a one-time
   "Bridges" rename in settings. QR-scan path unchanged.
 - "No magic strings" gate holds: every new wire-frame value
-  (`authMode`, `tailscaleIdentity`, peer-info fields) has a named
+  (`authMode`, `tailscaleServe`, peer-info fields) has a named
   constant.
 
 ---
 
-## Phase 1 — Bridge: Tailscale identity middleware
+## Phase 1 — Bridge: confirm serve auth + `/health` no-key signal
 
-Branch: `2026-05-26-multi-bridge-aggregator-phase1-tailscale-auth`
+Branch: `2026-05-26-multi-bridge-aggregator-phase1-health-signal`
 
-Goal: a bridge running on a tailnet accepts requests from authorised
-Tailscale identities without needing a bearer token. Bearer token
-remains as fallback.
+Goal: the bridge auth is **already** the no-key path — `tailscale serve`
+injects `Tailscale-User-Login`, which `bridge/src/auth.ts` trusts, with
+bearer token as the off-tailnet fallback. This phase does NOT build a whois
+middleware (rejected — see hla.md *Tradeoffs › Why reuse `tailscale
+serve`*). It only surfaces the bridge-level signals mobile needs.
 
 ### LLD
 
-- Tailscale local API client: prefer the official Tailscale Go
-  binary's `tailscale whois <ip>` over the local socket via `tsnet`'s
-  HTTP API at `http://local-tailscaled.sock/localapi/v0/whois?addr=…`.
-  Use a tiny `node-fetch`-over-unix-socket helper, not a Go shim.
-  Document the macOS / Linux / Windows socket paths.
-- Allowlist semantics: `allowed_users: string[]` matched against
-  `whois.UserProfile.LoginName`. Empty list = derived default
-  (current OS user @ tailnet). Wildcard `"*"` allows any tailnet
-  member (use case: lab / homelab where every device on the tailnet
-  is trusted).
-- Caching: `whois` results cached by source-IP for 60 s. Tailscale
-  IPs are stable per device.
-- Capability emission: bridge probes the socket on startup; if
-  reachable, `capabilities.tailscaleIdentity = true`. Probe is
-  idempotent and re-runs on /health.
+- `tailscaleServe` is a bridge-level fact already known at startup
+  (`runtimeState.tailscaleServing`). Expose it on `/health`, not on the
+  per-agent `AgentCapabilities`.
+- `bridgeId`: a stable per-bridge id (persist a random UUID in the bridge
+  config on first run). The bridge stays agnostic of its user-given name —
+  mobile owns the label.
+- Allowlist semantics are unchanged: `ALLOWED_USERS` matched against the
+  serve-header login; empty = current OS user's tailnet login
+  (auto-derived); wildcard `"*"` = any tailnet member (homelab).
 
 ### Tasks
 
-- [ ] `bridge/src/tailscale.ts` — `whois(ip): Promise<TailscaleIdentity
-      | null>`, `listPeers(): Promise<PeerInfo[]>`,
-      `selfStatus(): Promise<SelfInfo | null>`. Cross-platform socket
-      path detection.
-- [ ] `bridge/src/auth.ts` — middleware that runs whois first, falls
-      through to bearer-token check. Adds `c.var.identity` for
-      downstream handlers.
-- [ ] `bridge/src/server.ts` — wire the new middleware in front of
-      every existing protected route. Verify the WS upgrade path
-      runs through the same auth.
-- [ ] `bridge/src/config.ts` — load `~/.config/rove/bridge.toml`;
-      derive defaults; write on first run.
-- [ ] `bridge/src/agents/types.ts` — add `tailscaleIdentity?:
-      boolean` to `AgentCapabilities`. Constants where applicable.
-- [ ] Unit tests: whois success + cache hit + cache miss + fallback
-      to bearer + reject on unknown user.
+- [x] `bridge/src/server.ts` — extend `GET /health` to return
+      `{ ok, user, bridgeId, tailscaleServe }`.
+- [x] `bridge/src/config.ts` — persist a stable `bridgeId` on first run
+      (`~/.config/rove/bridge-id`; `BRIDGE_ID` env override).
+- [x] Confirm the WS upgrade path runs through auth: `app.use('*',
+      authMiddleware)` wraps the `upgradeWebSocket` routes too. No new
+      middleware.
+- [ ] Sanity test (live curl): serve path accepts with no token; bearer
+      path accepts with token; neither + non-loopback rejects 401.
 
 ### Definition of done
 
-- Curling the bridge from another tailnet device without a bearer
-  token succeeds (200 on /health). Curling from a non-tailnet IP
-  without a token fails with 401.
-- `~/.config/rove/bridge.toml` is created on first run if absent.
-- `tailscaleIdentity` field appears on the capabilities event when
-  the bridge is on a tailnet.
+- `GET /health` from another tailnet device (behind `tailscale serve`,
+  no bearer token) returns 200 with `tailscaleServe: true`, a `user`, and
+  a stable `bridgeId`. A non-tailnet caller without a token gets 401.
+- No whois middleware and no `AgentCapabilities.tailscaleIdentity` field
+  were added.
 
 ---
 
@@ -113,11 +104,13 @@ lands here.
 
 ### Tasks
 
-- [ ] `GET /peers` — wraps `tailscale.listPeers()`. Gated on
-      `tailscaleIdentity` capability. Returns `PeersResponse` with
-      `self`, `peers[]`, `tailnet`.
-- [ ] Update `GET /health` to include `bridgeId`, `user`,
-      `tailscaleIdentity`. Probes from the mobile client read this.
+- [x] `bridge/src/tailscale.ts` — `listTailnetDevices()` parses `Self` +
+      the `Peer` map + `MagicDNSSuffix` from `tailscale status --json`
+      (3s timeout; returns null → 503 when Tailscale is unavailable).
+- [x] `GET /peers` — returns `PeersResponse` with `self`, `peers[]`,
+      `tailnet`; 503 when Tailscale is unreachable. Auth-protected by the
+      global middleware; the client gates on the `/health` `tailscaleServe`
+      flag before calling it.
 - [ ] `bridge/bin/rove-bridge init` subcommand that writes a default
       config and prints the bridge URL.
 - [ ] Install script `scripts/install-bridge.sh` for headless boxes:
@@ -160,31 +153,46 @@ typed correctly; UX still looks single-bridge until phase 4.
     lastSeenMs?: number;
   }
   ```
-- Migration: if `useHydratedSettings()` returns the legacy shape,
-  produce a single `Bridge` with `id = "default"`, `authMode =
-  'bearer'`, persist, never run the migration again.
+- Migration: on first `useBridgesStore.load()` with no `rove:bridges:v1`,
+  read the legacy `rove:settings:v1` `{ baseUrl, token }` and produce a
+  single `Bridge` with `id = "default"`; `authMode` is **inferred**
+  (`token` present → `'bearer'`, else `'tailscale'`). Persist, never run
+  the migration again.
 - `BridgeConfig` (the existing `{ baseUrl, token }`) becomes a
   derived view of `Bridge` for the helper-call ergonomics.
 
 ### Tasks
 
-- [ ] `mobile/lib/bridges.ts` — types + store + migration.
-- [ ] `mobile/lib/bridge.ts` — every exported helper gains a `Bridge`
-      (or `bridgeId`) parameter; settings-derived defaults removed.
-- [ ] Routing: `app/sessions/[bridge]/[agent]/[id]/{index,diff,file}.tsx`.
-      Old `app/sessions/[agent]/[id]/*` becomes a redirect wrapper.
-- [ ] WS connection: keyed by `bridgeId` so we can hold many open at
-      once. Reconnect logic moves into the aggregator (phase 4).
-- [ ] Pending-permissions store: re-keyed by
-      `${bridgeId}:${agent}:${sessionId}:${toolUseId}`.
-- [ ] Diff cache: re-keyed by `(bridgeId, agent, sessionId, path)`.
+- [x] `mobile/lib/bridges.ts` — `Bridge` type, `BRIDGE_AUTH_MODE`,
+      `useBridgesStore` + selectors, legacy `{ baseUrl, token }` → single
+      `default` bridge migration, `bridgeToConfig` derived view,
+      `makeBridge` / `newLocalBridgeId` / `getActiveBridge` helpers.
+- [x] `mobile/lib/store.ts` — `useBridges` is now the persistent
+      connection source; `useSettings` delegates `baseUrl`/`token` to the
+      active bridge (facade), so all existing readers + the connect flow
+      keep working unchanged. `BridgeConfig` kept as the structural derived
+      view (helper signatures unchanged for now).
+- [x] Routing via **`?bridge=<id>` query param** (not a `[bridge]` path
+      segment): `index.tsx`, `diff.tsx`, `file.tsx` resolve the param to a
+      `Bridge`, falling back to the active bridge — old links keep working,
+      no redirect wrapper, route tree untouched. Lower-risk than restructuring.
+- [ ] (→ Phase 4) WS connection keyed by `bridgeId` (hold many open). Single
+      stream to the active bridge today; multiplexing lands with the aggregator.
+- [ ] (→ Phase 4) Pending-permissions store re-keyed by
+      `${bridgeId}:${agent}:${sessionId}:${toolUseId}`. Single bridge → no
+      collision yet.
+- [ ] (→ Phase 4) Diff cache re-keyed by `(bridgeId, agent, sessionId, path)`.
 
 ### Definition of done
 
-- Both bridge and mobile `tsc --noEmit` clean.
-- A user with one bridge sees zero behavior change.
-- Routes still resolve from existing share links via the
-  backward-compat redirect.
+- Both bridge and mobile `tsc --noEmit` clean. ✅ (mobile clean with the
+  `bridges.ts` + `store.ts` changes; bridge clean from Phase 1–2.)
+- A user with one bridge sees zero behavior change (connection config now
+  flows through `Bridge[]` but resolves to the same single bridge).
+- The concurrency-only mechanics (per-`bridgeId` re-keying + `[bridge]`
+  routes) moved to Phase 4, where two bridges actually stream at once — they
+  are no-ops for a single bridge and carry navigation/runtime risk best
+  verified on-device alongside the aggregator.
 
 ---
 
@@ -197,17 +205,36 @@ one view, with machine identity visible on every row.
 
 ### Tasks
 
-- [ ] `mobile/lib/aggregator.ts` — fans out `/sessions` on each
-      bridge in parallel with a 5s per-host timeout. Merges results
-      by `lastModified` desc. Emits per-bridge connection state.
-- [ ] Sessions screen — filter chip strip (`All · machine A …`),
-      machine pill on each row, offline badge on rows whose bridge
-      is unreachable.
-- [ ] `SessionsSidebar` — same machine pill; current session's
-      bridge highlighted.
-- [ ] Approvals inbox — aggregator-driven; banner shows
-      `N pending across M machines`.
-- [ ] Pull-to-refresh triggers `aggregator.refresh()` on all bridges.
+- [x] `mobile/lib/aggregator.ts` — fans out `/sessions` on each
+      bridge in parallel with a 5s per-host timeout. Emits per-bridge
+      connection state, keeps last-known rows on failure (offline stays
+      visible), tags each session with `bridgeId`; `mergeSessions()` util.
+- [x] Machine identity util — `bridgeColor()` in `bridges.ts`,
+      deterministic per-host hue; to be reused on rows, chips, chat
+      header, switcher.
+- [x] Session screens bridge-aware via `?bridge=` — `index.tsx`,
+      `diff.tsx`, `file.tsx` connect to the row's bridge (fallback active).
+      Note follow-up: chat → diff/file nav must forward `?bridge` once the
+      inbox passes it.
+- [x] Sessions screen = unified home inbox (`app/index.tsx`). needs-me
+      sort (`pending ▸ live ▸ recent`), machine pill per row (colour +
+      name), offline rows **faded + "· offline"**, filter chip strip
+      (recent-first, shown when >1 machine), sticky selection, `●` on a
+      chip when that machine needs the user. Rows navigate with `?bridge=`.
+      Empty / all-offline / connecting states handled.
+- [x] `SessionsSidebar` → switcher: aggregator-driven, opens scoped to the
+      current machine (`currentBridgeId` prop) with scope chips (machines +
+      `All`, shown when >1 machine), machine dot + name per row, navigates
+      with `?bridge=`. Button-triggered (existing `⊟`); not swipe.
+- [~] Approvals inbox — banner shows total pending across sessions
+      (single-stream today; true cross-bridge pending needs the WS fan-out,
+      below).
+- [x] Pull-to-refresh triggers `aggregator.refresh()` on all bridges.
+- [x] Multi-bridge pending streaming — `usePendingPermissions` opens one
+      `/events` stream per bridge, tags each request with `bridgeId`, keys the
+      map by `${bridgeId}:${agent}:${sessionId}`; `decide()` routes the
+      approval to the originating bridge. `selectOthersPending` excludes the
+      focused session per-bridge. 68 jest tests pass (incl. a cross-bridge case).
 
 ### Definition of done
 
@@ -227,17 +254,31 @@ Goal: adding a machine is one step. Headless boxes auto-enrol.
 
 ### Tasks
 
-- [ ] Settings → "Bridges" screen. List of configured bridges with
-      reachability state. Per-row: rename, remove, edit token.
-- [ ] "Find on my tailnet" action: prompts for one hostname, calls
-      `/peers` on it, lists discovered peers with checkboxes,
-      probes each on confirm, adds successes.
+- [x] Machines screen (`app/machines.tsx`), reached from a header icon on
+      home. Lists bridges with reachability (aggregator `connState`) +
+      session count + `lastSeenMs`; per-row rename + remove (token edit via
+      "Add manually" → settings for now). Route registered in `_layout.tsx`.
+      (`/machines` push is cast `as Href` until expo regenerates typed routes.)
+- [x] "Find on my tailnet" — `discovery.ts:discoverBridges(anchor)` calls
+      `/peers` on a reachable bridge, probes each device's `/health` over the
+      serve path (no token), filters to authorised bridges not already added
+      (self/phone/non-bridge drop out via the probe), and offers "Add all".
+      `fetchPeers` + extended `fetchHealth` (bridgeId, tailscaleServe) added.
+- [x] Discovery magic moment: after a successful connect on the serve path
+      (`health.tailscaleServe`), `settings.tsx` auto-runs `discoverBridges`
+      from the just-added bridge and offers "Add all" inline — connect one,
+      the rest appear.
+- [ ] Tailnet-presence detection: `100.64/10`-on-`utun` (iOS) /
+      `TRANSPORT_VPN` (Android); when off-tailnet, show "Turn on Tailscale"
+      copy. **Needs a native module** (no public RN API) — deferred; the
+      all-offline inbox state already points at the tailnet.
 - [ ] First-run onboarding: if `Bridge[]` is empty, present the
-      three options (Find / Scan QR / Paste URL).
-- [ ] Periodic re-discovery: every 5 min while the app is foreground,
-      call `/peers` on any reachable bridge, surface newly-seen
-      peers as a "1 new machine on your tailnet" banner. User taps
-      to confirm before it's added.
+      three options (Scan QR / Find / Paste URL), camera-first. (Today the
+      empty state links to settings, which has QR + URL.)
+- [x] Periodic re-discovery: `usePeriodicDiscovery` (mounted at root) probes
+      every 5 min while foreground (AppState-gated); newly-seen bridges land in
+      `useDiscoveryStore` and surface as a tappable "N new machine(s) on your
+      tailnet" banner on the home inbox (add-all / dismiss).
 
 ### Definition of done
 
@@ -257,20 +298,19 @@ Goal: graceful degradation, no rough edges.
 
 ### Tasks
 
-- [ ] Offline UX: rows from unreachable bridges show with a faded
-      pill, an offline badge, and a tap-to-retry. Tapping into the
-      session shows a connecting state until the bridge comes back.
-- [ ] Stale data: bridge `lastSeenMs` shown in the bridges
-      management screen.
-- [ ] Auth failure: 401 from a bridge demotes its state to
-      `unauthorised` and surfaces an inline "re-auth" banner on its
-      rows. Tapping the banner walks the user through re-scanning
-      the QR or re-entering the token.
-- [ ] Sidebar machine pill (matching the sessions-list pill style).
-- [ ] Smoke checklist (manual): two bridges configured, both online;
-      one online + one offline; one online + one unauthorised;
-      anchor discovery with three peers; legacy single-bridge
-      migration from a prior release.
+- [x] Offline UX: unreachable bridges' rows fade and show "· offline"
+      (stay visible); the Machines screen rows are tap-to-retry
+      (`refreshBridge`). Opening an offline session shows the chat's
+      connecting state.
+- [x] Stale data: `lastSeenMs` shown on the Machines screen ("seen 2h ago").
+- [x] Auth failure: a 401/403 demotes the bridge to `unauthorised`; inline
+      rows show "· re-auth" (danger), and the Machines screen flags
+      "re-auth needed". (A guided re-scan walk-through is still TODO — for
+      now the user re-connects via Settings.)
+- [x] Sidebar/switcher machine pill (dot + name), matching the inbox style.
+- [ ] Smoke checklist (manual, needs a device): two online; one online +
+      one offline; one online + one unauthorised; discovery with 3 peers;
+      legacy single-bridge migration.
 
 ### Definition of done
 
@@ -302,10 +342,11 @@ Goal: graceful degradation, no rough edges.
 
 ## Risk register
 
-- **`tailscale whois` socket path varies by platform.** Document
-  paths; smoke-test on Linux (Tailscale snap *and* deb), macOS
-  (CLI install *and* GUI app), Windows (admin pipe). Fall back to
-  bearer if socket detection fails — never block startup.
+- **`tailscale serve` may not be running.** Auth depends on the
+  serve-injected identity header. If serve isn't fronting the bridge,
+  fall back to bearer token — never block startup. Smoke-test on Linux,
+  macOS (CLI *and* GUI app), Windows. (This replaces the original
+  whois-socket-path risk, which no longer applies — see hla.md.)
 - **Shared tailnet privacy.** Default `allowed_users` to the current
   OS user only. Document the wildcard explicitly; never enable it
   by default. Smoke: roommate on the same tailnet must NOT see the

@@ -1,5 +1,7 @@
 import { QRScanner, type ScannedConfig } from '@/components/QRScanner';
 import { fetchHealth } from '@/lib/bridge';
+import { getActiveBridge, useBridgesStore, type Bridge } from '@/lib/bridges';
+import { discoverBridges } from '@/lib/discovery';
 import { registerWithBridge } from '@/lib/push';
 import { useHydratedSettings } from '@/lib/store';
 import { fontSize, radius, space, useTheme } from '@/theme';
@@ -52,8 +54,43 @@ export default function SettingsScreen() {
       // Best-effort push registration. Currently stubbed (no-op) until we
       // re-enable expo-notifications with a paid Apple Developer account.
       void registerWithBridge({ baseUrl: rawUrl, token: rawToken });
-      Alert.alert('Connected', `Authenticated as ${health.user ?? 'unknown'}`);
-      router.back();
+
+      // Discovery magic moment: on the keyless serve path, ask this bridge for
+      // the rest of the tailnet and offer to add them — so the user connects
+      // ONE machine and the others appear. Best-effort; never blocks connect.
+      let discovered: Bridge[] = [];
+      if (health.tailscaleServe) {
+        const anchor = getActiveBridge();
+        if (anchor) {
+          try {
+            discovered = await discoverBridges(anchor, useBridgesStore.getState().bridges);
+          } catch {
+            // discovery is optional — a failure here doesn't fail the connect
+          }
+        }
+      }
+      if (discovered.length > 0) {
+        Alert.alert(
+          'Connected',
+          `Authenticated as ${health.user ?? 'you'}. Found ${discovered.length} more machine${
+            discovered.length === 1 ? '' : 's'
+          } on your tailnet.`,
+          [
+            { text: 'Not now', style: 'cancel', onPress: () => router.back() },
+            {
+              text: 'Add all',
+              onPress: async () => {
+                for (const b of discovered) await useBridgesStore.getState().addBridge(b);
+                router.back();
+              },
+            },
+          ],
+        );
+      } else {
+        Alert.alert('Connected', `Authenticated as ${health.user ?? 'unknown'}`, [
+          { text: 'OK', onPress: () => router.back() },
+        ]);
+      }
     } catch (err) {
       Alert.alert('Could not connect', String((err as Error).message ?? err));
     } finally {

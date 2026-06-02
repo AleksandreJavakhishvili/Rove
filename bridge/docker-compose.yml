@@ -1,0 +1,22 @@
+services:
+  rove-bridge:
+    build: .
+    environment:
+      # Create one at https://login.tailscale.com/admin/settings/keys
+      # (reusable + ephemeral is handy for a throwaway test device).
+      # Required only for `up` (the entrypoint enforces it); left optional here
+      # so `docker compose exec/logs/down` work without re-supplying it.
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: ${TS_HOSTNAME:-rove-bridge-docker}
+      # Optional — defaults to the tailnet owner (the auth key's account).
+      # ALLOWED_USERS: you@example.com
+    # Userspace networking → no NET_ADMIN / /dev/net/tun needed (works on macOS).
+    volumes:
+      - rove-ts-state:/var/lib/tailscale
+      # Persists `claude /login` creds + sessions across restarts.
+      - rove-claude:/root/.claude
+    restart: unless-stopped
+
+volumes:
+  rove-ts-state:
+  rove-claude:

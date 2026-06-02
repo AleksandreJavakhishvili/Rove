@@ -93,9 +93,38 @@ async function fetchWithTimeout(url: string, opts: RequestInit, timeoutMs = 7000
   }
 }
 
-export async function fetchHealth(cfg: BridgeConfig): Promise<{ ok: boolean; user?: string }> {
+export interface HealthResponse {
+  ok: boolean;
+  user?: string;
+  /** Stable per-bridge id (used as the mobile Bridge.id for discovered hosts). */
+  bridgeId?: string;
+  /** True when the bridge is on the keyless `tailscale serve` path. */
+  tailscaleServe?: boolean;
+}
+
+export async function fetchHealth(cfg: BridgeConfig): Promise<HealthResponse> {
   const res = await fetchWithTimeout(`${cfg.baseUrl}/health`, { headers: authHeaders(cfg) });
-  if (!res.ok) throw new Error(`/health → ${res.status}`);
+  if (!res.ok) throw httpError('/health', res.status);
+  return res.json();
+}
+
+/** One device on the tailnet (mirrors the bridge's `/peers` shape). */
+export interface PeerInfo {
+  hostname: string;
+  dnsName: string;
+  tailscaleIPs: string[];
+  online: boolean;
+  os: string;
+}
+export interface PeersResponse {
+  self: PeerInfo;
+  peers: PeerInfo[];
+  tailnet: string;
+}
+
+export async function fetchPeers(cfg: BridgeConfig): Promise<PeersResponse> {
+  const res = await fetchWithTimeout(`${cfg.baseUrl}/peers`, { headers: authHeaders(cfg) });
+  if (!res.ok) throw httpError('/peers', res.status);
   return res.json();
 }
 

@@ -41,7 +41,12 @@ import {
 } from './handoffDispatch.ts';
 import { sessionMeta } from './sessionMeta.ts';
 import { saveUpload } from './uploads.ts';
-import { getTailscaleCert, getTailscaleInfo, isTailscaleServeRunning } from './tailscale.ts';
+import {
+  getTailscaleCert,
+  getTailscaleInfo,
+  isTailscaleServeRunning,
+  listTailnetDevices,
+} from './tailscale.ts';
 import {
   HANDOFF_RESULT_STATUS,
   HANDOFF_RESULT_STATUSES,
@@ -63,8 +68,28 @@ app.use('*', cors({ origin: '*', allowHeaders: ['Authorization', 'Tailscale-User
 app.use('*', authMiddleware);
 
 app.get('/health', (c) =>
-  c.json({ ok: true, user: c.get('auth').user, host: config.host, port: config.port }),
+  c.json({
+    ok: true,
+    user: c.get('auth').user,
+    bridgeId: config.bridgeId,
+    // Bridge-level signal: true when `tailscale serve` fronts us, i.e. the
+    // keyless identity path is active. Mobile reads this during the discovery
+    // probe to decide whether to surface the auto-discovery flow.
+    tailscaleServe: runtimeState.tailscaleServing,
+  }),
 );
+
+// Tailnet device list, used by the mobile app's anchor-based discovery: the
+// phone knows ONE bridge and asks it for the rest. Returns every tailnet
+// device; the client probes each /health to filter down to actual bridges
+// (and skips itself). Any serve-mode bridge can answer this — none is special.
+// 503 (not an error) when Tailscale isn't running so the client degrades
+// cleanly to the manual add-bridge path.
+app.get('/peers', async (c) => {
+  const result = await listTailnetDevices();
+  if (!result) return c.json({ error: 'tailscale-unavailable' }, 503);
+  return c.json(result);
+});
 
 app.get('/agents', async (c) => c.json({ agents: await listAgents() }));
 

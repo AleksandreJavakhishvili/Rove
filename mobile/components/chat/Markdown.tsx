@@ -57,6 +57,13 @@ export function Markdown({ text, color }: MarkdownProps) {
           backgroundColor: t.code.inlineBg,
           fontFamily: fontFamily.mono,
           fontSize: fontSize.base,
+          // The library merges its defaults under our overrides, so we must
+          // explicitly cancel its borderWidth/borderColor and vertical padding.
+          // On web (react-native-web) an inline element's vertical padding +
+          // border bleeds into the lines above and below, drawing stray
+          // horizontal lines across surrounding text; native ignores them.
+          borderWidth: 0,
+          paddingVertical: 0,
           paddingHorizontal: 4,
           borderRadius: radius.sm - 1,
         },

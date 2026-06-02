@@ -1,12 +1,14 @@
 import { useCallback, useState } from 'react';
 import { Alert } from 'react-native';
-import { sendApproval, type PendingPermissionSnapshot } from '@/lib/bridge';
-import { useHydratedSettings, usePendingPermissions } from '@/lib/store';
+import { sendApproval } from '@/lib/bridge';
+import { bridgeToConfig, useBridgesStore } from '@/lib/bridges';
+import { usePendingPermissions } from '@/lib/store';
+import type { PendingItem } from '@/lib/pendingSelectors';
 
 export type PermissionDecision = 'allow' | 'allow_always' | 'deny';
 
-function busyKey(p: PendingPermissionSnapshot): string {
-  return `${p.agent}:${p.sessionId}:${p.toolUseId}`;
+function busyKey(p: PendingItem): string {
+  return `${p.bridgeId}:${p.agent}:${p.sessionId}:${p.toolUseId}`;
 }
 
 /**
@@ -18,23 +20,23 @@ function busyKey(p: PendingPermissionSnapshot): string {
  * but the user shouldn't stare at a stale row in the meantime.
  */
 export function usePermissionDecision() {
-  const settings = useHydratedSettings();
   const removePending = usePendingPermissions((s) => s.removeOne);
   const [busy, setBusy] = useState<Set<string>>(new Set());
 
   const decide = useCallback(
-    async (p: PendingPermissionSnapshot, decision: PermissionDecision) => {
+    async (p: PendingItem, decision: PermissionDecision) => {
       const key = busyKey(p);
+      // Route the decision to the bridge the request came from — not the active
+      // one — so a cross-machine approval lands on the right host.
+      const bridge = useBridgesStore.getState().bridges.find((b) => b.id === p.bridgeId);
+      if (!bridge) {
+        Alert.alert('Approval failed', 'That machine is no longer configured.');
+        return;
+      }
       setBusy((prev) => new Set(prev).add(key));
       try {
-        await sendApproval(
-          { baseUrl: settings.baseUrl, token: settings.token },
-          p.agent,
-          p.sessionId,
-          p.toolUseId,
-          decision,
-        );
-        removePending(p.agent, p.sessionId, p.toolUseId);
+        await sendApproval(bridgeToConfig(bridge), p.agent, p.sessionId, p.toolUseId, decision);
+        removePending(p.bridgeId, p.agent, p.sessionId, p.toolUseId);
       } catch (err) {
         Alert.alert('Approval failed', String((err as Error).message ?? err));
       } finally {
@@ -45,10 +47,10 @@ export function usePermissionDecision() {
         });
       }
     },
-    [settings.baseUrl, settings.token, removePending],
+    [removePending],
   );
 
-  const isBusy = useCallback((p: PendingPermissionSnapshot) => busy.has(busyKey(p)), [busy]);
+  const isBusy = useCallback((p: PendingItem) => busy.has(busyKey(p)), [busy]);
 
   return { decide, isBusy };
 }

@@ -2,7 +2,7 @@ import { Markdown } from '@/components/chat/Markdown';
 import { CODE_LINE_HEIGHT, HighlightedCode } from '@/components/highlight/HighlightedCode';
 import { languageForPath } from '@/components/highlight/languages';
 import { fetchFile, type ScopedFile } from '@/lib/bridge';
-import { useHydratedSettings } from '@/lib/store';
+import { bridgeToConfig, useActiveBridge, useBridge, useHydratedBridges } from '@/lib/bridges';
 import { fontSize, space, useTheme } from '@/theme';
 import * as Clipboard from 'expo-clipboard';
 import { Stack, useLocalSearchParams } from 'expo-router';
@@ -10,18 +10,26 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 export default function FileViewerScreen() {
-  const { agent, id, path, line: lineParam } = useLocalSearchParams<{
+  const { agent, id, path, line: lineParam, bridge } = useLocalSearchParams<{
     agent: string;
     id: string;
     path: string;
     /** When set, the viewer scrolls to + highlights this 1-based line. */
     line?: string;
+    /** Which bridge this session lives on; falls back to the active bridge. */
+    bridge?: string;
   }>();
   const targetLine = (() => {
     const n = typeof lineParam === 'string' ? Number.parseInt(lineParam, 10) : NaN;
     return Number.isFinite(n) && n >= 1 ? n : null;
   })();
-  const settings = useHydratedSettings();
+  useHydratedBridges();
+  const paramBridge = useBridge(typeof bridge === 'string' ? bridge : null);
+  const activeBridge = useActiveBridge();
+  const connBridge = paramBridge ?? activeBridge;
+  const conn = connBridge
+    ? bridgeToConfig(connBridge)
+    : { baseUrl: '', token: undefined as string | undefined };
   const t = useTheme();
   const [file, setFile] = useState<ScopedFile | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -29,9 +37,9 @@ export default function FileViewerScreen() {
   const verticalScrollRef = useRef<ScrollView>(null);
 
   useEffect(() => {
-    if (!settings.baseUrl || !agent || !id || !path) return;
+    if (!conn.baseUrl || !agent || !id || !path) return;
     let cancelled = false;
-    fetchFile({ baseUrl: settings.baseUrl, token: settings.token }, agent, id, path)
+    fetchFile(conn, agent, id, path)
       .then((f) => {
         if (!cancelled) setFile(f);
       })
@@ -41,7 +49,7 @@ export default function FileViewerScreen() {
     return () => {
       cancelled = true;
     };
-  }, [settings.baseUrl, settings.token, agent, id, path]);
+  }, [conn.baseUrl, conn.token, agent, id, path]);
 
   const lineCount = useMemo(() => (file ? file.contents.split('\n').length : 0), [file]);
   const language = useMemo(

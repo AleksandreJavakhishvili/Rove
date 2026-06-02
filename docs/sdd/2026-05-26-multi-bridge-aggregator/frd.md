@@ -34,8 +34,13 @@ having multiple machines on the same tailnet.
 ## Goals
 
 1. **One unified sessions view across every machine on the tailnet.**
-   Newest activity surfaces first regardless of host. Each row carries
-   a machine pill so identity is visible without forcing a step.
+   This is the **home screen** — a single "needs-me" inbox, not a
+   machines-first hierarchy. Rows are sorted `pending-approval ▸ live ▸
+   recently-active ▸ idle` (nothing hidden by the sort); each row carries
+   a machine pill (deterministic colour per host) so identity is visible
+   without forcing a step. No bottom navigation — switching is a visible
+   control, not a hidden swipe (the chat owns horizontal swipe). See
+   hla.md *Mobile UX (target screens)*.
 2. **First-class machine identity.** Every chat / WS / approval call
    carries a `bridgeId` so the right bridge gets the right request,
    even when many bridges are connected at once.
@@ -45,7 +50,10 @@ having multiple machines on the same tailnet.
    "you're on the same tailnet as the phone."
 4. **Tailscale identity is the auth.** No bearer tokens to rotate, no
    per-machine secrets. The bridge accepts a request iff the caller's
-   Tailscale identity matches the bridge's owner.
+   Tailscale identity matches the bridge's owner — via the existing
+   `tailscale serve` header-injection path (`bridge/src/auth.ts`), not a
+   new whois middleware. See hla.md (*Tradeoffs › Why reuse
+   `tailscale serve`*).
 5. **Graceful offline.** A machine that's asleep or unreachable
    degrades to "offline" on its rows; existing chats with reachable
    bridges keep working. No popups, no spinners-of-death.
@@ -116,14 +124,29 @@ multi-bridge work. Their flow stays 1-step: scan QR, done.
 - The sessions list, sidebar, and approvals inbox aggregate across all
   configured bridges. Each item shows a machine pill.
 - A filter chip strip at the top of the sessions list lets the user
-  scope to "All" or one specific machine.
+  scope to "All" or one specific machine; the selection is sticky through
+  offline transitions, and a chip flags a machine that needs the user even
+  when not selected.
+- The home list is sorted by what needs the user (pending-approval ▸ live
+  ▸ recently-active ▸ idle), renders per-machine as results arrive (no
+  full-screen spinner), and never blocks on a slow host.
+- The chat's session switcher opens scoped to the current machine with the
+  same chips to switch scope; it is button-triggered, not swipe (no
+  collision with the workspace pager).
+- The instant the first bridge connects, the rest of the tailnet is
+  offered inline ("Found N machines — Add all"); the user never has to
+  hunt for a discover action.
+- When the phone is not on the tailnet, the app says so ("Turn on
+  Tailscale to reach your machines") rather than showing a generic
+  network error.
 - Adding a new machine to the tailnet, installing the bridge there,
   and opening the phone results in the new machine appearing in the
   list without further user action.
 - Removing a machine from the tailnet (or stopping its bridge) causes
   its rows to show as offline, not disappear.
-- A user on a shared tailnet only sees bridges whose `tailscale whois`
-  identity matches a user they've authorised on each bridge.
+- A user on a shared tailnet only sees bridges whose Tailscale identity
+  (from the `tailscale serve` header) matches a user they've authorised
+  on each bridge.
 - The bearer-token path keeps working: a bridge without Tailscale
   identity available falls back to the existing auth.
 - Existing single-bridge users upgrade in place: on first launch after

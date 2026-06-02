@@ -1,4 +1,4 @@
-import type { PendingPermissionSnapshot } from '@/lib/bridge';
+import type { PendingItem } from '@/lib/pendingSelectors';
 import { usePermissionDecision } from '@/lib/permissions';
 import { dangerLevel, summarizeToolInput } from '@/lib/toolSummary';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
@@ -27,7 +27,7 @@ import { ownerLabel } from './labels';
 
 interface ApprovalTrayProps {
   open: boolean;
-  requests: PendingPermissionSnapshot[];
+  requests: PendingItem[];
   onClose: () => void;
 }
 
@@ -124,7 +124,7 @@ function Row({
   onDecide,
   onOpen,
 }: {
-  p: PendingPermissionSnapshot;
+  p: PendingItem;
   busy: boolean;
   onDecide: (decision: 'allow' | 'allow_always' | 'deny') => void;
   onOpen: () => void;

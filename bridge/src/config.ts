@@ -1,5 +1,37 @@
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+
+const configDir = join(homedir(), '.config', 'rove');
+const bridgeIdFile = join(configDir, 'bridge-id');
+
+/**
+ * Stable per-bridge identifier, persisted across restarts. Reported on
+ * `/health` so the mobile aggregator can key sessions / approvals by bridge.
+ * The bridge stays agnostic of the *name* the user gives it — that lives on
+ * the phone. Precedence: `BRIDGE_ID` env > persisted file > freshly generated
+ * (then persisted). Never throws: if the disk isn't writable we fall back to
+ * an in-memory id for this run.
+ */
+function resolveBridgeId(): string {
+  const fromEnv = process.env.BRIDGE_ID?.trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const existing = readFileSync(bridgeIdFile, 'utf8').trim();
+    if (existing) return existing;
+  } catch {
+    // file not created yet — fall through to generate
+  }
+  const generated = randomUUID();
+  try {
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(bridgeIdFile, generated, 'utf8');
+  } catch {
+    // disk not writable — use the in-memory id for this run
+  }
+  return generated;
+}
 
 export const config = {
   /** Explicit bind override. When undefined, the bridge auto-detects (see runtimeState.bindHost). */
@@ -12,6 +44,8 @@ export const config = {
   allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
   bearerToken: process.env.BEARER_TOKEN,
   historyMaxEntries: Number(process.env.HISTORY_MAX_ENTRIES ?? 50),
+  /** Stable id for this bridge; see resolveBridgeId. */
+  bridgeId: resolveBridgeId(),
 } as const;
 
 /**

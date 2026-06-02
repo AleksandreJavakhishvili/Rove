@@ -1,6 +1,6 @@
 import { InlineDiff } from '@/components/chat/InlineDiff';
 import { fetchDiff, fetchGitDiffFile, type DiffFile, type SessionDiff } from '@/lib/bridge';
-import { useHydratedSettings } from '@/lib/store';
+import { bridgeToConfig, useActiveBridge, useBridge, useHydratedBridges } from '@/lib/bridges';
 import { fontFamily, fontSize, space, useTheme, type Theme } from '@/theme';
 import { Stack, useLocalSearchParams } from 'expo-router';
 import { useEffect, useState } from 'react';
@@ -30,6 +30,8 @@ export default function DiffViewerScreen() {
     source?: string;
     /** `'true'` → diff index vs HEAD (vs the default worktree vs HEAD). */
     staged?: string;
+    /** Which bridge this session lives on; falls back to the active bridge. */
+    bridge?: string;
   }>();
   const { agent, id } = params;
   const mode: DiffMode = (() => {
@@ -46,14 +48,20 @@ export default function DiffViewerScreen() {
   })();
   const focusPath = mode.kind === 'cumulative' ? null : mode.path;
 
-  const settings = useHydratedSettings();
+  useHydratedBridges();
+  const paramBridge = useBridge(typeof params.bridge === 'string' ? params.bridge : null);
+  const activeBridge = useActiveBridge();
+  const connBridge = paramBridge ?? activeBridge;
+  const conn = connBridge
+    ? bridgeToConfig(connBridge)
+    : { baseUrl: '', token: undefined as string | undefined };
   const t = useTheme();
   const [loaded, setLoaded] = useState<LoadedState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    if (!settings.baseUrl || !agent || !id) return;
+    if (!conn.baseUrl || !agent || !id) return;
     let cancelled = false;
 
     const apply = (state: LoadedState) => {
@@ -75,7 +83,7 @@ export default function DiffViewerScreen() {
 
     if (mode.kind === 'git-file') {
       fetchGitDiffFile(
-        { baseUrl: settings.baseUrl, token: settings.token },
+        conn,
         agent,
         id,
         mode.path,
@@ -85,7 +93,7 @@ export default function DiffViewerScreen() {
         .catch(fail);
     } else {
       fetchDiff(
-        { baseUrl: settings.baseUrl, token: settings.token },
+        conn,
         agent,
         id,
         focusPath ? { path: focusPath } : {},
@@ -100,7 +108,7 @@ export default function DiffViewerScreen() {
     // mode.kind / mode.staged / focusPath cover every input that changes the
     // fetch shape; primitive deps keep this from refetching on cosmetic
     // re-renders.
-  }, [settings.baseUrl, settings.token, agent, id, mode.kind, focusPath, mode.kind === 'git-file' ? mode.staged : false]);
+  }, [conn.baseUrl, conn.token, agent, id, mode.kind, focusPath, mode.kind === 'git-file' ? mode.staged : false]);
 
   if (error) {
     return (

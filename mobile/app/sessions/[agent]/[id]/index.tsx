@@ -50,6 +50,7 @@ import {
   useSessionCapabilities,
   useSessionCapabilitiesStore,
 } from '@/lib/store';
+import { bridgeToConfig, useActiveBridge, useBridge } from '@/lib/bridges';
 import {
   captureAndUploadPhoto,
   pickAndUploadDocument,
@@ -345,8 +346,22 @@ const MODE_DESCRIPTION: Record<PermissionMode, string> = {
 };
 
 export default function ChatScreen() {
-  const { agent, id } = useLocalSearchParams<{ agent: string; id: string }>();
+  const { agent, id, bridge } = useLocalSearchParams<{
+    agent: string;
+    id: string;
+    bridge?: string;
+  }>();
   const settings = useHydratedSettings();
+  // Which bridge this chat lives on. Inbox rows navigate with `?bridge=<id>`;
+  // links without it (old share URLs) fall back to the active bridge, which is
+  // exactly the single-bridge behaviour. `settings` is still used for the
+  // visual-feedback prefs; `conn` is the per-bridge connection config.
+  const paramBridge = useBridge(typeof bridge === 'string' ? bridge : null);
+  const activeBridge = useActiveBridge();
+  const connBridge = paramBridge ?? activeBridge;
+  const conn = connBridge
+    ? bridgeToConfig(connBridge)
+    : { baseUrl: '', token: undefined as string | undefined };
   const t = useTheme();
   const capabilities = useSessionCapabilities(agent, id);
   const setCapabilities = useSessionCapabilitiesStore((s) => s.set);
@@ -456,7 +471,7 @@ export default function ChatScreen() {
   // native `WKWebView.takeSnapshot` API (`rove-webview-snapshot`)
   // instead of view-shot's stale-prone host-compositor read.
   const screenshot = useScreenshotCapture(
-    { baseUrl: settings.baseUrl, token: settings.token },
+    conn,
     agent,
     id,
     { previewFrameRef },
@@ -531,9 +546,9 @@ export default function ChatScreen() {
 
   // Pull session metadata (label, project name) for the header title.
   useEffect(() => {
-    if (!settings.baseUrl || !agent || !id) return;
+    if (!conn.baseUrl || !agent || !id) return;
     let cancelled = false;
-    fetchSessionInfo({ baseUrl: settings.baseUrl, token: settings.token }, agent, id)
+    fetchSessionInfo(conn, agent, id)
       .then((info) => {
         if (cancelled) return;
         setSessionLabel(info.label ?? null);
@@ -545,7 +560,7 @@ export default function ChatScreen() {
     return () => {
       cancelled = true;
     };
-  }, [settings.baseUrl, settings.token, agent, id]);
+  }, [conn.baseUrl, conn.token, agent, id]);
 
   const onRename = useCallback(() => {
     Alert.prompt(
@@ -559,7 +574,7 @@ export default function ChatScreen() {
             const next = (text ?? '').trim();
             try {
               const res = await renameSession(
-                { baseUrl: settings.baseUrl, token: settings.token },
+                conn,
                 agent,
                 id,
                 next === '' ? null : next,
@@ -574,7 +589,7 @@ export default function ChatScreen() {
       'plain-text',
       sessionLabel ?? '',
     );
-  }, [settings.baseUrl, settings.token, agent, id, sessionLabel]);
+  }, [conn.baseUrl, conn.token, agent, id, sessionLabel]);
 
   // Inspect a chat item before it's added; for BashOutput/KillShell, override
   // parentToolUseId with the original background-Bash's toolUseId so indenting
@@ -621,14 +636,14 @@ export default function ChatScreen() {
   }
 
   useEffect(() => {
-    if (!settings.baseUrl || !agent || !id) return;
+    if (!conn.baseUrl || !agent || !id) return;
     let historyIndex = 0;
     let oldestHistoryTimestamp: string | null = null;
     let historyCount = 0;
     let liveAssistantBuffer: { id: string; text: string } | null = null;
 
     const handle = openStream(
-      { baseUrl: settings.baseUrl, token: settings.token },
+      conn,
       agent,
       id,
       {
@@ -1045,7 +1060,7 @@ export default function ChatScreen() {
       // doesn't pin memory. The cache also has an LRU cap as a backstop.
       clearInlineDiffCacheForSession(agent, id);
     };
-  }, [settings.baseUrl, settings.token, agent, id, reconnectNonce, setCapabilities, clearCapabilities]);
+  }, [conn.baseUrl, conn.token, agent, id, reconnectNonce, setCapabilities, clearCapabilities]);
 
   // Preview-takeover Phase 0 — mirror the persisted master switch up to
   // the bridge any time it changes (and on every fresh connect). Runs
@@ -1203,7 +1218,7 @@ export default function ChatScreen() {
     if (uploading) return;
     setUploading(true);
     try {
-      const cfg = { baseUrl: settings.baseUrl, token: settings.token };
+      const cfg = conn;
       const result =
         kind === 'image'
           ? await pickAndUploadImage(cfg, agent, id)
@@ -1252,7 +1267,7 @@ export default function ChatScreen() {
     stickToBottomRef.current = false;
     try {
       const page = await fetchHistory(
-        { baseUrl: settings.baseUrl, token: settings.token },
+        conn,
         agent,
         id,
         { before: olderCursor.before, limit: 50 },
@@ -1303,7 +1318,7 @@ export default function ChatScreen() {
       ]);
       try {
         const result = await takeOwnership(
-          { baseUrl: settings.baseUrl, token: settings.token },
+          conn,
           agent,
           id,
         );
@@ -1332,7 +1347,7 @@ export default function ChatScreen() {
         ]);
       }
     },
-    [settings.baseUrl, settings.token, agent, id],
+    [conn.baseUrl, conn.token, agent, id],
   );
 
   const onFork = useCallback(
@@ -1348,19 +1363,21 @@ export default function ChatScreen() {
           onPress: async () => {
             try {
               const res = await forkSession(
-                { baseUrl: settings.baseUrl, token: settings.token },
+                conn,
                 agent,
                 id,
                 atMessage ? { atMessage } : undefined,
               );
-              router.replace(`/sessions/${agent}/${res.sessionId}`);
+              router.replace(
+                `/sessions/${agent}/${res.sessionId}${connBridge ? `?bridge=${connBridge.id}` : ''}`,
+              );
             } catch (err) {
               Alert.alert('Fork failed', String((err as Error).message ?? err));
             }
           },
         },
       ]);
-  }, [settings.baseUrl, settings.token, agent, id]);
+  }, [conn.baseUrl, conn.token, agent, id]);
 
   // Per-session "Disable visual verification" is the only action that
   // still lives behind the header overflow. "Open diff" moved to the
@@ -1445,7 +1462,7 @@ export default function ChatScreen() {
     // replayed ApprovalSheet, and the live chat WS is still mid-reconnect.
     try {
       await sendApproval(
-        { baseUrl: settings.baseUrl, token: settings.token },
+        conn,
         agent,
         id,
         toolUseId,
@@ -1469,7 +1486,7 @@ export default function ChatScreen() {
     return status === 'live-bridge' ? 'live · phone' : status === 'live-desktop' ? 'live · desktop' : 'idle';
   }, [connState, status]);
 
-  if (!settings.hydrated || !settings.baseUrl) {
+  if (!settings.hydrated || !conn.baseUrl) {
     return (
       <View style={[styles.centered, { backgroundColor: t.surface.base }]}>
         <ActivityIndicator />
@@ -1689,8 +1706,16 @@ export default function ChatScreen() {
                     // viewer (the old default behavior, kept as an escape
                     // hatch for "I want to see the current contents, not
                     // just what changed").
-                    onPress={() => router.push(`/sessions/${agent}/${id}/diff?path=${encoded}`)}
-                    onLongPress={() => router.push(`/sessions/${agent}/${id}/file?path=${encoded}`)}
+                    onPress={() =>
+                      router.push(
+                        `/sessions/${agent}/${id}/diff?path=${encoded}${connBridge ? `&bridge=${connBridge.id}` : ''}`,
+                      )
+                    }
+                    onLongPress={() =>
+                      router.push(
+                        `/sessions/${agent}/${id}/file?path=${encoded}${connBridge ? `&bridge=${connBridge.id}` : ''}`,
+                      )
+                    }
                     delayLongPress={350}
                     style={styles.fileRow}>
                     <Text style={[styles.fileOp, { color: o.color }]}>{o.symbol}</Text>
@@ -1745,6 +1770,10 @@ export default function ChatScreen() {
         initialNumToRender={30}
         maxToRenderPerBatch={20}
         windowSize={9}
+        // react-native-web can leave clipped rows detached (blank) until a
+        // scroll/resize event fires, so messages don't show right away on open.
+        // The clipping optimization isn't worth that on web; keep it native-only.
+        removeClippedSubviews={Platform.OS === 'web' ? false : undefined}
         ListHeaderComponent={
           loadingOlder ? (
             <View style={styles.loadingOlderRow}>
@@ -2017,6 +2046,7 @@ export default function ChatScreen() {
         onClose={() => setSidebarOpen(false)}
         currentAgent={agent}
         currentSessionId={id}
+        currentBridgeId={connBridge?.id ?? ''}
       />
       <BubbleActionMenu
         visible={bubbleMenu !== null}
@@ -2039,6 +2069,7 @@ export default function ChatScreen() {
       <CrossSessionApprovals
         currentAgent={agent}
         currentSessionId={id}
+        currentBridgeId={connBridge?.id ?? ''}
         pagerGestureRef={pagerPanRef}
       />
     </>
@@ -2471,7 +2502,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: space[3] + 2,
     paddingTop: 10,
     paddingBottom: 10,
-    fontSize: fontSize.lg,
+    // iOS Safari auto-zooms when a focused field's font-size is < 16px. Keep
+    // native at the tighter 15px, but use 16px on web to suppress the zoom.
+    fontSize: Platform.OS === 'web' ? fontSize.xl : fontSize.lg,
   },
   sendButton: {
     paddingHorizontal: space[3] + 2,

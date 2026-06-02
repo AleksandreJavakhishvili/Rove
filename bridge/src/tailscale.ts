@@ -35,6 +35,60 @@ export async function getTailscaleInfo(): Promise<TailscaleInfo> {
   }
 }
 
+/** One device on the tailnet, as surfaced to the mobile discovery flow. */
+export interface PeerInfo {
+  /** Short host name, e.g. "mac-studio". */
+  hostname: string;
+  /** Fully-qualified MagicDNS name (no trailing dot), e.g. "mac-studio.<tailnet>.ts.net". */
+  dnsName: string;
+  /** Tailscale 100.x addresses for this device. */
+  tailscaleIPs: string[];
+  online: boolean;
+  os: string;
+}
+
+export interface PeersResponse {
+  /** This bridge's own device. */
+  self: PeerInfo;
+  /** Every other device on the tailnet (bridge or not — the mobile client
+   *  probes /health to filter down to actual bridges). */
+  peers: PeerInfo[];
+  /** MagicDNS suffix for the tailnet, e.g. "<tailnet>.ts.net". */
+  tailnet: string;
+}
+
+function toPeerInfo(node: any): PeerInfo {
+  return {
+    hostname: String(node?.HostName ?? ''),
+    dnsName: String(node?.DNSName ?? '').replace(/\.$/, ''),
+    tailscaleIPs: Array.isArray(node?.TailscaleIPs) ? node.TailscaleIPs.map(String) : [],
+    online: Boolean(node?.Online),
+    os: String(node?.OS ?? ''),
+  };
+}
+
+/**
+ * Enumerate every device on the tailnet from `tailscale status --json`.
+ * Returns null if Tailscale isn't running / reachable (the caller maps that
+ * to a clean 503). 3s timeout so a wedged daemon can't hang the request.
+ */
+export async function listTailnetDevices(): Promise<PeersResponse | null> {
+  try {
+    const { stdout } = await execP('tailscale status --json', { timeout: 3000 });
+    const j: any = JSON.parse(stdout);
+    if (!j?.Self) return null;
+    const peers =
+      j.Peer && typeof j.Peer === 'object' ? Object.values(j.Peer).map(toPeerInfo) : [];
+    return {
+      self: toPeerInfo(j.Self),
+      peers,
+      tailnet: String(j?.MagicDNSSuffix ?? j?.CurrentTailnet?.Name ?? ''),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export interface TailscaleCert {
   cert: Buffer;
   key: Buffer;
