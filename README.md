@@ -5,7 +5,7 @@
 <h1 align="center">Your coding agent. In your pocket.</h1>
 
 <p align="center">
-  Drive Claude Code (and friends) on your desktop from your phone.<br/>
+  Drive Claude Code (and friends) across every machine on your tailnet — from your phone.<br/>
   No cloud relay. No third-party server. Just your tailnet.
 </p>
 
@@ -17,6 +17,7 @@
   <a href="https://aleksandrejavakhishvili.github.io/Rove/"><strong>Try the web client →</strong></a> &nbsp;·&nbsp;
   <a href="#quickstart"><strong>Quickstart</strong></a> &nbsp;·&nbsp;
   <a href="#why"><strong>Why</strong></a> &nbsp;·&nbsp;
+  <a href="#multiple-machines"><strong>Multiple machines</strong></a> &nbsp;·&nbsp;
   <a href="#live-preview"><strong>Live preview</strong></a> &nbsp;·&nbsp;
   <a href="#visual-feedback"><strong>Visual feedback</strong></a> &nbsp;·&nbsp;
   <a href="#comparison-with-similar-projects"><strong>vs. Happy</strong></a>
@@ -38,9 +39,9 @@
 `rove` is two pieces you self-host on your own machines:
 
 1. A **bridge** — tiny Node.js server you run alongside `claude` on your desktop. Drives Claude Code in-process via `@anthropic-ai/claude-agent-sdk` and exposes each session over HTTP + WebSocket on your tailnet.
-2. A **client** — either the **Expo / React Native mobile app**, or the [hosted web client](https://aleksandrejavakhishvili.github.io/Rove/) running from your browser. Both read session history, stream tool calls + diffs as they happen, surface approval prompts as bottom sheets, and preview the dev server your agent is editing right next to the chat.
+2. A **client** — either the **Expo / React Native mobile app**, or the [hosted web client](https://aleksandrejavakhishvili.github.io/Rove/) running from your browser. Both read session history, stream tool calls + diffs as they happen, surface approval prompts as bottom sheets, and preview the dev server your agent is editing right next to the chat. Run a bridge on more than one machine and the client merges them into a single inbox — see [Multiple machines](#multiple-machines).
 
-Your laptop runs the agent. Your phone (or browser) is the editor surface. Tailscale is the network. Nothing in between.
+Your machines run the agents. Your phone (or browser) is the editor surface — one inbox across all of them. Tailscale is the network. Nothing in between.
 
 ## Why
 
@@ -48,7 +49,7 @@ Existing mobile clients (Happy, etc.) work — but they route your turns through
 
 ## Status
 
-Early. Works end-to-end with Claude Code today; Codex / Aider / Gemini drivers are scaffolded but unimplemented. APIs may change.
+Early. Works end-to-end with Claude Code today, across as many machines as you run the bridge on; Codex / Aider / Gemini drivers are scaffolded but unimplemented. APIs may change.
 
 ## Architecture
 
@@ -71,6 +72,16 @@ Early. Works end-to-end with Claude Code today; Codex / Aider / Gemini drivers a
 Sessions live as JSONL files in `~/.claude/projects/`. The bridge runs Claude Code in-process via the agent SDK, streams normalized events over WebSocket, and forwards approval requests through the SDK's `canUseTool` callback straight to your phone — no subprocess hop, no separate MCP server.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full picture and [`docs/WIRE_PROTOCOL.md`](docs/WIRE_PROTOCOL.md) for the event schema.
+
+## Multiple machines
+
+Run the bridge on more than one machine — desktop, laptop, a headless mac mini in a closet — and the client folds them all into **one inbox**: every live session across your tailnet, sorted by what needs you (pending approval ▸ running ▸ recent), each row tagged with a coloured machine pill. Scope to one machine with the filter chips, or hop between any session from the in-chat switcher. Aggregation is entirely client-side — there's no central server or cross-machine sync.
+
+- **Zero-config discovery.** Add one bridge (scan its QR), and the rest of your tailnet appears on its own — the client asks that bridge for the tailnet device list (`/peers`), probes each for a running bridge, and offers to add the ones it finds. Connect a machine and the others surface immediately; install the bridge on a new headless box and it shows up within a few minutes — no QR, no token to copy.
+- **Keyless on the tailnet.** Behind `tailscale serve`, a bridge authenticates you by your Tailscale identity, so no token crosses the wire. Bearer tokens remain as a fallback for off-tailnet access (CI, a tunnel).
+- **Graceful offline.** A machine that's asleep or unreachable degrades its rows to "offline" (they stay visible); the rest keep streaming. Approvals are routed back to the machine they came from, so you can act on any box's prompt from one place.
+
+Rename, remove, check reachability, and trigger discovery from the **Machines** screen. Sessions are per-machine and aren't synced across hosts — a session lives where its files are. Want to spin up a throwaway second machine to try it? See [`docs/multi-bridge-docker-test.md`](docs/multi-bridge-docker-test.md).
 
 ## Quickstart
 
@@ -130,7 +141,7 @@ Scan the QR with Expo Go on your phone.
 
 ### 4. Connect
 
-In the app: **Settings → Scan QR from the bridge** → point camera at the QR printed by the bridge. URL and token auto-fill, the app tests the connection, and you're in.
+In the app: **Settings → Scan QR from the bridge** → point camera at the QR printed by the bridge. URL and token auto-fill, the app tests the connection, and you're in. If you run bridges on other machines on the same tailnet, they're discovered automatically — tap **Add all** when prompted (or pull-to-refresh the **Machines** screen). See [Multiple machines](#multiple-machines).
 
 ## Repo layout
 
@@ -142,14 +153,15 @@ In the app: **Settings → Scan QR from the bridge** → point camera at the QR 
 │   │   ├── runtime.ts      # Per-session lifecycle manager
 │   │   ├── agents/         # AgentDriver interface + SDK-backed Claude Code driver
 │   │   ├── permissions.ts  # Cross-session approval registry (canUseTool → user)
-│   │   ├── tailscale.ts    # Tailscale detection
+│   │   ├── tailscale.ts    # Tailscale detection + /peers tailnet enumeration
 │   │   └── ...
 │   ├── bin/                # CLI entry (for npx rove-bridge)
+│   ├── Dockerfile          # run the bridge as a throwaway tailnet device (testing)
 │   └── SETUP.md            # Deployment modes
 ├── mobile/                 # Expo React Native + web app
-│   ├── app/                # Expo Router screens
-│   ├── components/         # Chat UI, markdown, code blocks, scanner
-│   └── lib/                # Transport, store, types
+│   ├── app/                # Expo Router screens (sessions inbox, chat, machines)
+│   ├── components/         # Chat UI, markdown, code blocks, scanner, switcher
+│   └── lib/                # Transport, bridges store + aggregator, discovery, types
 └── docs/
     ├── ARCHITECTURE.md
     ├── WIRE_PROTOCOL.md
