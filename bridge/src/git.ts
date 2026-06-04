@@ -190,7 +190,16 @@ export function parseUnifiedDiff(raw: string): ParsedDiffFile[] {
 const GIT_STATUS_TIMEOUT_MS = 3000;
 
 /**
- * Run `git status --porcelain=v2 --branch -z` and parse the output.
+ * Run `git status --porcelain=v2 --branch --untracked-files=all -z` and
+ * parse the output.
+ *
+ * `--untracked-files=all` is load-bearing: the default (`normal`) collapses
+ * a fully-untracked directory into a single `? dir/` record (trailing
+ * slash), so the mobile Files tab would show one un-openable row per new
+ * folder — tapping it hits `/file` with a directory path and 400s ("not a
+ * regular file"). Listing every untracked file individually makes each row
+ * a real, openable file. Ignored files are still excluded (we don't pass
+ * `--ignored`), so the output stays bounded.
  *
  * Returns `{ isRepo: false, … }` (with sensible empty fields) when the
  * cwd isn't a git working tree, so callers don't have to special-case
@@ -205,7 +214,7 @@ export async function runGitStatus(cwd: string): Promise<GitStatusResult> {
 
   let raw: string;
   try {
-    const { stdout } = await execP('git status --porcelain=v2 --branch -z', {
+    const { stdout } = await execP('git status --porcelain=v2 --branch --untracked-files=all -z', {
       cwd,
       timeout: GIT_STATUS_TIMEOUT_MS,
       maxBuffer: 20 * 1024 * 1024,

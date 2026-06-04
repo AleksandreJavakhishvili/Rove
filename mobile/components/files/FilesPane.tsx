@@ -19,6 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -76,6 +77,7 @@ export function FilesPane({
   const [gitSectionOpen, setGitSectionOpen] = useState(true);
   const [sessionSectionOpen, setSessionSectionOpen] = useState(true);
   const [treeSectionOpen, setTreeSectionOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   const supportsGit = Boolean(capabilities?.gitStatus);
   const supportsBrowser = Boolean(capabilities?.projectBrowser);
@@ -149,6 +151,20 @@ export function FilesPane({
     setSearchLoading(false);
   }, []);
 
+  // Pull-to-refresh. Re-fetches git status, and re-runs the active search
+  // if one is open so the user can refresh results without retyping.
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const tasks: Promise<unknown>[] = [loadGit()];
+      const q = searchQuery.trim();
+      if (q.length >= 2) tasks.push(runSearch(q));
+      await Promise.all(tasks);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadGit, runSearch, searchQuery]);
+
   // Debounce search-as-you-type so we don't fire a ripgrep on every
   // keystroke. Short trims (< 2 chars) are ignored to avoid pathological
   // wide matches; clearing the box clears results immediately.
@@ -202,7 +218,15 @@ export function FilesPane({
     <View style={{ flex: 1, backgroundColor: t.surface.base }}>
       <ScrollView
         contentContainerStyle={{ paddingBottom: space[8] }}
-        keyboardShouldPersistTaps="handled">
+        keyboardShouldPersistTaps="handled"
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            tintColor={t.text.secondary}
+            colors={[t.accent.primary]}
+          />
+        }>
         {/* Search bar — backed by /search (ripgrep with grep fallback).
          *  Gated on `projectSearch` capability. Search-as-you-type with
          *  a 250ms debounce; "Clear" returns to the sectioned view. */}

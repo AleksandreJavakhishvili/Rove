@@ -1,4 +1,4 @@
-import { bridgeColor, useBridges } from '@/lib/bridges';
+import { bridgeColor, shortBridgeName, useBridges } from '@/lib/bridges';
 import { useAggregator, type TaggedSession } from '@/lib/aggregator';
 import { fontSize, radius, space, useTheme, type Theme } from '@/theme';
 import { Ionicons } from '@expo/vector-icons';
@@ -170,7 +170,7 @@ export function SessionsSidebar({
               horizontal
               showsHorizontalScrollIndicator={false}
               contentContainerStyle={styles.chipStrip}>
-              {machines.map((b) => renderChip(b.id, b.name, bridgeColor(b)))}
+              {machines.map((b) => renderChip(b.id, shortBridgeName(b), bridgeColor(b)))}
               {renderChip(null, 'All')}
             </ScrollView>
           ) : null}
@@ -228,7 +228,7 @@ export function SessionsSidebar({
                         <>
                           <View style={[styles.machineDot, { backgroundColor: bridgeColor(bridge) }]} />
                           <Text style={[styles.machineName, { color: t.text.muted }]} numberOfLines={1}>
-                            {bridge.name}
+                            {shortBridgeName(bridge)}
                           </Text>
                         </>
                       ) : null}
@@ -268,16 +268,24 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   headerTitle: { fontSize: fontSize.xl, fontWeight: '700' },
-  chipStrip: { flexDirection: 'row', gap: space[2], paddingHorizontal: space[3], paddingVertical: space[2] },
+  chipStrip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space[2],
+    paddingHorizontal: space[3],
+    paddingVertical: space[2],
+  },
   chip: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'center',
+    height: 32,
     gap: space[1],
     paddingHorizontal: space[3],
-    paddingVertical: space[1] + 1,
     borderRadius: radius.pill,
     borderWidth: StyleSheet.hairlineWidth,
-    maxWidth: 160,
+    maxWidth: 180,
   },
   chipDot: { width: 8, height: 8, borderRadius: 4 },
   chipLabel: { fontSize: fontSize.sm, fontWeight: '600', flexShrink: 1 },

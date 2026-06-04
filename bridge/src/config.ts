@@ -39,6 +39,11 @@ export const config = {
   port: Number(process.env.PORT ?? 8443),
   claudeBin: process.env.CLAUDE_BIN ?? 'claude',
   projectsDir: process.env.CLAUDE_PROJECTS_DIR ?? join(homedir(), '.claude', 'projects'),
+  /** Claude v2.x live-session registry dir (~/.claude/sessions/<pid>.json). */
+  sessionsDir: process.env.CLAUDE_SESSIONS_DIR ?? join(homedir(), '.claude', 'sessions'),
+  /** Harness task store (~/.claude/tasks/<session-id>/<n>.json) — the
+   *  authoritative source for the TaskCreate/TaskUpdate checklist. */
+  tasksDir: process.env.CLAUDE_TASKS_DIR ?? join(homedir(), '.claude', 'tasks'),
   idleTimeoutMs: Number(process.env.IDLE_TIMEOUT_MS ?? 5 * 60 * 1000),
   reaperIntervalMs: Number(process.env.REAPER_INTERVAL_MS ?? 60 * 1000),
   allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map((s) => s.trim()).filter(Boolean),

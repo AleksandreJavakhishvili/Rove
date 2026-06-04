@@ -253,6 +253,40 @@ export async function fetchTree(
   return res.json();
 }
 
+/** One row of the session's current task checklist (normalized across the
+ *  harness Task tools and the SDK's TodoWrite). */
+export interface SessionTask {
+  id: string;
+  content: string;
+  activeForm?: string;
+  status: string;
+}
+
+export interface TasksResponse {
+  agent: AgentKind;
+  id: string;
+  tasks: SessionTask[];
+}
+
+/**
+ * GET /sessions/:agent/:id/tasks — the agent's current task/progress
+ * checklist, computed bridge-side from the FULL transcript (via the SDK) so
+ * it isn't subject to the live replay window. Backs the sticky task panel.
+ */
+export async function fetchTasks(
+  cfg: BridgeConfig,
+  agent: AgentKind,
+  id: string,
+): Promise<TasksResponse> {
+  const url = `${cfg.baseUrl}/sessions/${encodeURIComponent(agent)}/${id}/tasks`;
+  const res = await fetchWithTimeout(url, { headers: authHeaders(cfg) }, 15000);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`/tasks → ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
 export interface GitStatusResponse extends GitStatusResult {
   agent: AgentKind;
   id: string;

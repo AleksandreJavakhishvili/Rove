@@ -54,6 +54,7 @@ import { requestPermissionFromUser } from '../permissions.ts';
 import { runtime } from '../runtime.ts';
 import type { HistoryEntry } from '../types.ts';
 import { attributeManySessions, getDesktopPidsForSession } from './desktopPids.ts';
+import { desktopPidsForSessionFromRegistry } from '../sessionRegistry.ts';
 import {
   CLAUDE_CODE_AGENT,
   COMPACT_TRIGGER,
@@ -1602,6 +1603,12 @@ export class ClaudeCodeSdkDriver implements AgentDriver {
   }
 
   async getDesktopPids(id: string): Promise<number[]> {
+    // Registry-first (claude v2.x): exact pid -> session id, no cwd lookup or
+    // sibling listing needed. Returns null only on pre-2.x claude, where we
+    // fall through to the legacy cwd + most-recent heuristic below.
+    const fromRegistry = await desktopPidsForSessionFromRegistry(id);
+    if (fromRegistry !== null) return fromRegistry;
+
     let info: SDKSessionInfo | undefined;
     try {
       info = await sdkGetSessionInfo(id);

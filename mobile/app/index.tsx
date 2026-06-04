@@ -2,6 +2,7 @@ import { renameSession } from '@/lib/bridge';
 import {
   bridgeColor,
   bridgeToConfig,
+  shortBridgeName,
   useHydratedBridges,
   type Bridge,
 } from '@/lib/bridges';
@@ -240,7 +241,7 @@ export default function SessionsScreen() {
                 contentContainerStyle={styles.chipStrip}>
                 {renderChip(null, 'All')}
                 {orderedMachines.map((b) =>
-                  renderChip(b.id, b.name, bridgeColor(b), machineHasPending(b.id)),
+                  renderChip(b.id, shortBridgeName(b), bridgeColor(b), machineHasPending(b.id)),
                 )}
               </ScrollView>
             ) : null}
@@ -498,13 +499,21 @@ const styles = StyleSheet.create({
     borderRadius: radius.lg,
   },
   discoverText: { fontSize: fontSize.base, fontWeight: '700' },
-  chipStrip: { flexDirection: 'row', gap: space[2], paddingHorizontal: space[3], paddingVertical: space[2] },
+  chipStrip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space[2],
+    paddingHorizontal: space[3],
+    paddingVertical: space[2],
+  },
   chip: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'center',
+    height: 32,
     gap: space[1],
     paddingHorizontal: space[3],
-    paddingVertical: space[1] + 2,
     borderRadius: radius.pill,
     borderWidth: StyleSheet.hairlineWidth,
     maxWidth: 180,

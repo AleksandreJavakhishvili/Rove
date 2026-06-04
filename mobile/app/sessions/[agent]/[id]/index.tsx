@@ -21,6 +21,7 @@ import { useScreenshotCapture } from '@/hooks/useScreenshotCapture';
 import { Markdown } from '@/components/chat/Markdown';
 import { MentionPicker } from '@/components/chat/MentionPicker';
 import { PreviewPane } from '@/components/chat/PreviewPane';
+import { TaskProgressPanel, type TaskTodo } from '@/components/chat/TaskProgressPanel';
 import { ToolResultCard, ToolUseCard } from '@/components/chat/ToolCard';
 import { FilesPane } from '@/components/files/FilesPane';
 import { SessionsSidebar } from '@/components/SessionsSidebar';
@@ -34,12 +35,14 @@ import type { PreviewFrameHandle } from '@/components/chat/PreviewFrame';
 import {
   fetchHistory,
   fetchSessionInfo,
+  fetchTasks,
   forkSession,
   openStream,
   renameSession,
   sendApproval,
   takeOwnership,
   type ConnectionState,
+  type SessionTask,
 } from '@/lib/bridge';
 import {
   clearInlineDiffCacheForSession,
@@ -295,6 +298,100 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
+/** Sum the standard token fields off a result `usage` blob into one total.
+ *  Returns undefined when the shape carries no numeric token field, so the
+ *  task panel can hide the token chip rather than show "0 tokens". */
+function totalTokensFromUsage(usage: unknown): number | undefined {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const u = usage as Record<string, unknown>;
+  let total = 0;
+  let found = false;
+  for (const k of [
+    'input_tokens',
+    'output_tokens',
+    'cache_creation_input_tokens',
+    'cache_read_input_tokens',
+  ]) {
+    const v = u[k];
+    if (typeof v === 'number') {
+      total += v;
+      found = true;
+    }
+  }
+  return found ? total : undefined;
+}
+
+/** Pull a `todos` array off a TodoWrite tool input, guarding the unknown
+ *  shape. Returns null when the input isn't a TodoWrite-style payload. */
+function readTodos(input: unknown): TaskTodo[] | null {
+  if (input && typeof input === 'object') {
+    const todos = (input as { todos?: unknown }).todos;
+    if (Array.isArray(todos)) return todos as TaskTodo[];
+  }
+  return null;
+}
+
+/**
+ * Reconstruct the agent's current task checklist from the streamed tool
+ * calls, supporting both progress-tracking tools:
+ *   - `TodoWrite` (SDK sessions): each call carries the full `todos`
+ *     snapshot, so the latest call wins.
+ *   - `TaskCreate` / `TaskUpdate` / `TaskList` (desktop-CLI sessions): the
+ *     state is incremental, so we fold creates (sequential ids that match
+ *     the harness's #1..#N) and apply updates by id. The CLI's
+ *     `task_progress` SDK messages are never written to the JSONL, so these
+ *     tool calls are the only on-disk source the bridge can tail.
+ *
+ * We read the same structured `tool_use` events the chat is built from — the
+ * bridge already did the JSONL→event conversion — so this is not the app
+ * parsing transcripts. Returns the list plus the ids of the cards to pull
+ * out of the stream (surfaced in the sticky panel instead of inline).
+ */
+function deriveTaskProgress(items: ChatItem[]): { todos: TaskTodo[]; hiddenIds: Set<string> } {
+  const tasks: { id: string; todo: TaskTodo }[] = [];
+  const taskHidden = new Set<string>();
+  let latestTodo: { id: string; todos: TaskTodo[] } | null = null;
+
+  for (const it of items) {
+    if (it.kind !== 'tool_use') continue;
+    switch (it.name) {
+      case 'TaskCreate': {
+        const inp = (it.input ?? {}) as { subject?: string; activeForm?: string; status?: string };
+        tasks.push({
+          id: String(tasks.length + 1),
+          todo: {
+            content: inp.subject,
+            activeForm: inp.activeForm,
+            status: typeof inp.status === 'string' ? inp.status : 'pending',
+          },
+        });
+        taskHidden.add(it.id);
+        break;
+      }
+      case 'TaskUpdate': {
+        const inp = (it.input ?? {}) as { taskId?: string | number; status?: string };
+        const target = tasks.find((x) => x.id === String(inp.taskId));
+        if (target && typeof inp.status === 'string') target.todo.status = inp.status;
+        taskHidden.add(it.id);
+        break;
+      }
+      case 'TaskList':
+        taskHidden.add(it.id);
+        break;
+      case 'TodoWrite': {
+        const todos = readTodos(it.input);
+        if (todos) latestTodo = { id: it.id, todos };
+        break;
+      }
+    }
+  }
+
+  // Prefer the harness Task checklist when present; else the latest TodoWrite.
+  if (tasks.length > 0) return { todos: tasks.map((x) => x.todo), hiddenIds: taskHidden };
+  if (latestTodo) return { todos: latestTodo.todos, hiddenIds: new Set([latestTodo.id]) };
+  return { todos: [], hiddenIds: new Set() };
+}
+
 function extractText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -408,6 +505,19 @@ export default function ChatScreen() {
   // text_delta, or tool_use) starts to land, and on result/process_exit. This
   // is the live preview — historical thinking blocks are not (yet) rendered.
   const [thinkingTicker, setThinkingTicker] = useState<string>('');
+  // Live elapsed ms for the in-flight turn, and the last completed run's
+  // duration + token total. Together they drive the sticky task panel's
+  // status line ("1/6 · model · 2m 4s · 44.5k tokens"). Tokens/duration are
+  // only known at run end (the SDK reports `usage` on the `result` event),
+  // so the live timer covers the in-flight case and these the idle case.
+  const [runElapsedMs, setRunElapsedMs] = useState<number>(0);
+  const [lastRun, setLastRun] = useState<{ durationMs?: number; tokens?: number }>({});
+  const runStartRef = useRef<number | null>(null);
+  // Authoritative task checklist fetched from the bridge (computed over the
+  // FULL transcript via the SDK). Null until the first fetch / when the bridge
+  // has no /tasks endpoint, in which case we fall back to folding the live
+  // window. Reset per session so we never flash the previous session's list.
+  const [fetchedTasks, setFetchedTasks] = useState<SessionTask[] | null>(null);
   // Caret position in `draft`. Tracked via TextInput.onSelectionChange so the
   // @-mention picker knows where the `@<token>` lives. Defaults to end-of-
   // draft so picker-less typing still inserts in the right place.
@@ -512,6 +622,7 @@ export default function ChatScreen() {
     pendingBashRef.current = new Map();
     shellMapRef.current = new Map();
     toolNamesRef.current = new Map();
+    setFetchedTasks(null);
   }, [agent, id]);
 
   // Tick the compaction elapsed timer once per second while `compacting`.
@@ -529,6 +640,62 @@ export default function ChatScreen() {
     }, 1000);
     return () => clearInterval(handle);
   }, [sdkStatus]);
+
+  // Tick the in-flight run timer once per second while a turn is pending.
+  // The start instant is latched on the 0→running edge so the elapsed value
+  // survives re-renders; cleared back to 0 when the run ends so the panel
+  // switches to showing the last run's final duration instead.
+  useEffect(() => {
+    if (!sending) {
+      runStartRef.current = null;
+      return;
+    }
+    if (runStartRef.current === null) runStartRef.current = Date.now();
+    const tick = () => setRunElapsedMs(Date.now() - (runStartRef.current ?? Date.now()));
+    tick();
+    const handle = setInterval(tick, 1000);
+    return () => clearInterval(handle);
+  }, [sending]);
+
+  // Count of task-tracking tool calls in the live window. Bumps whenever a
+  // new TaskCreate/Update/List or TodoWrite lands, which we use to retrigger
+  // the authoritative fetch below so the panel tracks an in-progress run.
+  const taskToolSignal = useMemo(
+    () =>
+      items.reduce(
+        (n, it) =>
+          n +
+          (it.kind === 'tool_use' &&
+          (it.name === 'TaskCreate' ||
+            it.name === 'TaskUpdate' ||
+            it.name === 'TaskList' ||
+            it.name === 'TodoWrite')
+            ? 1
+            : 0),
+        0,
+      ),
+    [items],
+  );
+
+  // Fetch the authoritative checklist from the bridge (computed over the full
+  // transcript via the SDK, so it isn't limited by the replay window). Runs on
+  // mount/session-change, on each new task tool call, and at turn boundaries
+  // (a just-flushed TaskUpdate is then visible). Failures leave `fetchedTasks`
+  // null and the UI falls back to folding the live window.
+  useEffect(() => {
+    if (!conn.baseUrl || !agent || !id) return;
+    let cancelled = false;
+    fetchTasks(conn, agent, id)
+      .then((r) => {
+        if (!cancelled) setFetchedTasks(r.tasks);
+      })
+      .catch(() => {
+        /* older bridge without /tasks — fall back to the in-window fold */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [conn.baseUrl, conn.token, agent, id, taskToolSignal, sending]);
 
   // Reconnect when the app returns to the foreground with a dead socket. iOS
   // and Android both kill long-lived WebSockets while the app is backgrounded;
@@ -974,6 +1141,9 @@ export default function ChatScreen() {
         }
         case 'result':
           setPendingTurns((n) => Math.max(0, n - 1));
+          // Latch the run's final wall-clock + token total for the sticky
+          // task panel's idle status line.
+          setLastRun({ durationMs: ev.durationMs, tokens: totalTokensFromUsage(ev.usage) });
           if (ev.subtype && ev.subtype !== 'success') {
             setItems((prev) => [
               ...prev,
@@ -1512,6 +1682,23 @@ export default function ChatScreen() {
     return status === 'live-bridge' ? 'live · phone' : status === 'live-desktop' ? 'live · desktop' : 'idle';
   }, [connState, status]);
 
+  // The sticky panel prefers the bridge's authoritative list (full transcript
+  // via the SDK); the in-window fold is the fallback when the fetch hasn't
+  // returned or the bridge is too old to expose /tasks. `hiddenIds` always
+  // comes from the fold so the corresponding cards are pulled out of the
+  // stream regardless of which source drives the display.
+  const { todos: foldedTodos, hiddenIds } = useMemo(() => deriveTaskProgress(items), [items]);
+  const currentTodos: TaskTodo[] = fetchedTasks ?? foldedTodos;
+  const visibleItems = useMemo(
+    () => (hiddenIds.size > 0 ? items.filter((it) => !hiddenIds.has(it.id)) : items),
+    [items, hiddenIds],
+  );
+  const taskModelLabel = useMemo(() => {
+    const sel = capabilities?.modelSelection;
+    if (!sel) return undefined;
+    return sel.available.find((m) => m.value === sel.current)?.label ?? modelDisplay(sel.current);
+  }, [capabilities]);
+
   if (!settings.hydrated || !conn.baseUrl) {
     return (
       <View style={[styles.centered, { backgroundColor: t.surface.base }]}>
@@ -1757,7 +1944,7 @@ export default function ChatScreen() {
       ) : null}
       <FlatList
         ref={listRef}
-        data={items}
+        data={visibleItems}
         keyExtractor={(it) => it.id}
         style={{ flex: 1 }}
         contentContainerStyle={{
@@ -1837,6 +2024,16 @@ export default function ChatScreen() {
           }
         }}
       />
+      {currentTodos.length > 0 ? (
+        <TaskProgressPanel
+          todos={currentTodos}
+          running={sending}
+          elapsedMs={runElapsedMs}
+          lastDurationMs={lastRun.durationMs}
+          lastTokens={lastRun.tokens}
+          model={taskModelLabel}
+        />
+      ) : null}
       {sdkStatus === SDK_RUN_STATUS.compacting || sending || thinkingTicker ? (
         <View
           style={[

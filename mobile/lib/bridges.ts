@@ -59,6 +59,19 @@ function hostLabel(baseUrl: string): string {
   }
 }
 
+/** Compact display label for a machine. A bridge's `name` defaults to its full
+ *  MagicDNS host (`mini.tail1234.ts.net`), which is far too long for a chip or
+ *  a row tag — strip the tailnet domain so we show just the machine (`mini`).
+ *  Custom names (anything not ending in `.ts.net`) are left untouched. */
+export function shortBridgeName(b: Pick<Bridge, 'name'>): string {
+  const name = (b.name ?? '').trim();
+  if (/\.ts\.net$/i.test(name)) {
+    const first = name.split('.')[0];
+    if (first) return first;
+  }
+  return name;
+}
+
 /** Local id for manually-added bridges (discovered ones prefer the server's
  *  `/health` bridgeId). Not security-sensitive — just needs to be unique on
  *  this device. */

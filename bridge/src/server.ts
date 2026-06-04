@@ -21,7 +21,9 @@ import {
   detectSearchBackend,
   search as searchFiles,
 } from './search.ts';
+import { foldTaskState, readSessionTasks } from './taskState.ts';
 import { inspectPid, invalidateClaudeCache } from './lsof.ts';
+import { invalidateRegistryCache } from './sessionRegistry.ts';
 import { permissions } from './permissions.ts';
 import { preflight } from './preflight.ts';
 import { printConnectionQR } from './qr.ts';
@@ -304,6 +306,7 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
   }
   if (verified.length === 0) {
     invalidateClaudeCache();
+    invalidateRegistryCache();
     return c.json({
       ok: true,
       killed: [],
@@ -334,6 +337,7 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
     if (stillAlive.length === 0) {
       console.log(`[bridge] takeover complete — all pids exited cleanly`);
       invalidateClaudeCache();
+      invalidateRegistryCache();
       return c.json({ ok: true, killed: verified, force: false });
     }
     await new Promise((r) => setTimeout(r, 200));
@@ -349,6 +353,7 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
     }
   }
   invalidateClaudeCache();
+  invalidateRegistryCache();
   return c.json({ ok: true, killed: verified, force: true });
 });
 
@@ -432,6 +437,35 @@ app.get('/sessions/:agent/:id/file', async (c) => {
       truncated: file.truncated,
       contents: file.contents,
     });
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 400);
+  }
+});
+
+// Current task/progress checklist for the session — the same list the desktop
+// CLI shows ("#1 [completed] Phase 1…").
+//
+// Two sources, cheapest-first:
+//   1. The harness task store (~/.claude/tasks/<id>/<n>.json) — authoritative
+//      and O(#tasks) tiny reads, no transcript scan. Covers TaskCreate/Update.
+//   2. Fallback: fold the FULL transcript via the SDK (`readHistory` →
+//      `getSessionMessages`). Covers TodoWrite sessions (which write no store)
+//      and any session whose store is absent. We read the whole history on
+//      purpose — the live WS replay is capped at `historyMaxEntries`, which
+//      cuts off the early `TaskCreate` calls, so a phone that only sees the
+//      replay can't reconstruct the list itself.
+app.get('/sessions/:agent/:id/tasks', async (c) => {
+  const agent = c.req.param('agent') as AgentKind;
+  const id = c.req.param('id') ?? '';
+  const driver = getDriver(agent);
+  if (!driver) return c.json({ error: 'unknown agent' }, 404);
+  const located = await driver.findSession(id);
+  if (!located) return c.json({ error: 'session not found' }, 404);
+  try {
+    const fromStore = await readSessionTasks(config.tasksDir, id);
+    if (fromStore) return c.json({ agent, id, tasks: fromStore, source: 'store' });
+    const entries = await driver.readHistory(id, { limit: 1_000_000 });
+    return c.json({ agent, id, tasks: foldTaskState(entries), source: 'transcript' });
   } catch (err) {
     return c.json({ error: (err as Error).message }, 400);
   }
