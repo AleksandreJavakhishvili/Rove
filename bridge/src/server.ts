@@ -1313,6 +1313,45 @@ async function bootstrap(): Promise<void> {
 
   injectWebSocket(server);
 
+  // A client can vanish mid-connection — a phone backgrounding, a network
+  // flip (Wi-Fi↔cellular), or a `tailscale serve` proxy recycling a socket.
+  // Node then emits 'error' on the (TLS) socket, and with no listener that
+  // surfaces as an *unhandled* 'error' event which kills the whole bridge
+  // ("read ECONNRESET at TLSWrap.onStreamRead"). Attach a per-socket guard so
+  // a dead client is a non-event. The listener is added at connect time and
+  // rides along through a WebSocket upgrade (same socket object), so it covers
+  // the WS replay case too. `secureConnection` carries the TLS socket on the
+  // HTTPS path; `connection` covers plain HTTP.
+  const IGNORABLE_NET_ERRORS = new Set(['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ECANCELED']);
+  const guardSocket = (socket: import('node:net').Socket): void => {
+    socket.on('error', (err) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      // Benign client disappearance — swallow silently. Log anything else so a
+      // real socket fault is still visible, but never let it crash the bridge.
+      if (!code || !IGNORABLE_NET_ERRORS.has(code)) {
+        console.log(`[bridge] socket error: ${(err as Error).message}`);
+      }
+    });
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (server as any).on('connection', guardSocket);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (server as any).on('secureConnection', guardSocket);
+
+  // Backstop for any socket error path the per-socket guard doesn't see (e.g.
+  // a socket emitted before our listener attaches). We swallow ONLY known
+  // benign network resets; every other uncaught error still exits non-zero so
+  // we never keep running in a corrupted state.
+  process.on('uncaughtException', (err) => {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code && IGNORABLE_NET_ERRORS.has(code)) {
+      console.log(`[bridge] ignored client socket reset (${code})`);
+      return;
+    }
+    console.error('[bridge] uncaught exception:', err);
+    process.exit(1);
+  });
+
   function shutdown(reason: string): void {
     console.log(`shutting down (${reason})`);
     runtime.stopReaper();
