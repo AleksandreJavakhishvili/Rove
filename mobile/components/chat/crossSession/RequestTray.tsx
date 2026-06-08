@@ -23,9 +23,10 @@ import Animated, {
   withTiming,
 } from 'react-native-reanimated';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { parseAskUserQuestion } from '@/components/chat/QuestionSheet';
 import { ownerLabel } from './labels';
 
-interface ApprovalTrayProps {
+interface RequestTrayProps {
   open: boolean;
   requests: PendingItem[];
   onClose: () => void;
@@ -130,10 +131,43 @@ function Row({
   onOpen: () => void;
 }) {
   const t = useTheme();
+  const owner = ownerLabel(p);
+
+  // Questions can't be answered with allow/deny — the structured picker lives
+  // in the session's <QuestionSheet>. Route the user there instead.
+  if (p.kind === 'question') {
+    const qs = parseAskUserQuestion(p.input);
+    const text = qs[0]?.question ?? 'Claude has a question for you.';
+    return (
+      <Animated.View layout={LinearTransition} exiting={FadeOut.duration(180)}>
+        <View style={[styles.row, { backgroundColor: t.surface.raised, borderColor: t.border.subtle }]}>
+          <View style={styles.rowHead}>
+            <View style={[styles.dangerDot, { backgroundColor: t.accent.primary }]} />
+            <Text style={[styles.owner, { color: t.text.secondary }]} numberOfLines={1}>
+              {owner}
+            </Text>
+            <Text style={[styles.tool, { color: t.accent.primary }]}>Question</Text>
+          </View>
+          <Text style={[styles.summary, { color: t.text.primary, fontFamily: undefined }]} numberOfLines={3}>
+            {text}
+          </Text>
+          <Pressable
+            disabled={busy}
+            onPress={onOpen}
+            style={({ pressed }) => [
+              styles.btn,
+              { backgroundColor: pressed ? t.accent.pressed : t.accent.primary, marginTop: 2 },
+            ]}>
+            <Text style={[styles.btnLabel, { color: t.accent.fg }]}>Open to answer →</Text>
+          </Pressable>
+        </View>
+      </Animated.View>
+    );
+  }
+
   const summary = summarizeToolInput(p.tool, p.input);
   const level = dangerLevel(p.tool, p.input);
   const accent = dangerColor(level, t);
-  const owner = ownerLabel(p);
   const highRisk = level === 'high';
 
   return (
@@ -212,7 +246,7 @@ function Row({
  * their exact scroll position and draft. Each row identifies the owning
  * session/repo, tool, input summary, and risk so the user never approves blind.
  */
-export function ApprovalTray({ open, requests, onClose }: ApprovalTrayProps) {
+export function RequestTray({ open, requests, onClose }: RequestTrayProps) {
   const t = useTheme();
   const { decide, isBusy } = usePermissionDecision();
 
@@ -226,7 +260,7 @@ export function ApprovalTray({ open, requests, onClose }: ApprovalTrayProps) {
         <Pressable style={[styles.backdrop, { backgroundColor: t.surface.scrim }]} onPress={onClose}>
           {/* Inner Pressable swallows taps so pressing a row doesn't dismiss. */}
           <Pressable style={[styles.sheet, { backgroundColor: t.surface.base }]} onPress={() => {}}>
-            <ErrorBoundary label="ApprovalTray">
+            <ErrorBoundary label="RequestTray">
               <View style={[styles.handle, { backgroundColor: t.text.muted }]} />
               <Text style={[styles.title, { color: t.text.primary }]}>
                 {requests.length > 0 ? `Waiting on you · ${requests.length}` : 'All caught up'}

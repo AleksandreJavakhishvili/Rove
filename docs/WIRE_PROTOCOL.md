@@ -100,6 +100,40 @@ type ClientToServer =
   | { type: 'ping' };
 ```
 
+(The full unions also carry the visual-feedback / preview-handoff frames
+and the secrets frames below — see `bridge/src/types.ts` for the canonical
+list.)
+
+### Rove Secrets round-trip (`set_secret`)
+
+When the agent calls the `mcp__rove__set_secret` tool, the bridge asks the
+user to paste a credential into a **secure sheet** (never the chat). The
+value rides a dedicated side channel and is written to disk by the bridge —
+it never becomes a `user_message`, so it never reaches the SDK stream or the
+session JSONL, and the model only ever receives a value-hidden confirmation.
+See `docs/sdd/2026-06-07-rove-secrets/`.
+
+```ts
+// Server → client
+| {
+    type: 'secret_request';
+    requestId: string;   // correlates the reply
+    name: string;        // env-var name, e.g. OPENAI_API_KEY
+    reason: string;      // shown verbatim in the sheet
+    path: string;        // resolved default destination (cwd-relative); user-editable
+  }
+
+// Client → server
+| { type: 'secret_provide'; requestId: string; value: string; path?: string }  // value: side-channel only
+| { type: 'secret_deny'; requestId: string }
+```
+
+Flow: `secret_request` → user pastes → `secret_provide` → bridge writes
+`NAME=value` into `path` (default `.env`, confined to the session cwd,
+auto-gitignored) → tool result to the agent is `ok:` / `denied:` /
+`timeout:` / `no_client:` / `error:` (value-hidden). `secret_deny` resolves
+the tool non-fatally so the agent can adapt.
+
 ## `HistoryEntry` — persisted past
 
 These come back during history replay. Drivers parse their session files into this shape:

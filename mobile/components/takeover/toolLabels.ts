@@ -1,6 +1,6 @@
 /**
  * Friendly approval-sheet copy for the visual-feedback MCP tools. The
- * ApprovalSheet receives a tool's qualified name (e.g.
+ * PermissionSheet receives a tool's qualified name (e.g.
  * `mcp__rove__take_screenshot`) and looks up the user-facing label +
  * prompt body here. Any tool not in this table renders with the
  * existing fallback rendering.

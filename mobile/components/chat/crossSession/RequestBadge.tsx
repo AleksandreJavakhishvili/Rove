@@ -12,7 +12,7 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-interface ApprovalBadgeProps {
+interface RequestBadgeProps {
   count: number;
   onPress: () => void;
   /**
@@ -43,7 +43,7 @@ const SNAP_SPRING = { damping: 22, stiffness: 360, mass: 0.6 } as const;
  * `y` is clamped into the safe band (below header, above composer) at layout
  * time, so a value stored on a taller screen degrades gracefully.
  */
-export function ApprovalBadge({ count, onPress, pagerGestureRef }: ApprovalBadgeProps) {
+export function RequestBadge({ count, onPress, pagerGestureRef }: RequestBadgeProps) {
   const t = useTheme();
   const insets = useSafeAreaInsets();
   const pos = useHydratedBadgePosition();

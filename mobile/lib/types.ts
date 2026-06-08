@@ -67,6 +67,12 @@ export type HistoryEntry =
 
 export type PermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
 
+/** Kind of a pending *user request* (the canUseTool gate pipeline). NOT the
+ *  same as PermissionMode above. `permission` = allow/deny tool approval;
+ *  `question` = an AskUserQuestion answered with a choice or free text.
+ *  Mirror of the bridge's `RequestKind`. */
+export type RequestKind = 'permission' | 'question';
+
 /** Mirror of the bridge's `SdkRunStatus`. See bridge/src/agents/types.ts. */
 export type SdkRunStatus = 'compacting' | 'requesting' | 'idle';
 export const SDK_RUN_STATUS = {
@@ -214,7 +220,7 @@ export type AgentEvent =
   | { type: 'text_delta'; role: 'assistant'; delta: string; messageId?: string; parentToolUseId?: string }
   | { type: 'tool_use'; toolUseId: string; name: string; input: unknown; parentToolUseId?: string }
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean; parentToolUseId?: string }
-  | { type: 'permission_request'; toolUseId: string; tool: string; input: unknown; parentToolUseId?: string }
+  | { type: 'user_request'; kind: RequestKind; toolUseId: string; tool: string; input: unknown; parentToolUseId?: string }
   | { type: 'permission_mode'; mode: PermissionMode }
   | { type: 'model'; model: string }
   | { type: 'rewind'; messageId: string; filesAffected: string[] }
@@ -276,6 +282,17 @@ export type ServerToClient =
       instructions: string;
       suggestedPath?: string;
       timeoutSeconds?: number;
+    }
+  // Rove Secrets: bridge asks the user to paste a credential into a
+  // secure sheet (NOT the chat). The value comes back on `secret_provide`
+  // and is written to `path` by the bridge; it never enters the SDK
+  // stream / JSONL / model context. See `docs/sdd/2026-06-07-rove-secrets/`.
+  | {
+      type: 'secret_request';
+      requestId: string;
+      name: string;
+      reason: string;
+      path: string;
     };
 
 /** Reasons a screenshot capture can fail. Mirrors the bridge constant
@@ -335,10 +352,17 @@ export const HANDOFF_MODAL_FADE_MS = 250;
 /** Cap on the optional skip-note the user attaches to a `skipped` reply. */
 export const HANDOFF_NOTE_MAX_LEN = 400;
 
+/** Rove Secrets — cap on the user-editable destination path in the secure
+ *  sheet. Mirror of the bridge constant in `bridge/src/agents/types.ts`. */
+export const SECRET_PATH_MAX_LEN = 256;
+
 export interface ClientToServer {
   type:
     | 'user_message'
-    | 'approval'
+    // Resolve a pending user request (canUseTool gate pipeline):
+    // `kind:'permission'` carries `decision`; `kind:'question'` carries
+    // `answers` (the AskUserQuestion reply).
+    | 'resolve_request'
     | 'interrupt'
     | 'ping'
     | 'set_mode'
@@ -355,10 +379,19 @@ export interface ClientToServer {
     | 'set_visual_feedback_enabled'
     // Preview-handoff Phase 1 — phone's reply to a `prepare_preview`
     // request. `status` carries the user's decision.
-    | 'prepare_preview_result';
+    | 'prepare_preview_result'
+    // Rove Secrets — phone's reply to a `secret_request`. `secret_provide`
+    // carries the pasted `value` (+ optional user-edited `path`) on a side
+    // channel that never becomes a `user_message`; `secret_deny` declines.
+    | 'secret_provide'
+    | 'secret_deny';
   content?: string;
   toolUseId?: string;
   decision?: 'allow' | 'allow_always' | 'deny';
+  // `resolve_request` fields. `kind` discriminates the resolution; `answers`
+  // carries the AskUserQuestion reply (question text → chosen label(s) / free text).
+  kind?: RequestKind;
+  answers?: Record<string, string>;
   mode?: PermissionMode;
   model?: string;
   messageId?: string;
@@ -379,6 +412,11 @@ export interface ClientToServer {
   status?: HandoffResultStatus;
   finalUrl?: string;
   note?: string;
+  // Rove Secrets — `secret_provide` carries the pasted `value` (+ optional
+  // user-edited `path`); `secret_deny` carries only `requestId` (above).
+  // `value` exists ONLY on the outbound `secret_provide` frame.
+  value?: string;
+  path?: string;
 }
 
 export interface DevServerCandidate {

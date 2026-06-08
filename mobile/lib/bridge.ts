@@ -4,6 +4,7 @@ import type {
   GitStatusResult,
   HistoryEntry,
   PreviewResponse,
+  RequestKind,
   SearchHit,
   ServerToClient,
   SessionListItem,
@@ -597,7 +598,9 @@ export function openStream(
   };
 }
 
-export interface PendingPermissionSnapshot {
+export interface PendingRequestSnapshot {
+  /** `permission` (allow/deny) or `question` (AskUserQuestion). */
+  kind: RequestKind;
   agent: AgentKind;
   sessionId: string;
   toolUseId: string;
@@ -607,29 +610,29 @@ export interface PendingPermissionSnapshot {
   createdAt: number;
 }
 
-export type PermissionEvent =
-  | { type: 'permissions_snapshot'; pending: PendingPermissionSnapshot[] }
-  | { type: 'permission_added'; pending: PendingPermissionSnapshot }
+export type RequestEvent =
+  | { type: 'requests_snapshot'; pending: PendingRequestSnapshot[] }
+  | { type: 'request_added'; pending: PendingRequestSnapshot }
   | {
-      type: 'permission_resolved';
+      type: 'request_resolved';
       agent: AgentKind;
       sessionId: string;
       toolUseId: string;
       decision: 'allow' | 'allow_always' | 'deny' | 'timeout';
     };
 
-export async function fetchPendingPermissions(
+export async function fetchPendingRequests(
   cfg: BridgeConfig,
-): Promise<PendingPermissionSnapshot[]> {
+): Promise<PendingRequestSnapshot[]> {
   // Use the shared authed/timeout path so this matches `/sessions` exactly —
   // the hand-rolled bare `fetch` here was the one call that could send a
   // mismatched/missing Authorization header (and never time out), surfacing
   // as a spurious 401 even when the rest of the app was authenticated fine.
-  const res = await fetchWithTimeout(`${cfg.baseUrl}/permissions/pending`, {
+  const res = await fetchWithTimeout(`${cfg.baseUrl}/requests/pending`, {
     headers: authHeaders(cfg),
   });
-  if (!res.ok) throw httpError('/permissions/pending', res.status);
-  const j = (await res.json()) as { pending: PendingPermissionSnapshot[] };
+  if (!res.ok) throw httpError('/requests/pending', res.status);
+  const j = (await res.json()) as { pending: PendingRequestSnapshot[] };
   return j.pending;
 }
 
@@ -643,7 +646,7 @@ export async function fetchPendingPermissions(
  * it reconnects with capped exponential backoff. Without this the stream died
  * permanently on the first disconnect — chats kept working (they reconnect on
  * reopen) which masked it, but the "N waiting" badge silently stopped updating.
- * On every (re)connect the server replays a fresh `permissions_snapshot`, so
+ * On every (re)connect the server replays a fresh `requests_snapshot`, so
  * `byKey` is brought back in sync automatically.
  *
  * `onStatus` (optional) reports connectivity so callers can reflect a stale
@@ -651,7 +654,7 @@ export async function fetchPendingPermissions(
  */
 export function openEventsStream(
   cfg: BridgeConfig,
-  onMessage: (msg: PermissionEvent) => void,
+  onMessage: (msg: RequestEvent) => void,
   onStatus?: (connected: boolean) => void,
 ): { close(): void } {
   const wsUrl = cfg.baseUrl.replace(/^http(s?)/i, 'ws$1').replace(/\/+$/, '');
@@ -672,7 +675,7 @@ export function openEventsStream(
     };
     sock.onmessage = (evt) => {
       try {
-        const msg = JSON.parse(typeof evt.data === 'string' ? evt.data : '') as PermissionEvent;
+        const msg = JSON.parse(typeof evt.data === 'string' ? evt.data : '') as RequestEvent;
         onMessage(msg);
       } catch (err) {
         console.warn('[bridge events] invalid frame', err);
@@ -731,7 +734,7 @@ export function sendApproval(
       onStateChange: (state) => {
         if (state === 'open') {
           try {
-            handle.send({ type: 'approval', toolUseId, decision });
+            handle.send({ type: 'resolve_request', kind: 'permission', toolUseId, decision });
             // Give the bridge a moment to forward, then close.
             setTimeout(() => {
               handle.close();
@@ -749,6 +752,43 @@ export function sendApproval(
     setTimeout(() => {
       handle.close();
       reject(new Error('approval send timed out'));
+    }, 5_000);
+  });
+}
+
+/**
+ * One-shot reply to a pending `AskUserQuestion` (request kind `question`).
+ * Mirrors {@link sendApproval} — used as the fallback when the live chat WS
+ * isn't open (e.g. answering a replayed question mid-reconnect).
+ */
+export function sendQuestionAnswer(
+  cfg: BridgeConfig,
+  agent: AgentKind,
+  sessionId: string,
+  toolUseId: string,
+  answers: Record<string, string>,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const handle = openStream(cfg, agent, sessionId, {
+      onMessage: () => undefined,
+      onStateChange: (state) => {
+        if (state === 'open') {
+          try {
+            handle.send({ type: 'resolve_request', kind: 'question', toolUseId, answers });
+            setTimeout(() => {
+              handle.close();
+              resolve();
+            }, 50);
+          } catch (err) {
+            handle.close();
+            reject(err as Error);
+          }
+        }
+      },
+    });
+    setTimeout(() => {
+      handle.close();
+      reject(new Error('answer send timed out'));
     }, 5_000);
   });
 }

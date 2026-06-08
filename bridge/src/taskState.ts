@@ -1,3 +1,4 @@
+import { existsSync, readdirSync } from 'node:fs';
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -89,6 +90,31 @@ function readTodos(input: unknown): TodoWriteItem[] | null {
   return null;
 }
 
+/** Flatten a tool_result `content` (string, or array of `{type:'text'}`
+ *  blocks) down to plain text. */
+function resultText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => (typeof b === 'string' ? b : ((b as { text?: unknown }).text ?? '')))
+      .filter((s): s is string => typeof s === 'string')
+      .join('');
+  }
+  return '';
+}
+
+/**
+ * The harness echoes the id it assigned in the TaskCreate *result*, e.g.
+ * `"Task #14 created successfully: …"`. That id — not the task's position in
+ * the list — is what every later `TaskUpdate.taskId` references. The create's
+ * tool *input* carries no id, so this result string is the only reliable key.
+ * Folding by list position breaks the moment the visible window doesn't start
+ * at task #1 (e.g. a resumed/compacted session where the current batch is
+ * #14..#24): the position-based ids 1..N never match the real 14..N updates,
+ * so every task is stuck `pending`.
+ */
+const TASK_CREATE_ID_RE = /Task #(\d+)/;
+
 /**
  * Reconstruct the current task checklist from a session's full history.
  *
@@ -107,16 +133,31 @@ function readTodos(input: unknown): TodoWriteItem[] | null {
  * authoritative source; this fold matches the harness's on-disk task files.
  */
 export function foldTaskState(entries: HistoryEntry[]): TaskState[] {
-  const tasks: TaskState[] = [];
+  // First pass: TaskCreate tool_use id -> the harness id from its result text.
+  const realIdByUse = new Map<string, string>();
+  for (const e of entries) {
+    if (e.kind !== 'tool_result') continue;
+    const m = TASK_CREATE_ID_RE.exec(resultText(e.content));
+    if (m) realIdByUse.set(e.toolUseId, m[1]!);
+  }
+
+  // Tasks keyed by harness id; Map insertion order = creation order.
+  const tasks = new Map<string, TaskState>();
   let latestTodos: TaskState[] | null = null;
+  let seq = 0;
 
   for (const e of entries) {
     if (e.kind !== 'tool_use') continue;
     switch (e.name) {
       case 'TaskCreate': {
         const inp = (e.input ?? {}) as { subject?: string; activeForm?: string; status?: string };
-        tasks.push({
-          id: String(tasks.length + 1),
+        seq += 1;
+        // Prefer the harness-assigned id (from the result); fall back to
+        // creation order only when the result isn't available yet (e.g. a
+        // just-issued create whose tool_result hasn't landed).
+        const id = realIdByUse.get(e.toolUseId) ?? String(seq);
+        tasks.set(id, {
+          id,
           content: inp.subject ?? '',
           ...(inp.activeForm ? { activeForm: inp.activeForm } : {}),
           status: typeof inp.status === 'string' ? inp.status : 'pending',
@@ -125,7 +166,7 @@ export function foldTaskState(entries: HistoryEntry[]): TaskState[] {
       }
       case 'TaskUpdate': {
         const inp = (e.input ?? {}) as { taskId?: string | number; status?: string; subject?: string };
-        const target = tasks.find((t) => t.id === String(inp.taskId));
+        const target = tasks.get(String(inp.taskId));
         if (target) {
           if (typeof inp.status === 'string') target.status = inp.status;
           if (typeof inp.subject === 'string') target.content = inp.subject;
@@ -148,6 +189,106 @@ export function foldTaskState(entries: HistoryEntry[]): TaskState[] {
   }
 
   // Prefer the harness Task checklist when present; else the latest TodoWrite.
-  if (tasks.length > 0) return tasks;
+  // Drop tasks the agent deleted — the desktop TUI hides them too.
+  if (tasks.size > 0) {
+    return [...tasks.values()].filter((t) => t.status !== 'deleted');
+  }
   return latestTodos ?? [];
+}
+
+/** Locate a session's raw transcript: `<projectsDir>/<slug>/<sessionId>.jsonl`.
+ *  The slug encodes the cwd, so we scan project dirs for the id rather than
+ *  reconstruct it. */
+function findTranscriptPath(projectsDir: string, sessionId: string): string | null {
+  let dirs: string[];
+  try {
+    dirs = readdirSync(projectsDir);
+  } catch {
+    return null;
+  }
+  for (const d of dirs) {
+    const candidate = join(projectsDir, d, `${sessionId}.jsonl`);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** Extract only the task-relevant entries (TaskCreate/Update/List tool_use +
+ *  tool_result, TodoWrite) from one raw JSONL line. Mirrors the wire shape
+ *  `foldTaskState` consumes; everything else is ignored. */
+function transcriptLineToTaskEntries(obj: unknown): HistoryEntry[] {
+  const o = (obj ?? {}) as { type?: string; timestamp?: string; message?: { role?: string; content?: unknown } };
+  const ts = typeof o.timestamp === 'string' ? o.timestamp : '';
+  const content = o.message?.content;
+  if (!Array.isArray(content)) return [];
+  const out: HistoryEntry[] = [];
+  if (o.type === 'assistant' && o.message?.role === 'assistant') {
+    for (const b of content as Array<Record<string, unknown>>) {
+      if (
+        b.type === 'tool_use' &&
+        (b.name === 'TaskCreate' || b.name === 'TaskUpdate' || b.name === 'TaskList' || b.name === 'TodoWrite')
+      ) {
+        out.push({
+          kind: 'tool_use',
+          uuid: String(b.id),
+          parentUuid: null,
+          timestamp: ts,
+          name: String(b.name),
+          input: b.input,
+          toolUseId: String(b.id),
+        });
+      }
+    }
+  } else if (o.type === 'user' && o.message?.role === 'user') {
+    for (const b of content as Array<Record<string, unknown>>) {
+      if (b.type === 'tool_result') {
+        out.push({
+          kind: 'tool_result',
+          uuid: `${String(b.tool_use_id)}:r`,
+          parentUuid: null,
+          timestamp: ts,
+          toolUseId: String(b.tool_use_id),
+          content: b.content,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Fold task state straight from a session's raw JSONL transcript (the FULL
+ * history). The SDK's `getSessionMessages` only returns the active
+ * post-compaction conversation chain, so when an agent's task batch predates
+ * the last compaction boundary the SDK-based fold comes back empty and the
+ * panel vanishes — even though the checklist still exists on disk. This reads
+ * the file directly so the tasks survive compaction. Cheap line pre-filter
+ * keeps it fast on multi-MB transcripts; returns [] if the file is missing.
+ */
+export async function foldTaskStateFromTranscript(
+  projectsDir: string,
+  sessionId: string,
+): Promise<TaskState[]> {
+  const path = findTranscriptPath(projectsDir, sessionId);
+  if (!path) return [];
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch {
+    return [];
+  }
+  const entries: HistoryEntry[] = [];
+  for (const line of raw.split('\n')) {
+    // Only task tool calls and their results carry "Task"/"Todo"; skip the
+    // rest without paying for a JSON.parse.
+    if (!line.includes('Task') && !line.includes('Todo')) continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    for (const e of transcriptLineToTaskEntries(obj)) entries.push(e);
+  }
+  return foldTaskState(entries);
 }

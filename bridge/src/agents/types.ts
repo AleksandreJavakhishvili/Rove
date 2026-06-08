@@ -25,6 +25,14 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
 }
 
 /**
+ * Kind of a pending *user request* (the canUseTool gate pipeline — see
+ * `requests.ts`). NOT to be confused with `PermissionMode` above (the agent's
+ * autonomy level). `permission` = an allow/deny tool approval; `question` = an
+ * `AskUserQuestion` the user answers with a choice or free text.
+ */
+export type RequestKind = 'permission' | 'question';
+
+/**
  * High-level run-state mirror of the SDK's `SDKStatus`. The SDK emits
  * `compacting` while /compact (or the auto-compact threshold) is processing,
  * `requesting` while waiting for the model's response, and `null` when idle —
@@ -424,6 +432,33 @@ export const HANDOFF_MODAL_FADE_MS = 250;
  *  the broker doesn't sprinkle `* 1000` arithmetic. */
 export const HANDOFF_DEFAULT_TIMEOUT_MS = HANDOFF_DEFAULT_TIMEOUT_SECONDS * 1000;
 
+/* -------------------------------------------------------------------
+ *  Secrets (`set_secret`) — the agent asks the user to paste a
+ *  credential into a secure sheet (NOT the chat); the bridge writes it
+ *  into a project file (default `.env`) WITHOUT the value ever entering
+ *  the chat, the model context, or the session JSONL. v1 = provisioning
+ *  only; "read / use" is an agent-runtime concern, out of Rove's scope.
+ *  See `docs/sdd/2026-06-07-rove-secrets/`.
+ * ------------------------------------------------------------------ */
+
+/** MCP tool surface — shares the `rove` server with the visual-feedback
+ *  tools, but is registered ON EVERY turn (the agent should always be
+ *  able to request a secret instead of asking for a chat paste). */
+export const SET_SECRET_MCP_TOOL_NAME = 'set_secret';
+export const SET_SECRET_MCP_TOOL_QUALIFIED =
+  `mcp__${SCREENSHOT_MCP_SERVER_NAME}__${SET_SECRET_MCP_TOOL_NAME}` as const;
+
+/** Default destination for a provided secret, relative to the session cwd. */
+export const SECRET_DEFAULT_PATH = '.env';
+/** Caps to keep the secure sheet readable and bound adversarial input. */
+export const SECRET_NAME_MAX_LEN = 128;
+export const SECRET_REASON_MAX_LEN = 400;
+export const SECRET_PATH_MAX_LEN = 256;
+/** How long the broker waits for the user to paste before resolving
+ *  `timeout`. Generous — finding a key in a password manager takes time. */
+export const SECRET_REQUEST_TIMEOUT_SECONDS = 5 * 60;
+export const SECRET_REQUEST_TIMEOUT_MS = SECRET_REQUEST_TIMEOUT_SECONDS * 1000;
+
 /** Single match returned by `GET /sessions/:agent/:id/search`. */
 export interface SearchHit {
   /** Relative-to-cwd POSIX path. */
@@ -450,7 +485,7 @@ export type AgentEvent =
   | { type: 'text_delta'; role: 'assistant'; delta: string; messageId?: string; parentToolUseId?: string }
   | { type: 'tool_use'; toolUseId: string; name: string; input: unknown; parentToolUseId?: string }
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean; parentToolUseId?: string }
-  | { type: 'permission_request'; toolUseId: string; tool: string; input: unknown; parentToolUseId?: string }
+  | { type: 'user_request'; kind: RequestKind; toolUseId: string; tool: string; input: unknown; parentToolUseId?: string }
   | { type: 'permission_mode'; mode: PermissionMode }
   | { type: 'model'; model: string }
   | { type: 'rewind'; messageId: string; filesAffected: string[] }

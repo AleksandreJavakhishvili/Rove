@@ -2,10 +2,10 @@
  * Shared tool-input summary + risk heuristics for every permission surface.
  *
  * These were previously duplicated across the sessions-list approval chips
- * (`app/index.tsx`) and the foreground `ApprovalSheet`. The cross-session
+ * (`app/index.tsx`) and the foreground `PermissionSheet`. The cross-session
  * approval tray needs the exact same one-line summary and danger cue, so the
  * logic lives here once — a user who learns "red = destructive" from the
- * ApprovalSheet should see the identical signal in the tray.
+ * PermissionSheet should see the identical signal in the tray.
  */
 
 export type DangerLevel = 'low' | 'medium' | 'high';

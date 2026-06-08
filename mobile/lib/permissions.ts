@@ -2,7 +2,7 @@ import { useCallback, useState } from 'react';
 import { Alert } from 'react-native';
 import { sendApproval } from '@/lib/bridge';
 import { bridgeToConfig, useBridgesStore } from '@/lib/bridges';
-import { usePendingPermissions } from '@/lib/store';
+import { usePendingRequests } from '@/lib/store';
 import type { PendingItem } from '@/lib/pendingSelectors';
 
 export type PermissionDecision = 'allow' | 'allow_always' | 'deny';
@@ -16,11 +16,11 @@ function busyKey(p: PendingItem): string {
  * sessions-list chips and the in-chat cross-session tray). Owns a per-request
  * "busy" set so buttons disable while the round-trip is in flight, sends the
  * decision through the bridge, and optimistically drops the request from the
- * pending store — the bridge's `permission_resolved` echo confirms shortly,
+ * pending store — the bridge's `request_resolved` echo confirms shortly,
  * but the user shouldn't stare at a stale row in the meantime.
  */
 export function usePermissionDecision() {
-  const removePending = usePendingPermissions((s) => s.removeOne);
+  const removePending = usePendingRequests((s) => s.removeOne);
   const [busy, setBusy] = useState<Set<string>>(new Set());
 
   const decide = useCallback(

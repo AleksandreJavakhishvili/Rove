@@ -33,6 +33,7 @@ import {
 } from '../screenshotBroker.ts';
 import { requestHandoff, type HandoffOutcome } from '../handoffBroker.ts';
 import { getHandoffDispatch } from '../handoffDispatch.ts';
+import { getSecretDispatch, requestSecret, type SecretOutcome } from '../secretBroker.ts';
 import { checkAndConsume } from '../screenshotRateLimit.ts';
 import {
   HANDOFF_INSTRUCTIONS_MAX_LEN,
@@ -46,11 +47,16 @@ import {
   SCREENSHOT_RESOLVED_URL_PREFIX,
   SCREENSHOT_RESOLVED_URL_UNKNOWN,
   SCREENSHOT_WAIT_MS_CAP,
+  SECRET_NAME_MAX_LEN,
+  SECRET_PATH_MAX_LEN,
+  SECRET_REASON_MAX_LEN,
+  SET_SECRET_MCP_TOOL_NAME,
+  SET_SECRET_MCP_TOOL_QUALIFIED,
   type HandoffResultStatus,
   type ScreenshotErrorReason,
 } from './types.ts';
 import { getHeadSha } from '../git.ts';
-import { requestPermissionFromUser } from '../permissions.ts';
+import { requestUserAction } from '../requests.ts';
 import { runtime } from '../runtime.ts';
 import type { HistoryEntry } from '../types.ts';
 import { attributeManySessions, getDesktopPidsForSession } from './desktopPids.ts';
@@ -71,6 +77,7 @@ import {
   type ModelOption,
   type PermissionMode,
   type ReadHistoryOptions,
+  type RequestKind,
   type SdkRunStatus,
   type WorkflowTaskStatus,
 } from './types.ts';
@@ -163,6 +170,25 @@ function textToolResult(reason: ScreenshotErrorReason, details: string) {
   };
 }
 
+/**
+ * `set_secret` text result. Same `<status>: <details>` shape as the
+ * visual-feedback helpers so the agent can pattern-match the status.
+ * `isError` is set on everything except `ok` (a deny / timeout is a
+ * non-fatal outcome the agent should adapt to, but it's still not a
+ * success). The value is NEVER included here.
+ */
+function secretTextResult(status: string, details: string) {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: `${status}: ${details}`,
+      },
+    ],
+    ...(status === 'ok' ? {} : { isError: true as const }),
+  };
+}
+
 /** Human-readable detail line for each failure reason. Total coverage
  *  is enforced by the `Record<ScreenshotErrorReason, string>` type so
  *  any new reason added to the constant produces a compile error here
@@ -230,6 +256,10 @@ function envMode(): PermissionMode {
   const raw = process.env.PERMISSION_MODE;
   return isPermissionMode(raw) ? raw : DEFAULT_PERMISSION_MODE;
 }
+
+/** File-edit tools that `acceptEdits` ("auto-accept edits") auto-approves.
+ *  Mirrors the SDK's own notion of a "file edit operation". */
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
 /** Pull out the timestamp the SDK preserved from the on-disk JSONL entry.
  *  The SDK's public `SessionMessage` type doesn't surface this field, but the
@@ -769,9 +799,15 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
 
   spawnIfNeeded(): void {
     if (this.alive) return;
-    const safeAutoAllow = (process.env.AUTO_ALLOW_TOOLS ?? 'Read Grep Glob Ls WebSearch')
-      .split(/\s+/)
-      .filter(Boolean);
+    const safeAutoAllow = [
+      ...(process.env.AUTO_ALLOW_TOOLS ?? 'Read Grep Glob Ls WebSearch')
+        .split(/\s+/)
+        .filter(Boolean),
+      // The secure paste sheet (Provide / Deny) is the real gate for
+      // `set_secret`; auto-allowing the tool avoids a redundant "allow
+      // this tool?" prompt stacked in front of the secret sheet.
+      SET_SECRET_MCP_TOOL_QUALIFIED,
+    ];
 
     const options: SdkOptions = {
       cwd: this.cwd,
@@ -779,7 +815,7 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       permissionMode: this.permissionMode as SdkPermissionMode,
       // In-process permission gate — no MCP subprocess. Routes through the
       // shared `permissions` registry so the sessions-list approval UI and
-      // the in-chat ApprovalSheet keep working unchanged.
+      // the in-chat PermissionSheet keep working unchanged.
       canUseTool: this.makeCanUseTool(),
       allowedTools: safeAutoAllow,
       includePartialMessages: true,
@@ -839,9 +875,13 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
       // and `spawnIfNeeded` runs again with the updated check).
       // Flipping OFF mid-turn still has the `isVisualFeedbackEnabled`
       // handler gate as defense in depth.
-      ...(isVisualFeedbackEnabled(this.sessionId)
-        ? { mcpServers: { rove: this.buildVisualFeedbackMcpServer() } }
-        : {}),
+      // The `rove` MCP server is always registered now — `set_secret`
+      // must be available every turn so the agent can request a credential
+      // instead of asking for a chat paste. The screenshot / preview tools
+      // inside it stay gated on `isVisualFeedbackEnabled` (see
+      // buildRoveMcpServer), so the token cost when visual feedback is off
+      // is just the single secret tool.
+      mcpServers: { rove: this.buildRoveMcpServer() },
     };
 
     this.q = query({ prompt: this.userMessageStream(), options });
@@ -881,7 +921,7 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
 
   /**
    * Build the `canUseTool` callback the SDK calls before each tool execution.
-   * Defers to `requestPermissionFromUser` so the chat ApprovalSheet, sessions-
+   * Defers to `requestUserAction` so the chat PermissionSheet, sessions-
    * list chip, and allow-always rule persistence stay byte-identical with the
    * legacy CLI/MCP path from the user's perspective.
    */
@@ -895,12 +935,70 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
    * machine-readable prefix so the agent can pattern-match the cause
    * and decide whether to retry, fall back, or proceed.
    */
-  private buildVisualFeedbackMcpServer() {
+  private buildRoveMcpServer() {
     return createSdkMcpServer({
       name: SCREENSHOT_MCP_SERVER_NAME,
       version: SCREENSHOT_MCP_SERVER_VERSION,
       tools: [
+        // Always registered — the agent should obtain credentials through
+        // this tool, never by asking the user to paste a key into chat.
+        // The value is entered in a secure sheet on the client and written
+        // to disk by the bridge; the model only ever sees a value-hidden
+        // confirmation. See `docs/sdd/2026-06-07-rove-secrets/`.
         sdkTool(
+          SET_SECRET_MCP_TOOL_NAME,
+          'Securely obtain a secret (API key, token, password, connection ' +
+            'string) from the user and write it into a project file WITHOUT ' +
+            'ever seeing the value yourself. ALWAYS use this instead of asking ' +
+            'the user to paste a secret into the chat — never request raw ' +
+            'credentials in the conversation. The user pastes the value into a ' +
+            'secure sheet in their Rove client; the bridge writes `NAME=value` ' +
+            'into the destination file (default `.env`, auto-gitignored) and ' +
+            'returns only a value-hidden confirmation. After it is stored, use ' +
+            'the secret the normal way (your app/test reads it from the ' +
+            'environment / .env at runtime). Returns `ok:` on success, or ' +
+            '`denied:` / `timeout:` / `no_client:` / `error:` with a reason.',
+          {
+            name: z
+              .string()
+              .min(1)
+              .max(SECRET_NAME_MAX_LEN)
+              .describe(
+                'Environment-variable name to store the secret under, e.g. ' +
+                  '"OPENAI_API_KEY". Letters, digits, and underscores; must not ' +
+                  'start with a digit.',
+              ),
+            reason: z
+              .string()
+              .min(1)
+              .max(SECRET_REASON_MAX_LEN)
+              .describe(
+                'Short, plain-language reason shown to the user in the sheet, ' +
+                  'e.g. "Needed to run the integration tests against OpenAI."',
+              ),
+            path: z
+              .string()
+              .max(SECRET_PATH_MAX_LEN)
+              .optional()
+              .describe(
+                'Destination file, relative to the project root. Default ' +
+                  '".env". Must stay inside the project directory; the user can ' +
+                  'change it in the sheet before pasting.',
+              ),
+          },
+          async (args) => {
+            return await this.handleSetSecret({
+              name: args.name,
+              reason: args.reason,
+              path: args.path,
+            });
+          },
+        ),
+        // Visual-feedback tools — registered only when the user has opted
+        // in, so the token cost stays at one tool when the feature is off.
+        ...(isVisualFeedbackEnabled(this.sessionId)
+          ? [
+              sdkTool(
           SCREENSHOT_MCP_TOOL_NAME,
           'Capture the live preview from the user\'s mobile client and ' +
             'receive it as an image. Use this to visually verify ' +
@@ -981,9 +1079,71 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
               timeoutSeconds: args.timeoutSeconds,
             });
           },
-        ),
+              ),
+            ]
+          : []),
       ],
     });
+  }
+
+  /**
+   * Handle a `set_secret` MCP call (Rove Secrets SDD). Gate chain:
+   *   1. Non-empty `name`.
+   *   2. A Rove client is attached (no_client otherwise — don't register
+   *      a request that's guaranteed to time out).
+   *   3. Broker round-trip → the user pastes into the secure sheet → the
+   *      bridge writes the value to disk and resolves a value-FREE outcome.
+   * The value never passes through this method; the model receives only a
+   * value-hidden text result.
+   */
+  private async handleSetSecret(args: { name: string; reason: string; path?: string }) {
+    const name = (args.name ?? '').trim();
+    if (!name) {
+      return secretTextResult('error', 'set_secret requires a non-empty `name`.');
+    }
+    const dispatch = getSecretDispatch(this.sessionId);
+    if (!dispatch) {
+      return secretTextResult(
+        'no_client',
+        'No Rove client is attached to this session to receive the secure paste prompt.',
+      );
+    }
+    let outcome: SecretOutcome;
+    try {
+      outcome = await requestSecret(
+        this.sessionId,
+        { cwd: this.cwd, name, reason: (args.reason ?? '').trim(), path: args.path },
+        dispatch,
+      );
+    } catch (err) {
+      return secretTextResult('error', String((err as Error).message ?? err));
+    }
+    if (outcome.ok) {
+      const gi = outcome.addedGitignore ? '; added it to .gitignore' : '';
+      return secretTextResult(
+        'ok',
+        `wrote ${outcome.name} to ${outcome.where} (value hidden${gi}). The value was ` +
+          `written to a project file you did not receive — read it from the environment / ` +
+          `file at runtime. Note: the file can be read like any other project file; do not ` +
+          `print or echo it.`,
+      );
+    }
+    switch (outcome.status) {
+      case 'denied':
+        return secretTextResult('denied', `User declined to provide ${outcome.name}.`);
+      case 'timeout':
+        return secretTextResult('timeout', `User did not provide ${outcome.name} in time.`);
+      case 'no_client':
+        return secretTextResult('no_client', 'No Rove client attached to receive the prompt.');
+      case 'cancelled':
+        return secretTextResult(
+          'cancelled',
+          `The ${outcome.name} request was cancelled (client disconnected).`,
+        );
+      case 'error':
+      default:
+        return secretTextResult('error', outcome.detail ?? `Failed to store ${outcome.name}.`);
+    }
   }
 
   private async handleTakeScreenshot(args: { path?: string; waitMs?: number }) {
@@ -1156,8 +1316,26 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
 
   private makeCanUseTool(): CanUseTool {
     return async (toolName, input, opts) => {
+      // AskUserQuestion is a built-in tool that wants a structured answer, not
+      // an allow/deny — route it as a `question` request so the client renders
+      // the interactive picker. Everything else is a permission gate.
+      const kind: RequestKind = toolName === 'AskUserQuestion' ? 'question' : 'permission';
+
+      // We supply `canUseTool`, so the SDK routes tool calls through us instead
+      // of applying its own permission-mode auto-allow. That means the modes
+      // the user picks (the chip/`/mode` picker) only take effect if WE honor
+      // them here — otherwise "auto-accept edits" still prompts on every edit.
+      // Questions always fall through so the picker still appears.
+      if (kind === 'permission') {
+        const mode = this.permissionMode;
+        if (mode === 'bypassPermissions' || (mode === 'acceptEdits' && EDIT_TOOLS.has(toolName))) {
+          return { behavior: 'allow', updatedInput: input };
+        }
+      }
+
       try {
-        const res = await requestPermissionFromUser({
+        const res = await requestUserAction({
+          kind,
           agent: this.agent,
           sessionId: this.sessionId,
           cwd: this.cwd,

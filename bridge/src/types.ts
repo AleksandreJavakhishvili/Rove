@@ -3,6 +3,7 @@ import type {
   AgentKind,
   HandoffResultStatus,
   PermissionMode,
+  RequestKind,
   ScreenshotErrorReason,
 } from './agents/types.ts';
 
@@ -35,7 +36,10 @@ export type HistoryEntry =
 export interface ClientToServer {
   type:
     | 'user_message'
-    | 'approval'
+    // Resolve a pending user request (the generic canUseTool gate pipeline,
+    // see requests.ts): `kind:'permission'` carries `decision`,
+    // `kind:'question'` carries `answers` (the AskUserQuestion reply).
+    | 'resolve_request'
     | 'interrupt'
     | 'ping'
     | 'set_mode'
@@ -52,10 +56,21 @@ export interface ClientToServer {
     | 'set_visual_feedback_enabled'
     // Preview-handoff Phase 1: phone replies to a `prepare_preview`
     // round-trip with the user's decision + optional `finalUrl` / note.
-    | 'prepare_preview_result';
+    | 'prepare_preview_result'
+    // Rove Secrets: client → server replies to a bridge-initiated
+    // `secret_request`. `secret_provide` carries the pasted value on a
+    // side channel that NEVER becomes a `user_message` (so it never hits
+    // the JSONL); `secret_deny` declines. See
+    // `docs/sdd/2026-06-07-rove-secrets/`.
+    | 'secret_provide'
+    | 'secret_deny';
   content?: string;
   toolUseId?: string;
   decision?: 'allow' | 'allow_always' | 'deny';
+  // `resolve_request` fields. `kind` discriminates the resolution; `answers`
+  // carries the AskUserQuestion reply (question text → chosen label(s) / free text).
+  kind?: RequestKind;
+  answers?: Record<string, string>;
   mode?: PermissionMode;
   model?: string;
   messageId?: string;
@@ -80,6 +95,13 @@ export interface ClientToServer {
   status?: HandoffResultStatus;
   finalUrl?: string;
   note?: string;
+  // Rove Secrets — `secret_provide` carries the pasted `value` (+ an
+  // optional user-edited `path`); `secret_deny` carries only `requestId`.
+  // `requestId` (above) correlates both back to the pending broker entry.
+  // `value` exists ONLY on the inbound `secret_provide` frame and is
+  // consumed by the bridge writer — never re-emitted.
+  value?: string;
+  path?: string;
 }
 
 export type ServerToClient =
@@ -113,4 +135,18 @@ export type ServerToClient =
       instructions: string;
       suggestedPath?: string;
       timeoutSeconds?: number;
+    }
+  // Rove Secrets: bridge → client request that the user paste a
+  // credential into a secure sheet (NOT the chat composer). The value
+  // comes back on `secret_provide` and is written to `path` by the
+  // bridge; it never enters the SDK stream / JSONL / model context.
+  | {
+      type: 'secret_request';
+      requestId: string;
+      /** Env-var name the agent asked for, e.g. `OPENAI_API_KEY`. */
+      name: string;
+      /** Plain-language reason, shown verbatim in the sheet. */
+      reason: string;
+      /** Resolved default destination (cwd-relative); user may edit it. */
+      path: string;
     };

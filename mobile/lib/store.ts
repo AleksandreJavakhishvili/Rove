@@ -27,7 +27,7 @@ interface Settings {
   enableVisualFeedback: boolean;
   /**
    * Sub-option (only meaningful when `enableVisualFeedback === true`).
-   * When `true`, the ApprovalSheet hides the "Always allow" button for
+   * When `true`, the PermissionSheet hides the "Always allow" button for
    * the visual-feedback tools so the user is prompted on every call.
    */
   alwaysAskBeforeCapture: boolean;
@@ -260,7 +260,7 @@ export function useHydratedPreviewPrefs(): PreviewPrefsStore {
 //
 // Lives at the app level (not per-screen) so the WebSocket stays connected as
 // the user navigates between chats. Without this, /events disconnects every
-// time the sessions list unmounts and any `permission_added` event fired while
+// time the sessions list unmounts and any `request_added` event fired while
 // the user is inside a chat is lost — exactly the bug we're fixing.
 
 // `PendingMap` / `PendingItem` and the focused-session selector live in a
@@ -288,7 +288,7 @@ interface PendingPermissionsActions {
   /** Close every stream and clear state. */
   disconnectAll(): void;
   /** Optimistically drop a request the user just decided on, before the
-   *  bridge's `permission_resolved` echo arrives. */
+   *  bridge's `request_resolved` echo arrives. */
   removeOne(bridgeId: string, agent: string, sessionId: string, toolUseId: string): void;
 }
 
@@ -309,7 +309,7 @@ function withoutBridge(byKey: PendingMap, bridgeId: string): PendingMap {
 // against reopening a stream when nothing actually changed.
 const streams = new Map<string, { connKey: string; close(): void }>();
 
-export const usePendingPermissions = create<PendingPermissionsStore>((set, get) => ({
+export const usePendingRequests = create<PendingPermissionsStore>((set, get) => ({
   byKey: {},
   connected: false,
 
@@ -334,7 +334,7 @@ export const usePendingPermissions = create<PendingPermissionsStore>((set, get) 
         bridgeToConfig(b),
         (msg) => {
           if (streams.get(b.id)?.connKey !== connKey) return; // stale stream
-          if (msg.type === 'permissions_snapshot') {
+          if (msg.type === 'requests_snapshot') {
             set((st) => {
               const byKey = withoutBridge(st.byKey, b.id);
               for (const p of msg.pending) {
@@ -343,7 +343,7 @@ export const usePendingPermissions = create<PendingPermissionsStore>((set, get) 
               }
               return { byKey, connected: true };
             });
-          } else if (msg.type === 'permission_added') {
+          } else if (msg.type === 'request_added') {
             const k = pendingKey(b.id, msg.pending.agent, msg.pending.sessionId);
             set((st) => ({
               byKey: {
@@ -351,7 +351,7 @@ export const usePendingPermissions = create<PendingPermissionsStore>((set, get) 
                 [k]: [...(st.byKey[k] ?? []), { ...msg.pending, bridgeId: b.id }],
               },
             }));
-          } else if (msg.type === 'permission_resolved') {
+          } else if (msg.type === 'request_resolved') {
             get().removeOne(b.id, msg.agent, msg.sessionId, msg.toolUseId);
           }
         },
@@ -493,7 +493,7 @@ export function useSessionCapabilities(
  *  the app root so the connection survives navigation. */
 export function useEnsurePendingPermissionsStream(): void {
   const { bridges, hydrated } = useHydratedBridges();
-  const sync = usePendingPermissions((s) => s.syncStreams);
+  const sync = usePendingRequests((s) => s.syncStreams);
   // String key so the effect re-runs only when a bridge's id/url/token changes.
   const key = bridges.map((b) => `${b.id}|${b.baseUrl}|${b.token ?? ''}`).join('§');
   useEffect(() => {

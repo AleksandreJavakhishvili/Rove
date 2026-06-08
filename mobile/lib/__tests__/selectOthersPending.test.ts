@@ -7,7 +7,7 @@ function snap(
   toolUseId: string,
   createdAt: number,
 ): PendingItem {
-  return { bridgeId, agent, sessionId, toolUseId, tool: 'Bash', input: {}, cwd: null, createdAt };
+  return { kind: 'permission', bridgeId, agent, sessionId, toolUseId, tool: 'Bash', input: {}, cwd: null, createdAt };
 }
 
 const B = 'b1';

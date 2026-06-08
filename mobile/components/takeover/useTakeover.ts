@@ -439,7 +439,7 @@ export function useTakeover(inputs: UseTakeoverInputs): UseTakeoverApi {
       // canUseTool runs in the bridge as a separate gate; for the
       // agent-direction path we treat receipt of the WS frame as
       // implicit permission_granted (the user already approved the
-      // tool via the ApprovalSheet that fired before the bridge sent
+      // tool via the PermissionSheet that fired before the bridge sent
       // the frame). Fire the granted event immediately so the reducer
       // advances to `engaging`.
       dispatch({ kind: 'permission_granted' });

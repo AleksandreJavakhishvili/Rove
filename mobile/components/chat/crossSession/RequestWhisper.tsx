@@ -1,4 +1,4 @@
-import type { PendingPermissionSnapshot } from '@/lib/bridge';
+import type { PendingRequestSnapshot } from '@/lib/bridge';
 import { fontSize, radius, space, useTheme } from '@/theme';
 import * as Haptics from 'expo-haptics';
 import { useEffect } from 'react';
@@ -7,9 +7,9 @@ import Animated, { useAnimatedStyle, useSharedValue, withTiming } from 'react-na
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ownerLabel } from './labels';
 
-interface ApprovalWhisperProps {
+interface RequestWhisperProps {
   /** The most recent background request to announce, or null to dismiss. */
-  request: PendingPermissionSnapshot | null;
+  request: PendingRequestSnapshot | null;
   onPress: () => void;
   onDismiss: () => void;
 }
@@ -25,7 +25,7 @@ const AUTO_DISMISS_MS = 4000;
  * by the controller: it only ever passes the newest request, so a fresh arrival
  * swaps the content and resets the timer rather than stacking banners.
  */
-export function ApprovalWhisper({ request, onPress, onDismiss }: ApprovalWhisperProps) {
+export function RequestWhisper({ request, onPress, onDismiss }: RequestWhisperProps) {
   const t = useTheme();
   const insets = useSafeAreaInsets();
   const progress = useSharedValue(0);

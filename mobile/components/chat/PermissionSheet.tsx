@@ -3,14 +3,14 @@ import { dangerLevel } from '@/lib/toolSummary';
 import { fontFamily, fontSize, radius, space, useTheme } from '@/theme';
 import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
-export interface PendingApproval {
+export interface PendingPermission {
   toolUseId: string;
   tool: string;
   input: unknown;
 }
 
-interface ApprovalSheetProps {
-  approval: PendingApproval | null;
+interface PermissionSheetProps {
+  approval: PendingPermission | null;
   onDecision: (decision: 'allow' | 'allow_always' | 'deny') => void;
   /**
    * When true, suppress the "Always allow" button — the user is forced to
@@ -42,7 +42,7 @@ function summarize(tool: string, input: unknown): string {
   }
 }
 
-export function ApprovalSheet({ approval, onDecision, suppressAllowAlways }: ApprovalSheetProps) {
+export function PermissionSheet({ approval, onDecision, suppressAllowAlways }: PermissionSheetProps) {
   const t = useTheme();
   if (!approval) return null;
   const danger = dangerLevel(approval.tool, approval.input);

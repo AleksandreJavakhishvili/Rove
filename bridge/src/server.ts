@@ -21,10 +21,10 @@ import {
   detectSearchBackend,
   search as searchFiles,
 } from './search.ts';
-import { foldTaskState, readSessionTasks } from './taskState.ts';
+import { foldTaskState, foldTaskStateFromTranscript, readSessionTasks } from './taskState.ts';
 import { inspectPid, invalidateClaudeCache } from './lsof.ts';
 import { invalidateRegistryCache } from './sessionRegistry.ts';
-import { permissions } from './permissions.ts';
+import { requests, type RequestResolution } from './requests.ts';
 import { preflight } from './preflight.ts';
 import { printConnectionQR } from './qr.ts';
 import { runtime } from './runtime.ts';
@@ -41,6 +41,13 @@ import {
   registerHandoffDispatch,
   unregisterHandoffDispatch,
 } from './handoffDispatch.ts';
+import {
+  cancelSecretsForSession,
+  denySecret,
+  provideSecret,
+  registerSecretDispatch,
+  unregisterSecretDispatch,
+} from './secretBroker.ts';
 import { sessionMeta } from './sessionMeta.ts';
 import { saveUpload } from './uploads.ts';
 import {
@@ -55,6 +62,7 @@ import {
   PERMISSION_MODES,
   SCREENSHOT_ERROR_REASON,
   SCREENSHOT_ERROR_REASONS,
+  SECRET_PATH_MAX_LEN,
   type AgentEvent,
   type AgentKind,
   type HandoffResultStatus,
@@ -126,7 +134,7 @@ app.delete('/devices', async (c) => {
 
 app.get('/devices', async (c) => c.json({ devices: await devices.list() }));
 
-app.get('/permissions/pending', (c) => c.json({ pending: permissions.list() }));
+app.get('/requests/pending', (c) => c.json({ pending: requests.list() }));
 
 app.get('/sessions', async (c) => {
   const ourPids = runtime.livePids();
@@ -465,7 +473,13 @@ app.get('/sessions/:agent/:id/tasks', async (c) => {
     const fromStore = await readSessionTasks(config.tasksDir, id);
     if (fromStore) return c.json({ agent, id, tasks: fromStore, source: 'store' });
     const entries = await driver.readHistory(id, { limit: 1_000_000 });
-    return c.json({ agent, id, tasks: foldTaskState(entries), source: 'transcript' });
+    const tasks = foldTaskState(entries);
+    if (tasks.length > 0) return c.json({ agent, id, tasks, source: 'transcript' });
+    // The SDK only returns the active post-compaction chain, so a checklist
+    // created before the last compaction folds to nothing here. Fall back to
+    // the raw transcript (full history) so the panel doesn't silently vanish.
+    const fromRaw = await foldTaskStateFromTranscript(config.projectsDir, id);
+    return c.json({ agent, id, tasks: fromRaw, source: 'transcript-raw' });
   } catch (err) {
     return c.json({ error: (err as Error).message }, 400);
   }
@@ -682,10 +696,15 @@ const treeQuerySchema = z.object({
 
 const clientSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('user_message'), content: z.string().min(1) }),
+  // Resolve a pending user request (the generic canUseTool gate pipeline —
+  // see requests.ts). `kind: 'permission'` carries a `decision`;
+  // `kind: 'question'` carries `answers` (the AskUserQuestion reply).
   z.object({
-    type: z.literal('approval'),
+    type: z.literal('resolve_request'),
     toolUseId: z.string(),
-    decision: z.enum(['allow', 'allow_always', 'deny']),
+    kind: z.enum(['permission', 'question']),
+    decision: z.enum(['allow', 'allow_always', 'deny']).optional(),
+    answers: z.record(z.string()).optional(),
   }),
   z.object({ type: z.literal('interrupt') }),
   z.object({ type: z.literal('ping') }),
@@ -748,6 +767,19 @@ const clientSchema = z.discriminatedUnion('type', [
     finalUrl: z.string().optional(),
     note: z.string().optional(),
   }),
+  // Rove Secrets — client replies to a bridge `secret_request`. The
+  // pasted `value` rides here on the side channel; it is never turned
+  // into a `user_message`, so it never reaches the SDK / JSONL.
+  z.object({
+    type: z.literal('secret_provide'),
+    requestId: z.string().min(1),
+    value: z.string().min(1),
+    path: z.string().max(SECRET_PATH_MAX_LEN).optional(),
+  }),
+  z.object({
+    type: z.literal('secret_deny'),
+    requestId: z.string().min(1),
+  }),
 ]);
 
 app.get(
@@ -774,6 +806,9 @@ app.get(
           timeoutSeconds?: number;
         }) => void)
       | null = null;
+    let secretDispatcher:
+      | ((args: { requestId: string; name: string; reason: string; path: string }) => void)
+      | null = null;
     // The whole onOpen handler is async (history replay + attach), but a fast
     // client (e.g. the sessions-list one-shot approval helper) sends its first
     // frame the instant the socket reports `open` — which arrives BEFORE we've
@@ -794,15 +829,16 @@ app.get(
       send(ws, { type: 'event', event: { type: 'permission_mode', mode: session.permissionMode } });
       // Replay any approvals that are already pending for this session, so a
       // user opening the chat after the prompt fired still sees the
-      // ApprovalSheet. Without this, the sessions-list chip shows the chip
+      // PermissionSheet. Without this, the sessions-list chip shows the chip
       // (it hydrates from the bridge-wide /events snapshot) but the chat
       // stays blank until the next, unrelated prompt arrives.
-      for (const p of permissions.list()) {
+      for (const p of requests.list()) {
         if (p.agent !== agent || p.sessionId !== id) continue;
         send(ws, {
           type: 'event',
           event: {
-            type: 'permission_request',
+            type: 'user_request',
+            kind: p.kind,
             toolUseId: p.toolUseId,
             tool: p.tool,
             input: p.input,
@@ -888,6 +924,21 @@ app.get(
         });
       };
       registerHandoffDispatch(id, handoffDispatcher);
+
+      // Rove Secrets: dispatcher for the `set_secret` round-trip. The SDK
+      // tool calls into the broker, which pushes a `secret_request` frame
+      // here; the user's `secret_provide` / `secret_deny` reply is routed
+      // back by the onMessage handler. The value never transits this path.
+      secretDispatcher = (args) => {
+        send(ws, {
+          type: 'secret_request',
+          requestId: args.requestId,
+          name: args.name,
+          reason: args.reason,
+          path: args.path,
+        });
+      };
+      registerSecretDispatch(id, secretDispatcher);
     };
 
     const initialize = async (ws: WSContext): Promise<void> => {
@@ -990,12 +1041,18 @@ app.get(
               }
               break;
             }
-            case 'approval': {
-              // First try resolving an MCP permission_prompt that's waiting on this id.
-              const resolved = permissions.resolve(agent, id, parsed.toolUseId!, parsed.decision!);
-              if (!resolved) {
-                // No pending MCP prompt — fall back to writing to claude's stdin (legacy path).
-                session.sendApproval(parsed.toolUseId!, parsed.decision!);
+            case 'resolve_request': {
+              const toolUseId = parsed.toolUseId!;
+              const resolution: RequestResolution =
+                parsed.kind === 'question'
+                  ? { kind: 'question', answers: parsed.answers ?? {} }
+                  : { kind: 'permission', decision: parsed.decision ?? 'deny' };
+              // First try resolving a pending request waiting on this id.
+              const resolved = requests.resolve(agent, id, toolUseId, resolution);
+              if (!resolved && resolution.kind === 'permission') {
+                // No pending request — fall back to writing to claude's stdin
+                // (legacy permission path). Questions have no stdin fallback.
+                session.sendApproval(toolUseId, resolution.decision);
               }
               break;
             }
@@ -1120,6 +1177,26 @@ app.get(
               }
               break;
             }
+            case 'secret_provide': {
+              // The pasted value is consumed straight into the bridge
+              // writer and dropped — it is deliberately NOT echoed,
+              // logged, or turned into a session turn.
+              const requestId = parsed.requestId;
+              if (typeof requestId !== 'string' || typeof parsed.value !== 'string') {
+                send(ws, { type: 'error', message: 'secret_provide missing requestId/value' });
+                break;
+              }
+              provideSecret(
+                requestId,
+                parsed.value,
+                typeof parsed.path === 'string' ? parsed.path : undefined,
+              );
+              break;
+            }
+            case 'secret_deny': {
+              if (typeof parsed.requestId === 'string') denySecret(parsed.requestId);
+              break;
+            }
           }
         } catch (err) {
           console.error(`[bridge] message handler error:`, err);
@@ -1151,6 +1228,14 @@ app.get(
           handoffDispatcher = null;
         }
         cancelHandoffsForSession(id, HANDOFF_RESULT_STATUS.cancelled);
+        // Rove Secrets: tear down the secret dispatcher and drain any
+        // pending `set_secret` request as `cancelled` so the agent's tool
+        // promise resolves instead of hanging until the timeout.
+        if (secretDispatcher) {
+          unregisterSecretDispatch(id, secretDispatcher);
+          secretDispatcher = null;
+        }
+        cancelSecretsForSession(id);
         // Per-session allow toggle (see setScreenshotAllowed / isScreenshotAllowed)
         // intentionally persists across reconnects within the same process —
         // sessions can outlive their WS subscribers (e.g. agent still running)
@@ -1188,14 +1273,14 @@ app.get(
         try {
           ws.send(
             JSON.stringify({
-              type: 'permissions_snapshot',
-              pending: permissions.list(),
+              type: 'requests_snapshot',
+              pending: requests.list(),
             }),
           );
         } catch {
           // socket likely closing
         }
-        off = permissions.onChange((e) => {
+        off = requests.onChange((e) => {
           try {
             ws.send(JSON.stringify(e));
           } catch {

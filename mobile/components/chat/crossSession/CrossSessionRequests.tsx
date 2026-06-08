@@ -1,20 +1,20 @@
-import type { PendingPermissionSnapshot } from '@/lib/bridge';
+import type { PendingRequestSnapshot } from '@/lib/bridge';
 import { selectOthersPending } from '@/lib/pendingSelectors';
-import { usePendingPermissions } from '@/lib/store';
+import { usePendingRequests } from '@/lib/store';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { GestureType } from 'react-native-gesture-handler';
-import { ApprovalBadge } from './ApprovalBadge';
-import { ApprovalTray } from './ApprovalTray';
-import { ApprovalWhisper } from './ApprovalWhisper';
+import { RequestBadge } from './RequestBadge';
+import { RequestTray } from './RequestTray';
+import { RequestWhisper } from './RequestWhisper';
 
-interface CrossSessionApprovalsProps {
+interface CrossSessionRequestsProps {
   currentAgent: string;
   currentSessionId: string;
   /** The bridge the focused chat lives on — so the focused session is excluded
    *  per machine (same agent/id on another machine is still "other"). */
   currentBridgeId: string;
   /** The chat pager's pan gesture, forwarded to the draggable badge so a
-   *  re-snap drag doesn't flip the page. See ApprovalBadge. */
+   *  re-snap drag doesn't flip the page. See RequestBadge. */
   pagerGestureRef?: React.MutableRefObject<GestureType | undefined>;
 }
 
@@ -22,17 +22,17 @@ interface CrossSessionApprovalsProps {
  * Controller for the in-chat cross-session approval surface. Mounted once per
  * chat screen. Subscribes to the app-level pending-permissions store, derives
  * the requests that belong to *other* sessions (the focused session keeps its
- * own ApprovalSheet), and drives the whisper → badge → tray flow.
+ * own PermissionSheet), and drives the whisper → badge → tray flow.
  *
  * `count === 0` is the single teardown condition: no badge, no tray, no whisper.
  */
-export function CrossSessionApprovals({
+export function CrossSessionRequests({
   currentAgent,
   currentSessionId,
   currentBridgeId,
   pagerGestureRef,
-}: CrossSessionApprovalsProps) {
-  const byKey = usePendingPermissions((s) => s.byKey);
+}: CrossSessionRequestsProps) {
+  const byKey = usePendingRequests((s) => s.byKey);
   const [trayOpen, setTrayOpen] = useState(false);
   const [whisperId, setWhisperId] = useState<string | null>(null);
   // toolUseIds we've already announced, so re-renders don't re-whisper old
@@ -63,7 +63,7 @@ export function CrossSessionApprovals({
 
   // The whisper resolves against live data, so a request approved elsewhere (or
   // drained to zero) makes the banner dismiss itself with no extra bookkeeping.
-  const whisper: PendingPermissionSnapshot | null = whisperId
+  const whisper: PendingRequestSnapshot | null = whisperId
     ? others.find((p) => p.toolUseId === whisperId) ?? null
     : null;
 
@@ -75,15 +75,15 @@ export function CrossSessionApprovals({
   if (count === 0) {
     // Drained — make sure a left-open tray closes; render nothing otherwise.
     return trayOpen ? (
-      <ApprovalTray open={false} requests={others} onClose={() => setTrayOpen(false)} />
+      <RequestTray open={false} requests={others} onClose={() => setTrayOpen(false)} />
     ) : null;
   }
 
   return (
     <>
-      <ApprovalWhisper request={whisper} onPress={openTray} onDismiss={() => setWhisperId(null)} />
-      <ApprovalBadge count={count} onPress={openTray} pagerGestureRef={pagerGestureRef} />
-      <ApprovalTray open={trayOpen} requests={others} onClose={() => setTrayOpen(false)} />
+      <RequestWhisper request={whisper} onPress={openTray} onDismiss={() => setWhisperId(null)} />
+      <RequestBadge count={count} onPress={openTray} pagerGestureRef={pagerGestureRef} />
+      <RequestTray open={trayOpen} requests={others} onClose={() => setTrayOpen(false)} />
     </>
   );
 }

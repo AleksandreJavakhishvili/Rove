@@ -15,7 +15,7 @@ import {
 import { useDiscoveryStore } from '@/lib/discovery';
 import { usePermissionDecision } from '@/lib/permissions';
 import { pendingKey } from '@/lib/pendingSelectors';
-import { usePendingPermissions } from '@/lib/store';
+import { usePendingRequests } from '@/lib/store';
 import { summarizeToolInput } from '@/lib/toolSummary';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
 import { Ionicons } from '@expo/vector-icons';
@@ -78,7 +78,7 @@ export default function SessionsScreen() {
 
   // Pending approvals across every bridge (one /events stream per machine,
   // keyed by bridgeId), so needs-me / the chip dots reflect the whole fleet.
-  const pending = usePendingPermissions((s) => s.byKey);
+  const pending = usePendingRequests((s) => s.byKey);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // null = "All"; otherwise scope to one machine. Sticky across refreshes.
   const [filterBridgeId, setFilterBridgeId] = useState<string | null>(null);

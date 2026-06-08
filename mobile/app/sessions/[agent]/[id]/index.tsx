@@ -1,5 +1,7 @@
-import { ApprovalSheet, type PendingApproval } from '@/components/chat/ApprovalSheet';
-import { CrossSessionApprovals } from '@/components/chat/crossSession/CrossSessionApprovals';
+import { PermissionSheet, type PendingPermission } from '@/components/chat/PermissionSheet';
+import { QuestionSheet } from '@/components/chat/QuestionSheet';
+import { SecretSheet } from '@/components/secrets/SecretSheet';
+import { CrossSessionRequests } from '@/components/chat/crossSession/CrossSessionRequests';
 import {
   BubbleActionMenu,
   copyAction,
@@ -40,6 +42,7 @@ import {
   openStream,
   renameSession,
   sendApproval,
+  sendQuestionAnswer,
   takeOwnership,
   type ConnectionState,
   type SessionTask,
@@ -348,30 +351,47 @@ function readTodos(input: unknown): TaskTodo[] | null {
  * out of the stream (surfaced in the sticky panel instead of inline).
  */
 function deriveTaskProgress(items: ChatItem[]): { todos: TaskTodo[]; hiddenIds: Set<string> } {
-  const tasks: { id: string; todo: TaskTodo }[] = [];
+  // The harness assigns each task an id it echoes in the TaskCreate *result*
+  // ("Task #14 created successfully: …"); later TaskUpdates reference that id.
+  // The create *input* carries none, so keying by list position breaks the
+  // moment the window doesn't start at task #1 (resumed/compacted sessions
+  // whose live batch is #14..#24): positional ids never match the real
+  // updates and every task is stuck `pending`. Mirror the bridge fold and key
+  // by the harness id parsed from the result.
+  const realIdByUse = new Map<string, string>();
+  for (const it of items) {
+    if (it.kind !== 'tool_result') continue;
+    const m = /Task #(\d+)/.exec(extractText(it.content));
+    if (m) realIdByUse.set(it.toolUseId, m[1]!);
+  }
+
+  // Tasks keyed by harness id; Map insertion order = creation order.
+  const tasks = new Map<string, TaskTodo>();
   const taskHidden = new Set<string>();
   let latestTodo: { id: string; todos: TaskTodo[] } | null = null;
+  let seq = 0;
 
   for (const it of items) {
     if (it.kind !== 'tool_use') continue;
     switch (it.name) {
       case 'TaskCreate': {
         const inp = (it.input ?? {}) as { subject?: string; activeForm?: string; status?: string };
-        tasks.push({
-          id: String(tasks.length + 1),
-          todo: {
-            content: inp.subject,
-            activeForm: inp.activeForm,
-            status: typeof inp.status === 'string' ? inp.status : 'pending',
-          },
+        seq += 1;
+        // Prefer the harness-assigned id; fall back to creation order only
+        // when the create's result hasn't streamed in yet.
+        const id = realIdByUse.get(it.toolUseId) ?? String(seq);
+        tasks.set(id, {
+          content: inp.subject,
+          activeForm: inp.activeForm,
+          status: typeof inp.status === 'string' ? inp.status : 'pending',
         });
         taskHidden.add(it.id);
         break;
       }
       case 'TaskUpdate': {
         const inp = (it.input ?? {}) as { taskId?: string | number; status?: string };
-        const target = tasks.find((x) => x.id === String(inp.taskId));
-        if (target && typeof inp.status === 'string') target.todo.status = inp.status;
+        const target = tasks.get(String(inp.taskId));
+        if (target && typeof inp.status === 'string') target.status = inp.status;
         taskHidden.add(it.id);
         break;
       }
@@ -387,7 +407,11 @@ function deriveTaskProgress(items: ChatItem[]): { todos: TaskTodo[]; hiddenIds: 
   }
 
   // Prefer the harness Task checklist when present; else the latest TodoWrite.
-  if (tasks.length > 0) return { todos: tasks.map((x) => x.todo), hiddenIds: taskHidden };
+  // Drop deleted tasks (the desktop TUI hides them too).
+  if (tasks.size > 0) {
+    const todos = [...tasks.values()].filter((td) => td.status !== 'deleted');
+    return { todos, hiddenIds: taskHidden };
+  }
   if (latestTodo) return { todos: latestTodo.todos, hiddenIds: new Set([latestTodo.id]) };
   return { todos: [], hiddenIds: new Set() };
 }
@@ -471,7 +495,20 @@ export default function ChatScreen() {
   const [connState, setConnState] = useState<ConnectionState>('connecting');
   const [pendingTurns, setPendingTurns] = useState(0);
   const [draft, setDraft] = useState('');
-  const [approval, setApproval] = useState<PendingApproval | null>(null);
+  const [approval, setApproval] = useState<PendingPermission | null>(null);
+  // Rove "ask user questions" — the in-flight AskUserQuestion request, if any.
+  // Drives the interactive <QuestionSheet>. Same request pipeline as approvals,
+  // just `kind: 'question'`.
+  const [question, setQuestion] = useState<{ toolUseId: string; input: unknown } | null>(null);
+  // Rove Secrets — the in-flight `set_secret` request, if any. Drives the
+  // secure paste sheet. Holds NO value; the pasted secret lives only inside
+  // <SecretSheet> until it's sent on the side channel.
+  const [secretReq, setSecretReq] = useState<{
+    requestId: string;
+    name: string;
+    reason: string;
+    path: string;
+  } | null>(null);
   const [changedFiles, setChangedFiles] = useState<Map<string, 'add' | 'change' | 'unlink'>>(new Map());
   const [filesPaneOpen, setFilesPaneOpen] = useState(false);
   const [sessionLabel, setSessionLabel] = useState<string | null>(null);
@@ -974,6 +1011,17 @@ export default function ChatScreen() {
               }
               takeoverFrameHandler.current(msg);
               break;
+            case 'secret_request':
+              // Rove Secrets — agent called `set_secret`. Surface the
+              // secure paste sheet; the value never touches the chat
+              // composer. Independent of the visual-feedback gate.
+              setSecretReq({
+                requestId: msg.requestId,
+                name: msg.name,
+                reason: msg.reason,
+                path: msg.path,
+              });
+              break;
           }
         },
       },
@@ -1101,8 +1149,14 @@ export default function ChatScreen() {
           });
           break;
         }
-        case 'permission_request':
-          setApproval({ toolUseId: ev.toolUseId, tool: ev.tool, input: ev.input });
+        case 'user_request':
+          // Generic gate pipeline: a `question` (AskUserQuestion) opens the
+          // interactive picker; anything else is an allow/deny permission.
+          if (ev.kind === 'question') {
+            setQuestion({ toolUseId: ev.toolUseId, input: ev.input });
+          } else {
+            setApproval({ toolUseId: ev.toolUseId, tool: ev.tool, input: ev.input });
+          }
           break;
         case 'permission_mode':
           setPermissionMode(ev.mode);
@@ -1646,7 +1700,7 @@ export default function ChatScreen() {
     // resolves the prompt without any extra round-trip.
     if (connState === 'open' && sendRef.current) {
       try {
-        sendRef.current({ type: 'approval', toolUseId, decision });
+        sendRef.current({ type: 'resolve_request', kind: 'permission', toolUseId, decision });
         return;
       } catch {
         // Live socket flaked between our check and the send — fall through.
@@ -1655,7 +1709,7 @@ export default function ChatScreen() {
 
     // Fallback: one-shot WS, same path the sessions-list approval chip uses.
     // Survives the case where the user reopens the app, taps Allow on the
-    // replayed ApprovalSheet, and the live chat WS is still mid-reconnect.
+    // replayed PermissionSheet, and the live chat WS is still mid-reconnect.
     try {
       await sendApproval(
         conn,
@@ -1672,6 +1726,29 @@ export default function ChatScreen() {
           kind: 'meta',
           text: `Approval send failed: ${String((err as Error).message)}`,
         },
+      ]);
+    }
+  }
+
+  async function onQuestionAnswer(answers: Record<string, string>) {
+    if (!question) return;
+    const toolUseId = question.toolUseId;
+    setQuestion(null);
+    // Fast path: live WS open — resolve the AskUserQuestion in place.
+    if (connState === 'open' && sendRef.current) {
+      try {
+        sendRef.current({ type: 'resolve_request', kind: 'question', toolUseId, answers });
+        return;
+      } catch {
+        // fall through to the one-shot path
+      }
+    }
+    try {
+      await sendQuestionAnswer(conn, agent, id, toolUseId, answers);
+    } catch (err) {
+      setItems((prev) => [
+        ...prev,
+        { id: `meta-${Date.now()}`, kind: 'meta', text: `Answer send failed: ${String((err as Error).message)}` },
       ]);
     }
   }
@@ -2186,7 +2263,7 @@ export default function ChatScreen() {
         </Pressable>
       </View>
       {capabilities?.permissionPrompts !== false ? (
-        <ApprovalSheet
+        <PermissionSheet
           approval={approval}
           onDecision={onApprovalDecision}
           // Preview-takeover Phase 0: when the user has opted into
@@ -2198,6 +2275,37 @@ export default function ChatScreen() {
             approval !== null &&
             isVisualFeedbackTool(approval.tool)
           }
+        />
+      ) : null}
+      {/* Rove "ask user questions" — interactive AskUserQuestion picker,
+          mounted (keyed by toolUseId) while a `question` request is pending.
+          Same request pipeline as the PermissionSheet, different kind. */}
+      {question ? (
+        <QuestionSheet
+          key={question.toolUseId}
+          input={question.input}
+          onSubmit={onQuestionAnswer}
+          onDismiss={() => onQuestionAnswer({})}
+        />
+      ) : null}
+      {/* Rove Secrets — secure paste sheet, mounted only while a
+          `set_secret` request is pending (keyed by requestId so each
+          request gets a fresh, value-free component that unmounts —
+          and drops the pasted value — on close). */}
+      {secretReq ? (
+        <SecretSheet
+          key={secretReq.requestId}
+          name={secretReq.name}
+          reason={secretReq.reason}
+          path={secretReq.path}
+          onProvide={(value, path) => {
+            sendRef.current?.({ type: 'secret_provide', requestId: secretReq.requestId, value, path });
+            setSecretReq(null);
+          }}
+          onDeny={() => {
+            sendRef.current?.({ type: 'secret_deny', requestId: secretReq.requestId });
+            setSecretReq(null);
+          }}
         />
       ) : null}
     </KeyboardAvoidingView>
@@ -2288,8 +2396,8 @@ export default function ChatScreen() {
       />
       {/* Cross-session approvals — surfaces *other* sessions' pending permission
           requests (whisper → badge → tray) without leaving this chat. The
-          focused session's own requests stay on the ApprovalSheet above. */}
-      <CrossSessionApprovals
+          focused session's own requests stay on the PermissionSheet above. */}
+      <CrossSessionRequests
         currentAgent={agent}
         currentSessionId={id}
         currentBridgeId={connBridge?.id ?? ''}
