@@ -467,6 +467,11 @@ const MODE_DESCRIPTION: Record<PermissionMode, string> = {
   bypassPermissions: 'Skip every prompt. Use with care.',
 };
 
+// File-edit tools `acceptEdits` auto-approves. Mirrors the bridge's EDIT_TOOLS
+// set (claudeCodeSdk.ts) so the in-flight auto-allow effect below decides the
+// same way the gate does.
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
 export default function ChatScreen() {
   const { agent, id, bridge } = useLocalSearchParams<{
     agent: string;
@@ -1690,6 +1695,32 @@ export default function ChatScreen() {
     },
     [],
   );
+
+  // Auto mode (bypass) — and auto-accept-edits for file-edit tools — must not
+  // leave a stale approval sheet on screen. The bridge stops emitting NEW
+  // prompts once the mode is live and drains in-flight ones on `setMode`, but
+  // the request the user is *looking at* when they flip the mode is the whole
+  // reason they reached for bypass. Resolve + dismiss it the instant a mode
+  // that would allow it takes effect (whether the switch came from here or
+  // another client). Questions are intentionally excluded — they always need a
+  // real answer. Sending `resolve_request` is idempotent with the bridge-side
+  // drain (the registry no-ops a second resolve), so this is safe either way.
+  useEffect(() => {
+    if (!approval) return;
+    const autoAllowed =
+      permissionMode === 'bypassPermissions' ||
+      (permissionMode === 'acceptEdits' && EDIT_TOOLS.has(approval.tool));
+    if (!autoAllowed) return;
+    const toolUseId = approval.toolUseId;
+    setApproval(null);
+    if (connState === 'open' && sendRef.current) {
+      try {
+        sendRef.current({ type: 'resolve_request', kind: 'permission', toolUseId, decision: 'allow' });
+      } catch {
+        // Live socket flaked; the bridge-side setMode drain still resolves it.
+      }
+    }
+  }, [approval, permissionMode, connState]);
 
   async function onApprovalDecision(decision: 'allow' | 'allow_always' | 'deny') {
     if (!approval) return;

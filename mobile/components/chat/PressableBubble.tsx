@@ -29,9 +29,9 @@ interface PressableBubbleProps {
  * Bubble container that:
  *  • Makes the whole bubble (text *and* padding) a long-press target,
  *    so the user doesn't need to land precisely on a text glyph.
- *  • Plays a subtle press-in scale animation (~0.97) on touch-down and
- *    springs back on release, giving haptic-adjacent visual feedback
- *    that the menu is about to open.
+ *  • Plays a subtle press-in scale animation (~0.985, no bounce) on
+ *    touch-down and eases back on release, giving haptic-adjacent visual
+ *    feedback that the menu is about to open.
  *
  * Markdown links inside the bubble continue to receive their own taps
  * because the inner Text components have higher-specificity press
@@ -51,8 +51,8 @@ export function PressableBubble({
     Animated.spring(scale, {
       toValue,
       useNativeDriver: true,
-      speed: 30,
-      bounciness: 6,
+      speed: 24,
+      bounciness: 0,
     }).start();
   };
 
@@ -60,7 +60,7 @@ export function PressableBubble({
     <AnimatedPressable
       onPress={onPress}
       onLongPress={onLongPress}
-      onPressIn={() => animateTo(0.97)}
+      onPressIn={() => animateTo(0.985)}
       onPressOut={() => animateTo(1)}
       delayLongPress={delayLongPress}
       style={[style, { transform: [{ scale }] }]}>

@@ -2,7 +2,7 @@ import { basename } from 'node:path';
 import { config } from './config.ts';
 import { getDriver } from './agents/registry.ts';
 import { devices } from './devices.ts';
-import type { AgentEvent, AgentKind, AgentSession } from './agents/types.ts';
+import type { AgentEvent, AgentKind, AgentSession, PermissionMode } from './agents/types.ts';
 
 function key(agent: AgentKind, sessionId: string): string {
   return `${agent}::${sessionId}`;
@@ -21,6 +21,17 @@ class SessionRuntime {
    * re-prompting "take over ownership" against the bridge's own SDK child.
    */
   private claimed = new Set<string>();
+  /**
+   * Last permission mode the user selected for each session, kept alongside
+   * `claimed` and for the same reason: the mode lives on the ephemeral session
+   * object (`permissionMode`, defaulted to `envMode()` in the constructor),
+   * which is evicted on idle (see `reap` — the SDK driver has no `pid`, so it
+   * always hits the delete branch). Without this, backgrounding the app past
+   * the idle window silently snaps the session back to `default`, so "bypass"
+   * stops being bypass and prompts return. We restore the saved mode on
+   * re-create so the user's choice survives eviction for the bridge lifetime.
+   */
+  private modes = new Map<string, PermissionMode>();
   private reaper: NodeJS.Timeout | null = null;
 
   startReaper(): void {
@@ -104,12 +115,21 @@ class SessionRuntime {
     // Restore bridge ownership across eviction — a session we claimed earlier
     // this lifetime stays claimed even though the object was recreated.
     session.claimedByBridge = this.claimed.has(k);
+    // Restore the user's last permission mode across eviction — otherwise a
+    // recycled session reverts to the env default and "bypass" silently
+    // becomes "default" after the app is backgrounded past the idle window.
+    const savedMode = this.modes.get(k);
+    if (savedMode) session.permissionMode = savedMode;
     session.on('exit', () => {
       if (this.map.get(k) === session) this.map.delete(k);
     });
-    // Hook 'result' events for off-screen push notifications. Fires only when
-    // nobody is actively watching the session via WebSocket.
+    // Hook session events: remember permission-mode changes (so they survive
+    // eviction, above) and fire off-screen push notifications on `result`.
     session.on('event', (e: AgentEvent) => {
+      if (e.type === 'permission_mode') {
+        this.modes.set(k, e.mode);
+        return;
+      }
       if (e.type !== 'result') return;
       if (session.subscribers > 0) return;
       const project = basename(located.cwd) || 'session';

@@ -56,7 +56,7 @@ import {
   type ScreenshotErrorReason,
 } from './types.ts';
 import { getHeadSha } from '../git.ts';
-import { requestUserAction } from '../requests.ts';
+import { requestUserAction, requests } from '../requests.ts';
 import { runtime } from '../runtime.ts';
 import type { HistoryEntry } from '../types.ts';
 import { attributeManySessions, getDesktopPidsForSession } from './desktopPids.ts';
@@ -1548,11 +1548,42 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
     }
     this.permissionMode = mode;
     this.emit('event', { type: 'permission_mode', mode });
+    // Switching INTO an auto-allow mode must also clear anything already
+    // waiting on the gate. `makeCanUseTool` only short-circuits *future* tool
+    // calls — a prompt that fired before the switch lives in the shared
+    // request registry and would otherwise keep its sheet up (and the turn
+    // blocked on the awaiting `canUseTool` promise) until the user taps it or
+    // it times out. That's the "bypass still asks for approvals" bug: the user
+    // flips to bypass precisely because a prompt is on screen, but the prompt
+    // never goes away. Resolve those in-flight requests the new mode allows.
+    this.autoResolvePending(mode);
     // Apply live — the SDK supports a runtime mode swap, so unlike the CLI
     // driver we don't have to kill the running query.
     if (this.q) {
       this.q.setPermissionMode(mode as SdkPermissionMode).catch((err) => {
         console.error(`[claude-sdk ${this.sessionId.slice(0, 8)}] setPermissionMode failed:`, err);
+      });
+    }
+  }
+
+  /**
+   * Auto-allow any permission requests already pending for this session that
+   * the just-applied `mode` would have allowed. Mirrors `makeCanUseTool`'s gate
+   * exactly: `bypassPermissions` allows everything; `acceptEdits` allows file
+   * edits. Questions (`AskUserQuestion`) are never auto-resolved — they need a
+   * real answer regardless of permission mode. Resolving here drains the
+   * awaiting `canUseTool` promise (so the turn proceeds) and fires the
+   * registry's `request_resolved` event so the sessions-list tray clears too.
+   */
+  private autoResolvePending(mode: PermissionMode): void {
+    if (mode !== 'bypassPermissions' && mode !== 'acceptEdits') return;
+    for (const p of requests.list()) {
+      if (p.agent !== this.agent || p.sessionId !== this.sessionId) continue;
+      if (p.kind !== 'permission') continue;
+      if (mode === 'acceptEdits' && !EDIT_TOOLS.has(p.tool)) continue;
+      requests.resolve(this.agent, this.sessionId, p.toolUseId, {
+        kind: 'permission',
+        decision: 'allow',
       });
     }
   }

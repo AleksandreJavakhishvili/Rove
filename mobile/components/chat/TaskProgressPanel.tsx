@@ -1,6 +1,6 @@
 import { fontFamily, fontSize, space, useTheme } from '@/theme';
 import { useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 /** One entry of a Claude Code `TodoWrite` call. Loosely typed because the
  *  payload arrives as the raw tool input over the wire. */
@@ -58,7 +58,10 @@ export function TaskProgressPanel({
   model,
 }: TaskProgressPanelProps) {
   const t = useTheme();
-  const [collapsed, setCollapsed] = useState(false);
+  // On mobile the panel sits right above the input, so default it collapsed to
+  // keep the keyboard area uncluttered; the user can tap the header to expand.
+  // On web there's more vertical room, so start expanded.
+  const [collapsed, setCollapsed] = useState(Platform.OS !== 'web');
   const done = todos.filter((td) => td?.status === 'completed').length;
   const total = todos.length;
 
