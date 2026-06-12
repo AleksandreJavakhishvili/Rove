@@ -113,6 +113,7 @@ const SLASH_COMMANDS: SlashCmd[] = [
   { name: '/mcp', hint: 'Manage MCP servers' },
   { name: '/clear', hint: 'Reset conversation context' },
   { name: '/init', hint: 'Initialize a CLAUDE.md for the project' },
+  { name: '/workflows', hint: 'Inspect live & completed workflow runs' },
 ];
 
 // Friendly hints for SDK-advertised commands. Anything not listed (e.g. a
@@ -575,6 +576,9 @@ export default function ChatScreen() {
   const inputRef = useRef<TextInput>(null);
   const [modePickerOpen, setModePickerOpen] = useState(false);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  // Native stand-in for the CLI's interactive `/workflows` viewer (which can't
+  // render headlessly). Lists this session's workflow runs with live state.
+  const [workflowsPanelOpen, setWorkflowsPanelOpen] = useState(false);
   // Bumped when the app comes back to the foreground while the chat WS isn't
   // open — triggers the stream effect below to tear down the stale handle and
   // open a fresh one. Without this, the socket stays in 'closed' after the OS
@@ -1355,10 +1359,10 @@ export default function ChatScreen() {
   function onSend() {
     const userText = draft.trim();
     if (!userText && attachments.length === 0) return;
-    // `/model` and `/mode` are interactive terminal commands that fail
-    // headlessly ("isn't available in this environment"). Rove has native
-    // pickers for both, so intercept the command and open the picker instead
-    // of sending a doomed message.
+    // `/model`, `/mode`, and `/workflows` are interactive terminal commands
+    // that fail headlessly ("isn't available in this environment"). Rove has
+    // native equivalents for all three, so intercept the command and open the
+    // native UI instead of sending a doomed message.
     if (attachments.length === 0) {
       const cmd = userText.toLowerCase();
       if (cmd === '/model' && capabilities?.modelSelection) {
@@ -1368,6 +1372,11 @@ export default function ChatScreen() {
       }
       if (cmd === '/mode' && capabilities?.permissionModes && capabilities.permissionModes.length > 0) {
         setModePickerOpen(true);
+        setDraft('');
+        return;
+      }
+      if (cmd === '/workflows') {
+        setWorkflowsPanelOpen(true);
         setDraft('');
         return;
       }
@@ -1998,6 +2007,37 @@ export default function ChatScreen() {
               </Pressable>
             );
           })}
+        </View>
+      ) : null}
+      {workflowsPanelOpen ? (
+        <View style={[styles.modePicker, { borderBottomColor: t.border.subtle, backgroundColor: t.surface.sunken }]}>
+          <View style={styles.workflowsPanelHeader}>
+            <Text style={[styles.workflowsPanelTitle, { color: t.text.primary }]}>
+              Workflow runs
+            </Text>
+            <Pressable onPress={() => setWorkflowsPanelOpen(false)} hitSlop={8}>
+              <Text style={{ color: t.text.muted, fontSize: fontSize.md }}>✕</Text>
+            </Pressable>
+          </View>
+          {(() => {
+            const runs = items.filter(
+              (it): it is Extract<ChatItem, { kind: 'workflow' }> => it.kind === 'workflow',
+            );
+            if (runs.length === 0) {
+              return (
+                <Text style={[styles.modeOptionDescription, { color: t.text.secondary }]}>
+                  No workflow runs in this session yet. Start one with /workflow.
+                </Text>
+              );
+            }
+            return (
+              <ScrollView style={styles.workflowsPanelList} keyboardShouldPersistTaps="always">
+                {runs.map((run) => (
+                  <WorkflowCard key={run.id} item={run} />
+                ))}
+              </ScrollView>
+            );
+          })()}
         </View>
       ) : null}
       {changedFiles.size > 0 ? (
@@ -2762,6 +2802,9 @@ const styles = StyleSheet.create({
     borderLeftWidth: 3,
     gap: space[2],
   },
+  workflowsPanelHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  workflowsPanelTitle: { fontSize: fontSize.base, fontWeight: '600' },
+  workflowsPanelList: { maxHeight: 280 },
   workflowHeader: { flexDirection: 'row', alignItems: 'center', gap: space[2] },
   workflowDot: { width: 8, height: 8, borderRadius: 4 },
   workflowTitle: { flex: 1, fontSize: fontSize.base, fontWeight: '600' },
