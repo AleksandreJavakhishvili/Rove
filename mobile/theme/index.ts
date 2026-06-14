@@ -1,5 +1,6 @@
 export { useTheme } from './useTheme';
 export {
+  brand,
   fontFamily,
   fontSize,
   fontWeight,

@@ -1,3 +1,4 @@
+import { ClaudeMark } from '@/components/ClaudeMark';
 import { renameSession } from '@/lib/bridge';
 import {
   bridgeColor,
@@ -397,7 +398,11 @@ export default function SessionsScreen() {
                         </Text>
                       </Pressable>
                     ) : null}
-                    <Text style={[styles.agentLabel, { color: t.text.muted }]}>{item.agent}</Text>
+                    {item.agent === 'claude-code' ? (
+                      <ClaudeMark size={fontSize.lg} />
+                    ) : (
+                      <Text style={[styles.agentLabel, { color: t.text.muted }]}>{item.agent}</Text>
+                    )}
                   </View>
                 </View>
               </Pressable>

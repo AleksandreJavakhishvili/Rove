@@ -852,21 +852,31 @@ app.get(
       // don't track this leave `getLiveActivity` undefined and we skip.
       if (session.getLiveActivity) {
         const live = session.getLiveActivity();
-        if (live.sdkStatus !== 'idle') {
-          send(ws, { type: 'event', event: { type: 'sdk_status', status: live.sdkStatus } });
-        }
-        if (live.thinkingText) {
-          send(ws, { type: 'event', event: { type: 'thinking', text: live.thinkingText } });
-        }
-        if (live.pendingTurns > 0) {
-          // Reuse the `status` frame to carry the in-flight count; mobile
-          // sets pendingTurns from the optional `pending` field on attach.
-          send(ws, {
-            type: 'status',
-            status: session.alive ? 'live-bridge' : 'idle',
-            ...(session.pid !== undefined ? { pid: session.pid } : {}),
-            pending: live.pendingTurns,
-          });
+        // Only replay in-flight indicators when the SDK query is actually
+        // alive. `pendingTurns` is decremented on the SDK's `result` event;
+        // a turn that ends by any other path (interrupt, takeover, mid-turn
+        // error, query teardown between turns) can leave the counter stuck
+        // at ≥1. Without this `alive` gate, a reattaching client would then
+        // restore a "Claude is thinking…" footer for a turn that finished
+        // long ago — the "stuck thinking after reopen" bug. When the query
+        // isn't alive there is definitively no turn running, so suppress it.
+        if (session.alive) {
+          if (live.sdkStatus !== 'idle') {
+            send(ws, { type: 'event', event: { type: 'sdk_status', status: live.sdkStatus } });
+          }
+          if (live.thinkingText) {
+            send(ws, { type: 'event', event: { type: 'thinking', text: live.thinkingText } });
+          }
+          if (live.pendingTurns > 0) {
+            // Reuse the `status` frame to carry the in-flight count; mobile
+            // sets pendingTurns from the optional `pending` field on attach.
+            send(ws, {
+              type: 'status',
+              status: 'live-bridge',
+              ...(session.pid !== undefined ? { pid: session.pid } : {}),
+              pending: live.pendingTurns,
+            });
+          }
         }
       }
       let eventCount = 0;

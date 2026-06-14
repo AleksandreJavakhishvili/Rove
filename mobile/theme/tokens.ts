@@ -117,6 +117,13 @@ export interface Theme {
 const accent = '#0a7ea4';
 const accentPressed = '#0066b0';
 
+/**
+ * Claude brand "clay" — the color of the sunburst mark. Fixed across themes
+ * (it reads on both light and dark surfaces), so it lives outside `light`/`dark`.
+ * Source: `--brand-clay: 14.8 63.1% 59.6%` (HSL) → #D97757.
+ */
+export const brand = { clay: '#D97757' } as const;
+
 const dark: Theme = {
   scheme: 'dark',
   surface: {

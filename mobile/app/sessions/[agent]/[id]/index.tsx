@@ -1,3 +1,4 @@
+import { ClaudeMark } from '@/components/ClaudeMark';
 import { PermissionSheet, type PendingPermission } from '@/components/chat/PermissionSheet';
 import { QuestionSheet } from '@/components/chat/QuestionSheet';
 import { SecretSheet } from '@/components/secrets/SecretSheet';
@@ -931,8 +932,14 @@ export default function ChatScreen() {
               // Bridge re-emits the in-flight turn count when we reattach
               // mid-turn (user navigated away and back). Restore pending so
               // the "Thinking…" footer shows immediately instead of waiting
-              // for the next event.
-              if (typeof msg.pending === 'number' && msg.pending > 0) {
+              // for the next event — but ONLY when the session is actually
+              // live. An `idle` status carrying a stale `pending` (a turn that
+              // ended without a `result`, e.g. interrupt/takeover) must not
+              // resurrect the spinner: that's the "stuck thinking after
+              // reopen" bug. When idle, force pending to 0 instead.
+              if (msg.status === 'idle') {
+                setPendingTurns(0);
+              } else if (typeof msg.pending === 'number' && msg.pending > 0) {
                 setPendingTurns((n) => Math.max(n, msg.pending ?? 0));
               }
               break;
@@ -1806,9 +1813,21 @@ export default function ChatScreen() {
   // stream regardless of which source drives the display.
   const { todos: foldedTodos, hiddenIds } = useMemo(() => deriveTaskProgress(items), [items]);
   const currentTodos: TaskTodo[] = fetchedTasks ?? foldedTodos;
+  // Show the sticky panel only while a turn is running AND the checklist is
+  // still incomplete. A done checklist (8/8) carries no live signal — hide it
+  // (the finished list stays in the transcript via its inline card). This also
+  // suppresses a stale complete checklist from a prior run during a fresh turn
+  // that hasn't written its own todos yet (e.g. a plain question), so we don't
+  // render the contradictory "8/8 · updating…".
+  const taskDone = currentTodos.filter((td) => td?.status === 'completed').length;
+  const taskPanelVisible =
+    sending && currentTodos.length > 0 && taskDone < currentTodos.length;
+  // The panel supersedes the latest inline checklist card while it's up; once
+  // it retires, let the card render again so the final state stays findable
+  // in the scrollback.
   const visibleItems = useMemo(
-    () => (hiddenIds.size > 0 ? items.filter((it) => !hiddenIds.has(it.id)) : items),
-    [items, hiddenIds],
+    () => (taskPanelVisible && hiddenIds.size > 0 ? items.filter((it) => !hiddenIds.has(it.id)) : items),
+    [items, hiddenIds, taskPanelVisible],
   );
   const taskModelLabel = useMemo(() => {
     const sel = capabilities?.modelSelection;
@@ -1881,9 +1900,24 @@ export default function ChatScreen() {
         }}
       />
       <View style={[styles.statusBar, { borderBottomColor: t.border.subtle }]}>
-        <Text style={[styles.statusBarText, { color: t.text.secondary }]} numberOfLines={1}>
-          {statusLabel} · {agent} · {id.slice(0, 8)} · {items.length}
-        </Text>
+        <View style={styles.statusBarLeft}>
+          {agent === 'claude-code' ? (
+            <>
+              <Text style={[styles.statusBarText, { color: t.text.secondary }]} numberOfLines={1}>
+                {statusLabel} ·{' '}
+              </Text>
+              <ClaudeMark size={fontSize.sm} />
+              <Text style={[styles.statusBarText, { color: t.text.secondary }]} numberOfLines={1}>
+                {' '}
+                · {id.slice(0, 8)} · {items.length}
+              </Text>
+            </>
+          ) : (
+            <Text style={[styles.statusBarText, { color: t.text.secondary }]} numberOfLines={1}>
+              {statusLabel} · {agent} · {id.slice(0, 8)} · {items.length}
+            </Text>
+          )}
+        </View>
         <View style={styles.chipRow}>
           {capabilities?.modelSelection ? (
             <Pressable
@@ -2172,7 +2206,7 @@ export default function ChatScreen() {
           }
         }}
       />
-      {currentTodos.length > 0 ? (
+      {taskPanelVisible ? (
         <TaskProgressPanel
           todos={currentTodos}
           running={sending}
@@ -2749,6 +2783,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     gap: space[2],
   },
+  statusBarLeft: { flexDirection: 'row', alignItems: 'center', flexShrink: 1 },
   statusBarText: { fontSize: fontSize.sm, flexShrink: 1 },
   chipRow: { flexDirection: 'row', alignItems: 'center', gap: space[1.5] },
   modeChip: {

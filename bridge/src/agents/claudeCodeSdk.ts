@@ -1537,6 +1537,13 @@ class ClaudeCodeSdkSession extends EventEmitter implements AgentSession {
     this.q.interrupt().catch((err) => {
       console.error(`[claude-sdk ${this.sessionId.slice(0, 8)}] interrupt failed:`, err);
     });
+    // A graceful interrupt closes the current turn, but the SDK may not surface
+    // a `result` event for it — which is what `trackLiveActivity` relies on to
+    // decrement `pendingTurns`. Zero the in-flight indicators here so an
+    // interrupted turn can't leave a re-attaching client stuck on "thinking".
+    this.liveActivity.pendingTurns = 0;
+    this.liveActivity.thinkingText = null;
+    this.liveActivity.sdkStatus = SDK_RUN_STATUS.idle;
     return true;
   }
 
