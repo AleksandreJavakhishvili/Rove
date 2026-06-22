@@ -474,6 +474,13 @@ const MODE_DESCRIPTION: Record<PermissionMode, string> = {
 // same way the gate does.
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
+// The built-in tool the bridge routes as a `question` instead of an allow/deny
+// gate. Single source of truth for the name, mirroring the bridge's own check
+// (`toolName === 'AskUserQuestion'` in claudeCodeSdk.ts). Its answer rides the
+// SDK `deny` channel, so its tool_result is flagged is_error even though it's a
+// successful reply — used below to keep that result from rendering as an error.
+const ASK_USER_QUESTION_TOOL = 'AskUserQuestion';
+
 export default function ChatScreen() {
   const { agent, id, bridge } = useLocalSearchParams<{
     agent: string;
@@ -872,6 +879,12 @@ export default function ChatScreen() {
   // result content is rarely informative for the user.
   function isQuietResult(item: ChatItem): boolean {
     if (item.kind !== 'tool_result') return false;
+    // AskUserQuestion answers come back as a *denied* tool call (isError=true) —
+    // that's how the SDK injects the user's reply to the model, not a failure.
+    // The user already answered in the QuestionSheet, so suppress the result
+    // card; otherwise it renders as a scary red "tool error". (See the bridge's
+    // requests.ts formatQuestionAnswers + its deny-based resolution.)
+    if (toolNamesRef.current.get(item.toolUseId) === ASK_USER_QUESTION_TOOL) return true;
     return !item.isError;
   }
 
@@ -1169,6 +1182,10 @@ export default function ChatScreen() {
           // Generic gate pipeline: a `question` (AskUserQuestion) opens the
           // interactive picker; anything else is an allow/deny permission.
           if (ev.kind === 'question') {
+            // Record the tool name now so the eventual answer result (a denied
+            // tool call) is recognised as a quiet AskUserQuestion reply even if
+            // its tool_use event never streamed — see isQuietResult.
+            toolNamesRef.current.set(ev.toolUseId, ASK_USER_QUESTION_TOOL);
             setQuestion({ toolUseId: ev.toolUseId, input: ev.input });
           } else {
             setApproval({ toolUseId: ev.toolUseId, tool: ev.tool, input: ev.input });
