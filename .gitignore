@@ -45,6 +45,9 @@ Thumbs.db
 # Local config
 .claude/
 
+# Git worktrees
+.worktrees/
+
 # Source recordings for demo GIFs (output .gif files are committed)
 scripts/demo/raw/
 scripts/demo/.*-palette.png
