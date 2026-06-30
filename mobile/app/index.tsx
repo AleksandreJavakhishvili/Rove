@@ -18,6 +18,8 @@ import { usePermissionDecision } from '@/lib/permissions';
 import { pendingKey } from '@/lib/pendingSelectors';
 import { usePendingRequests } from '@/lib/store';
 import { summarizeToolInput } from '@/lib/toolSummary';
+import { useSessionFilters } from '@/hooks/useSessionFilters';
+import { SessionFilterSheet } from '@/components/SessionFilterSheet';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
 import { Ionicons } from '@expo/vector-icons';
 import { router, Stack, type Href } from 'expo-router';
@@ -83,6 +85,8 @@ export default function SessionsScreen() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // null = "All"; otherwise scope to one machine. Sticky across refreshes.
   const [filterBridgeId, setFilterBridgeId] = useState<string | null>(null);
+  const [filterSheetVisible, setFilterSheetVisible] = useState(false);
+  const { filters, addFilter, removeFilter, clearFilters, applyFilters, load: loadFilters } = useSessionFilters();
   const { decide, isBusy } = usePermissionDecision();
 
   // Fan out on first hydrate and whenever the set of bridges changes.
@@ -90,6 +94,8 @@ export default function SessionsScreen() {
   useEffect(() => {
     if (hydrated && bridges.length > 0) void refresh();
   }, [hydrated, bridgeIds, refresh]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => { void loadFilters(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const bridgeById = useMemo(
     () => new Map<string, Bridge>(bridges.map((b) => [b.id, b])),
@@ -128,10 +134,10 @@ export default function SessionsScreen() {
     [allSessions, pending],
   );
 
-  const visible = useMemo(
-    () => (filterBridgeId ? sorted.filter((s) => s.bridgeId === filterBridgeId) : sorted),
-    [sorted, filterBridgeId],
-  );
+  const visible = useMemo(() => {
+    const byMachine = filterBridgeId ? sorted.filter((s) => s.bridgeId === filterBridgeId) : sorted;
+    return applyFilters(byMachine);
+  }, [sorted, filterBridgeId, applyFilters, filters]);
 
   const totalPending = Object.values(pending).reduce((n, list) => n + list.length, 0);
   const sessionsWithPending = Object.keys(pending).length;
@@ -196,6 +202,24 @@ export default function SessionsScreen() {
           headerTitle: 'Sessions',
           headerRight: () => (
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: space[1] }}>
+              <Pressable onPress={() => setFilterSheetVisible(true)} hitSlop={16} style={{ padding: space[2], position: 'relative' }}>
+                <Ionicons
+                  name={filters.length > 0 ? 'funnel' : 'funnel-outline'}
+                  size={fontSize['2xl']}
+                  color={filters.length > 0 ? t.accent.primary : t.text.primary}
+                />
+                {filters.length > 0 && (
+                  <View style={{
+                    position: 'absolute', top: 2, right: 2,
+                    minWidth: 16, height: 16, borderRadius: 8,
+                    backgroundColor: t.accent.primary,
+                    alignItems: 'center', justifyContent: 'center',
+                    paddingHorizontal: 3,
+                  }}>
+                    <Text style={{ fontSize: 10, fontWeight: '700', color: t.accent.fg }}>{filters.length}</Text>
+                  </View>
+                )}
+              </Pressable>
               <Pressable onPress={() => router.push('/machines' as Href)} hitSlop={12} style={{ paddingHorizontal: space[2] }}>
                 <Ionicons name="hardware-chip-outline" size={fontSize['2xl']} color={t.text.primary} />
               </Pressable>
@@ -477,6 +501,15 @@ export default function SessionsScreen() {
             </View>
           );
         }}
+      />
+      <SessionFilterSheet
+        visible={filterSheetVisible}
+        onClose={() => setFilterSheetVisible(false)}
+        filters={filters}
+        onAddFilter={addFilter}
+        onRemoveFilter={removeFilter}
+        onClearAll={clearFilters}
+        sessions={Object.values(byBridge).flat()}
       />
     </>
   );
