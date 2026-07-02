@@ -18,8 +18,15 @@ import { usePermissionDecision } from '@/lib/permissions';
 import { pendingKey } from '@/lib/pendingSelectors';
 import { usePendingRequests } from '@/lib/store';
 import { summarizeToolInput } from '@/lib/toolSummary';
+import { useDefaultCollapsed } from '@/hooks/useDefaultCollapsed';
+import { useExcludeSubagents, isSubagentSession } from '@/hooks/useExcludeSubagents';
+import { useRepoPath, matchesRepoPath } from '@/hooks/useRepoPath';
 import { useSessionFilters } from '@/hooks/useSessionFilters';
+import { useSessionImport } from '@/hooks/useSessionImport';
+import { useViewMode, type ViewMode } from '@/hooks/useViewMode';
 import { SessionFilterSheet } from '@/components/SessionFilterSheet';
+import { ImportProgressBanner } from '@/components/ImportProgressBanner';
+import { sessionDb } from '@/lib/sessionDb';
 import { fontFamily, fontSize, radius, space, useTheme, type Theme } from '@/theme';
 import { Ionicons } from '@expo/vector-icons';
 import { router, Stack, type Href } from 'expo-router';
@@ -35,6 +42,9 @@ import {
   Text,
   View,
 } from 'react-native';
+
+type ListItem = TaggedSession | { _header: true; label: string; count: number; collapsed: boolean };
+const VIEW_MODE_CYCLE: ViewMode[] = ['flat', 'grouped-recency', 'grouped-alpha'];
 
 function statusBadge(s: TaggedSession, t: Theme) {
   switch (s.status) {
@@ -88,56 +98,138 @@ export default function SessionsScreen() {
   const [filterSheetVisible, setFilterSheetVisible] = useState(false);
   const { filters, addFilter, removeFilter, clearFilters, applyFilters, load: loadFilters } = useSessionFilters();
   const { decide, isBusy } = usePermissionDecision();
+  const runImport = useSessionImport((s) => s.runImport);
+  const importStatus = useSessionImport((s) => s.status);
+  const { viewMode, setViewMode, load: loadViewMode } = useViewMode();
+  const { defaultCollapsed, load: loadDefaultCollapsed } = useDefaultCollapsed();
+  const { excludeSubagents, load: loadExcludeSubagents } = useExcludeSubagents();
+  const { repoPath, load: loadRepoPath } = useRepoPath();
+
+  const [cachedSessions, setCachedSessions] = useState<TaggedSession[]>([]);
+  // Tracks repos that are in the NON-default state. When defaultCollapsed is false,
+  // this set holds repos the user has manually closed. When true, repos they've opened.
+  const [toggledRepos, setToggledRepos] = useState<Set<string>>(new Set());
+
+  // Clear exceptions whenever the default changes so all repos snap to the new default.
+  useEffect(() => { setToggledRepos(new Set()); }, [defaultCollapsed]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toggleRepo = (label: string) =>
+    setToggledRepos((prev) => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label);
+      else next.add(label);
+      return next;
+    });
 
   // Fan out on first hydrate and whenever the set of bridges changes.
   const bridgeIds = bridges.map((b) => b.id).join(',');
   useEffect(() => {
-    if (hydrated && bridges.length > 0) void refresh();
+    if (!hydrated || bridges.length === 0) return;
+    // Seed from SQLite immediately so the list is populated before the bridge responds.
+    Promise.all(bridges.map((b) => sessionDb.getAllForBridge(b.id)))
+      .then((results) => setCachedSessions(results.flat()))
+      .catch(() => {});
+    void refresh();
+    for (const b of bridges) void runImport(b);
   }, [hydrated, bridgeIds, refresh]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => { void loadFilters(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { void loadFilters(); void loadViewMode(); void loadDefaultCollapsed(); void loadExcludeSubagents(); void loadRepoPath(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // When an import finishes, reload SQLite into cachedSessions (it was seeded once
+  // on mount before the import ran) and re-poll the bridge (its cache is warm now).
+  useEffect(() => {
+    if (importStatus !== 'done') return;
+    Promise.all(bridges.map((b) => sessionDb.getAllForBridge(b.id)))
+      .then((results) => setCachedSessions(results.flat()))
+      .catch(() => {});
+    void refresh();
+  }, [importStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const bridgeById = useMemo(
     () => new Map<string, Bridge>(bridges.map((b) => [b.id, b])),
     [bridges],
   );
 
-  const allSessions = useMemo(() => mergeSessions(byBridge), [byBridge]);
+  const allSessions = useMemo(() => {
+    const live = mergeSessions(byBridge);
+    const liveKey = new Set(live.map((s) => `${s.agent}::${s.id}`));
+    const historical = cachedSessions.filter((s) => !liveKey.has(`${s.agent}::${s.id}`));
+    return [...live, ...historical];
+  }, [byBridge, cachedSessions]);
+
+  const repoFiltered = useMemo(
+    () => allSessions.filter((s) => matchesRepoPath(s.cwd, repoPath)),
+    [allSessions, repoPath],
+  );
+
+  const displaySessions = useMemo(
+    () => excludeSubagents ? repoFiltered.filter((s) => !isSubagentSession(s)) : repoFiltered,
+    [repoFiltered, excludeSubagents],
+  );
 
   // needs-me ordering (pending ▸ live ▸ recent), recency-tiebroken.
   const sorted = useMemo(() => {
-    return [...allSessions]
+    return [...displaySessions]
       .map((s) => {
         const hasPending = (pending[pendingKey(s.bridgeId, s.agent, s.id)]?.length ?? 0) > 0;
         return { s, rank: needsMeRank(s, hasPending) };
       })
       .sort((a, b) => a.rank - b.rank || b.s.lastModified - a.s.lastModified)
       .map((x) => x.s);
-  }, [allSessions, pending]);
+  }, [displaySessions, pending]);
 
   // Machines that actually have sessions, ordered by most-recent activity.
   const orderedMachines = useMemo(() => {
     const lastSeen = new Map<string, number>();
-    for (const s of allSessions) {
+    for (const s of displaySessions) {
       lastSeen.set(s.bridgeId, Math.max(lastSeen.get(s.bridgeId) ?? 0, s.lastModified));
     }
     return bridges
       .filter((b) => lastSeen.has(b.id))
       .sort((a, b) => (lastSeen.get(b.id) ?? 0) - (lastSeen.get(a.id) ?? 0));
-  }, [allSessions, bridges]);
+  }, [displaySessions, bridges]);
 
   const machineHasPending = useCallback(
     (bridgeId: string) =>
-      allSessions.some(
+      displaySessions.some(
         (s) => s.bridgeId === bridgeId && (pending[pendingKey(s.bridgeId, s.agent, s.id)]?.length ?? 0) > 0,
       ),
-    [allSessions, pending],
+    [displaySessions, pending],
   );
 
   const visible = useMemo(() => {
     const byMachine = filterBridgeId ? sorted.filter((s) => s.bridgeId === filterBridgeId) : sorted;
     return applyFilters(byMachine);
   }, [sorted, filterBridgeId, applyFilters, filters]);
+
+  const cycleViewMode = () => {
+    const idx = VIEW_MODE_CYCLE.indexOf(viewMode);
+    setViewMode(VIEW_MODE_CYCLE[(idx + 1) % VIEW_MODE_CYCLE.length]);
+  };
+
+  const listItems = useMemo((): ListItem[] => {
+    if (viewMode === 'flat') return visible;
+    const byProject = new Map<string, TaggedSession[]>();
+    for (const s of visible) {
+      const key = s.projectName;
+      if (!byProject.has(key)) byProject.set(key, []);
+      byProject.get(key)!.push(s);
+    }
+    const projectOrder = [...byProject.keys()].sort((a, b) => {
+      if (viewMode === 'grouped-alpha') return a.localeCompare(b);
+      const lastA = Math.max(...byProject.get(a)!.map((s) => s.lastModified));
+      const lastB = Math.max(...byProject.get(b)!.map((s) => s.lastModified));
+      return lastB - lastA;
+    });
+    const items: ListItem[] = [];
+    for (const name of projectOrder) {
+      const sessions = byProject.get(name)!;
+      const collapsed = defaultCollapsed ? !toggledRepos.has(name) : toggledRepos.has(name);
+      items.push({ _header: true, label: name, count: sessions.length, collapsed });
+      if (!collapsed) items.push(...sessions);
+    }
+    return items;
+  }, [visible, viewMode, toggledRepos, defaultCollapsed]);
 
   const totalPending = Object.values(pending).reduce((n, list) => n + list.length, 0);
   const sessionsWithPending = Object.keys(pending).length;
@@ -201,8 +293,8 @@ export default function SessionsScreen() {
           headerTitleAlign: 'left',
           headerTitle: 'Sessions',
           headerRight: () => (
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: space[1] }}>
-              <Pressable onPress={() => setFilterSheetVisible(true)} hitSlop={16} style={{ padding: space[2], position: 'relative' }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <Pressable onPress={() => setFilterSheetVisible(true)} hitSlop={{ top: 12, bottom: 12, left: 8, right: 8 }} style={{ paddingHorizontal: space[2], paddingVertical: space[2] }}>
                 <Ionicons
                   name={filters.length > 0 ? 'funnel' : 'funnel-outline'}
                   size={fontSize['2xl']}
@@ -210,7 +302,7 @@ export default function SessionsScreen() {
                 />
                 {filters.length > 0 && (
                   <View style={{
-                    position: 'absolute', top: 2, right: 2,
+                    position: 'absolute', top: space[1], right: space[1],
                     minWidth: 16, height: 16, borderRadius: 8,
                     backgroundColor: t.accent.primary,
                     alignItems: 'center', justifyContent: 'center',
@@ -219,6 +311,13 @@ export default function SessionsScreen() {
                     <Text style={{ fontSize: 10, fontWeight: '700', color: t.accent.fg }}>{filters.length}</Text>
                   </View>
                 )}
+              </Pressable>
+              <Pressable onPress={cycleViewMode} hitSlop={{ top: 12, bottom: 12, left: 8, right: 8 }} style={{ paddingHorizontal: space[2], paddingVertical: space[2] }}>
+                <Ionicons
+                  name={viewMode === 'flat' ? 'list-outline' : 'layers-outline'}
+                  size={fontSize['2xl']}
+                  color={viewMode !== 'flat' ? t.accent.primary : t.text.primary}
+                />
               </Pressable>
               <Pressable onPress={() => router.push('/machines' as Href)} hitSlop={12} style={{ paddingHorizontal: space[2] }}>
                 <Ionicons name="hardware-chip-outline" size={fontSize['2xl']} color={t.text.primary} />
@@ -233,8 +332,11 @@ export default function SessionsScreen() {
       <FlatList
         style={{ backgroundColor: t.surface.base }}
         contentContainerStyle={{ paddingVertical: 4 }}
-        data={visible}
-        keyExtractor={(s) => `${s.bridgeId}:${s.agent}:${s.id}`}
+        data={listItems}
+        keyExtractor={(item) => {
+          if ('_header' in item) return `header:${item.label}`;
+          return `${item.bridgeId}:${item.agent}:${item.id}`;
+        }}
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} tintColor={t.text.primary} />
         }
@@ -285,6 +387,7 @@ export default function SessionsScreen() {
                 </Text>
               </View>
             ) : null}
+            <ImportProgressBanner />
           </View>
         }
         ListEmptyComponent={
@@ -316,6 +419,28 @@ export default function SessionsScreen() {
           )
         }
         renderItem={({ item }) => {
+          if ('_header' in item) {
+            return (
+              <Pressable
+                onPress={() => toggleRepo(item.label)}
+                style={({ pressed }) => [
+                  styles.groupHeader,
+                  { borderBottomColor: t.border.subtle, backgroundColor: pressed ? t.surface.raised : t.surface.base },
+                ]}>
+                <Text style={[styles.groupHeaderLabel, { color: t.text.secondary, flex: 1 }]}>
+                  {item.label}
+                </Text>
+                {item.collapsed ? (
+                  <Text style={[styles.groupHeaderCount, { color: t.text.muted }]}>
+                    {item.count} session{item.count === 1 ? '' : 's'}
+                  </Text>
+                ) : null}
+                <Text style={[styles.groupHeaderChevron, { color: t.text.muted }]}>
+                  {item.collapsed ? '▶' : '▼'}
+                </Text>
+              </Pressable>
+            );
+          }
           const badge = statusBadge(item, t);
           const title = item.label ?? item.projectName;
           const subtitle = item.label ? item.projectName : null;
@@ -571,6 +696,10 @@ const styles = StyleSheet.create({
   },
   bannerLabel: { fontSize: fontSize.base, fontWeight: '700' },
   bannerHint: { fontSize: fontSize.sm },
+  groupHeader: { flexDirection: 'row', alignItems: 'center', gap: space[2], paddingHorizontal: space[4], paddingVertical: space[3], borderBottomWidth: StyleSheet.hairlineWidth, marginTop: space[2] },
+  groupHeaderLabel: { fontSize: fontSize.sm, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.5 },
+  groupHeaderCount: { fontSize: fontSize.sm },
+  groupHeaderChevron: { fontSize: 10, width: 12, textAlign: 'center' },
   rowContainer: {},
   row: { paddingHorizontal: space[4], paddingVertical: space[3], borderBottomWidth: StyleSheet.hairlineWidth, gap: 6 },
   rowHeader: { flexDirection: 'row', alignItems: 'center', gap: space[2] },

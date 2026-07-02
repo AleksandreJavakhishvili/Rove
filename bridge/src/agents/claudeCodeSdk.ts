@@ -1722,6 +1722,17 @@ function readFirstRecordedCwd(sessionId: string): string | null {
   return null;
 }
 
+/** Cached result of the last full sdkListSessions() scan, invalidated after 60 s or on write. */
+let _sessionListCache: { at: number; items: DriverSessionListItem[] } | null = null;
+const SESSION_LIST_CACHE_TTL = 60_000;
+
+/** In-flight scan promise — concurrent callers share one scan instead of piling on the disk. */
+let _inflightScan: Promise<DriverSessionListItem[]> | null = null;
+
+export function invalidateSessionListCache(): void {
+  _sessionListCache = null;
+}
+
 /**
  * Claude-code driver, fully SDK-backed. Session reads (`listSessions`,
  * `findSession`, `readHistory`) delegate to the SDK's session-management
@@ -1740,22 +1751,32 @@ export class ClaudeCodeSdkDriver implements AgentDriver {
   }
 
   async listSessions(): Promise<DriverSessionListItem[]> {
-    let sdkSessions: SDKSessionInfo[];
-    try {
-      sdkSessions = await sdkListSessions();
-    } catch (err) {
-      console.error('[claude-sdk] listSessions failed:', (err as Error).message);
-      return [];
+    const now = Date.now();
+    if (_sessionListCache && now - _sessionListCache.at < SESSION_LIST_CACHE_TTL) {
+      return _sessionListCache.items;
     }
-    const items = sdkSessions
-      .filter((s) => Boolean(s.cwd))
-      .map((s) => ({ id: s.sessionId, cwd: s.cwd!, lastModified: s.lastModified }));
-    const desktopByid = await attributeManySessions(items);
-    const out = sdkSessions.map((s) =>
-      sdkSessionToListItem(s, desktopByid.get(s.sessionId) ?? []),
-    );
-    out.sort((a, b) => b.lastModified - a.lastModified);
-    return out;
+    // Deduplicate: if a scan is already running, wait on it rather than starting a second one.
+    if (_inflightScan) return _inflightScan;
+    _inflightScan = (async () => {
+      let sdkSessions: SDKSessionInfo[];
+      try {
+        sdkSessions = await sdkListSessions({ limit: 5000 });
+      } catch (err) {
+        console.error('[claude-sdk] listSessions failed:', (err as Error).message);
+        return [];
+      }
+      const items = sdkSessions
+        .filter((s) => Boolean(s.cwd))
+        .map((s) => ({ id: s.sessionId, cwd: s.cwd!, lastModified: s.lastModified }));
+      const desktopByid = await attributeManySessions(items);
+      const out = sdkSessions.map((s) =>
+        sdkSessionToListItem(s, desktopByid.get(s.sessionId) ?? []),
+      );
+      out.sort((a, b) => b.lastModified - a.lastModified);
+      _sessionListCache = { at: Date.now(), items: out };
+      return out;
+    })().finally(() => { _inflightScan = null; });
+    return _inflightScan;
   }
 
   async findSession(id: string): Promise<{ cwd: string; path?: string } | null> {

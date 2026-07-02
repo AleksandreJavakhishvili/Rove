@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { BridgeError, fetchSessions } from './bridge';
 import { bridgeToConfig, useBridgesStore } from './bridges';
+import { sessionDb } from './sessionDb';
 import type { SessionListItem } from './types';
 
 /** Per-host fan-out budget. A bridge slower than this is treated as offline so
@@ -81,6 +82,7 @@ export const useAggregator = create<AggregatorStore>((set, get) => ({
         connState: { ...s.connState, [bridgeId]: 'open' },
       }));
       void useBridgesStore.getState().markSeen(bridgeId, Date.now());
+      void sessionDb.upsert(bridgeId, tagged);
     } catch (err) {
       // A 401/403 means "re-auth this bridge", anything else means "offline".
       // Either way we keep the last-known rows so they degrade rather than vanish.

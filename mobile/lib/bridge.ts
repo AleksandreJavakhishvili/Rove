@@ -11,7 +11,7 @@ import type {
   TreeEntry,
 } from './types';
 
-interface BridgeConfig {
+export interface BridgeConfig {
   baseUrl: string;
   token?: string;
 }
@@ -134,6 +134,27 @@ export async function fetchSessions(cfg: BridgeConfig): Promise<SessionListItem[
   if (!res.ok) throw httpError('/sessions', res.status);
   const body = (await res.json()) as { sessions: SessionListItem[] };
   return body.sessions;
+}
+
+export async function fetchSessionsPage(
+  cfg: BridgeConfig,
+  since: number,
+  limit: number,
+  offset: number,
+): Promise<{ sessions: SessionListItem[]; total: number }> {
+  const params = new URLSearchParams({
+    since: String(since),
+    limit: String(limit),
+    offset: String(offset),
+  });
+  // Use a long timeout — this is a background import and the bridge may need
+  // time to scan disk on a cold cache (can take 10-30s for large session dirs).
+  const res = await fetchWithTimeout(`${cfg.baseUrl}/sessions?${params}`, {
+    headers: authHeaders(cfg),
+  }, 60_000);
+  if (!res.ok) throw httpError('/sessions', res.status);
+  const body = (await res.json()) as { sessions: SessionListItem[]; total: number };
+  return body;
 }
 
 export interface HistoryPage {

@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { authMiddleware } from './auth.ts';
 import { config, runtimeState } from './config.ts';
 import { getDriver, listAgents, listAllSessions } from './agents/registry.ts';
+import { CLAUDE_CODE_AGENT } from './agents/types.ts';
 import { devices } from './devices.ts';
 import { scanDevServers } from './devServers.ts';
 import { normalizeClientRelPath, readScopedFile, relToCwd } from './files.ts';
@@ -24,6 +25,7 @@ import {
 import { foldTaskState, foldTaskStateFromTranscript, readSessionTasks } from './taskState.ts';
 import { inspectPid, invalidateClaudeCache } from './lsof.ts';
 import { invalidateRegistryCache } from './sessionRegistry.ts';
+import { invalidateSessionListCache } from './agents/claudeCodeSdk.ts';
 import { requests, type RequestResolution } from './requests.ts';
 import { preflight } from './preflight.ts';
 import { printConnectionQR } from './qr.ts';
@@ -176,7 +178,22 @@ app.get('/sessions', async (c) => {
       ...(bridgePid !== undefined ? { bridgePid } : {}),
     };
   });
-  return c.json({ sessions });
+
+  // Optional date filter + pagination for the session history importer.
+  const sinceRaw = c.req.query('since');
+  const since = sinceRaw ? Number(sinceRaw) : null;
+  const limitRaw = c.req.query('limit');
+  const offsetRaw = c.req.query('offset');
+  const limit = limitRaw ? Math.min(Math.max(1, Number(limitRaw)), 500) : null;
+  const offset = offsetRaw ? Math.max(0, Number(offsetRaw)) : 0;
+
+  const filtered = since !== null && Number.isFinite(since)
+    ? sessions.filter((s) => s.lastModified >= since)
+    : sessions;
+  const total = filtered.length;
+  const page = limit !== null ? filtered.slice(offset, offset + limit) : filtered;
+
+  return c.json({ sessions: page, total });
 });
 
 // Single-session info (label + cwd + status). Used by the mobile chat header.
@@ -315,6 +332,7 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
   if (verified.length === 0) {
     invalidateClaudeCache();
     invalidateRegistryCache();
+    invalidateSessionListCache();
     return c.json({
       ok: true,
       killed: [],
@@ -346,6 +364,7 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
       console.log(`[bridge] takeover complete — all pids exited cleanly`);
       invalidateClaudeCache();
       invalidateRegistryCache();
+      invalidateSessionListCache();
       return c.json({ ok: true, killed: verified, force: false });
     }
     await new Promise((r) => setTimeout(r, 200));
@@ -362,6 +381,7 @@ app.post('/sessions/:agent/:id/takeover', async (c) => {
   }
   invalidateClaudeCache();
   invalidateRegistryCache();
+  invalidateSessionListCache();
   return c.json({ ok: true, killed: verified, force: true });
 });
 
@@ -1397,6 +1417,9 @@ async function bootstrap(): Promise<void> {
         console.log('[info] ALLOWED_USERS not set — will auto-detect Tailscale owner on first request');
       }
       void preflight(config.claudeBin);
+      // Warm the session list cache in the background so the first phone
+      // request hits the cache instead of waiting for a cold disk scan.
+      setTimeout(() => { void getDriver(CLAUDE_CODE_AGENT)?.listSessions(); }, 1000);
       // Log which search backend will be used; helps the operator notice
       // when ripgrep isn't installed and the grep fallback is in play.
       void detectSearchBackend().then((b) => {
