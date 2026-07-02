@@ -4,6 +4,11 @@ import { getActiveBridge, useBridgesStore, type Bridge } from '@/lib/bridges';
 import { discoverBridges } from '@/lib/discovery';
 import { registerWithBridge } from '@/lib/push';
 import { useHydratedSettings } from '@/lib/store';
+import { useDefaultCollapsed } from '@/hooks/useDefaultCollapsed';
+import { useExcludeSubagents } from '@/hooks/useExcludeSubagents';
+import { useHistoryDays } from '@/hooks/useHistoryDays';
+import { useRepoPath } from '@/hooks/useRepoPath';
+import { useSessionImport } from '@/hooks/useSessionImport';
 import { fontSize, radius, space, useTheme } from '@/theme';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
@@ -204,11 +209,115 @@ export default function SettingsScreen() {
           </Text>
         </Pressable>
 
+        <SessionHistorySection />
         <VisualFeedbackSection />
       </ScrollView>
 
       <QRScanner visible={scannerOpen} onClose={() => setScannerOpen(false)} onScan={onScan} />
     </KeyboardAvoidingView>
+  );
+}
+
+function SessionHistorySection() {
+  const t = useTheme();
+  const { historyDays, load, setHistoryDays } = useHistoryDays();
+  const { defaultCollapsed, load: loadDefaultCollapsed, setDefaultCollapsed } = useDefaultCollapsed();
+  const { excludeSubagents, load: loadExcludeSubagents, setExcludeSubagents } = useExcludeSubagents();
+  const { repoPath, load: loadRepoPath, setRepoPath } = useRepoPath();
+  const runImport = useSessionImport((s) => s.runImport);
+  const importStatus = useSessionImport((s) => s.status);
+  const [localDays, setLocalDays] = useState(String(historyDays));
+  const [localRepoPath, setLocalRepoPath] = useState(repoPath);
+
+  useEffect(() => { void load(); void loadDefaultCollapsed(); void loadExcludeSubagents(); void loadRepoPath(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setLocalRepoPath(repoPath); }, [repoPath]);
+  useEffect(() => { setLocalDays(String(historyDays)); }, [historyDays]);
+
+  function commitDays() {
+    const n = parseInt(localDays, 10);
+    if (Number.isFinite(n) && n >= 1 && n <= 365) setHistoryDays(n);
+    else setLocalDays(String(historyDays));
+  }
+
+  function resync() {
+    const bridges = useBridgesStore.getState().bridges;
+    for (const b of bridges) void runImport(b, { force: true });
+  }
+
+  return (
+    <View style={styles.section}>
+      <View style={[styles.sectionDivider, { backgroundColor: t.border.default }]} />
+      <Text style={[styles.sectionTitle, { color: t.text.primary }]}>Session history</Text>
+      <Text style={[styles.sectionBody, { color: t.text.secondary }]}>
+        How many days of session history to import and cache locally. Default is 30.
+      </Text>
+      <View style={[styles.toggleRow, { backgroundColor: t.surface.raised, borderColor: t.border.subtle }]}>
+        <Text style={[styles.toggleLabel, { color: t.text.primary }]}>Days of history</Text>
+        <TextInput
+          value={localDays}
+          onChangeText={setLocalDays}
+          onBlur={commitDays}
+          onSubmitEditing={commitDays}
+          keyboardType="number-pad"
+          maxLength={3}
+          style={[styles.input, { color: t.text.primary, borderColor: t.border.default, width: 64, textAlign: 'center' }]}
+        />
+      </View>
+      <View style={[styles.toggleRow, { backgroundColor: t.surface.raised, borderColor: t.border.subtle, flexDirection: 'column', alignItems: 'stretch', gap: 6 }]}>
+        <Text style={[styles.toggleLabel, { color: t.text.primary }]}>Repo root path</Text>
+        <Text style={[styles.toggleHint, { color: t.text.secondary }]}>
+          Only sessions whose working directory starts with this path are shown. Leave empty to show all.
+        </Text>
+        <TextInput
+          value={localRepoPath}
+          onChangeText={setLocalRepoPath}
+          onBlur={() => setRepoPath(localRepoPath)}
+          onSubmitEditing={() => setRepoPath(localRepoPath)}
+          autoCapitalize="none"
+          autoCorrect={false}
+          placeholder="/home/you/repos"
+          placeholderTextColor={t.text.muted}
+          style={[styles.input, { color: t.text.primary, borderColor: t.border.default, flex: undefined, width: '100%' }]}
+        />
+      </View>
+      <View style={[styles.toggleRow, { backgroundColor: t.surface.raised, borderColor: t.border.subtle }]}>
+        <View style={{ flex: 1 }}>
+          <Text style={[styles.toggleLabel, { color: t.text.primary }]}>Collapse repos by default</Text>
+          <Text style={[styles.toggleHint, { color: t.text.secondary }]}>
+            Repos start folded — tap the triangle to expand them.
+          </Text>
+        </View>
+        <Switch
+          value={defaultCollapsed}
+          onValueChange={setDefaultCollapsed}
+          trackColor={{ true: t.accent.primary }}
+        />
+      </View>
+      <View style={[styles.toggleRow, { backgroundColor: t.surface.raised, borderColor: t.border.subtle }]}>
+        <View style={{ flex: 1 }}>
+          <Text style={[styles.toggleLabel, { color: t.text.primary }]}>Hide subagent sessions</Text>
+          <Text style={[styles.toggleHint, { color: t.text.secondary }]}>
+            Hides subagents (UUID/hash-named worktrees) and system sessions (.claude-mem observer sessions).
+          </Text>
+        </View>
+        <Switch
+          value={excludeSubagents}
+          onValueChange={setExcludeSubagents}
+          trackColor={{ true: t.accent.primary }}
+        />
+      </View>
+      <Pressable
+        onPress={resync}
+        disabled={importStatus === 'running'}
+        style={({ pressed }) => [
+          styles.button,
+          { backgroundColor: pressed ? t.accent.pressed : t.accent.primary, opacity: importStatus === 'running' ? 0.6 : 1 },
+        ]}>
+        <Text style={[styles.buttonLabel, { color: t.accent.fg }]}>
+          {importStatus === 'running' ? 'Syncing…' : 'Re-sync now'}
+        </Text>
+      </Pressable>
+    </View>
   );
 }
 

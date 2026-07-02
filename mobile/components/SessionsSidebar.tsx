@@ -5,6 +5,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Alert,
   Animated,
   Dimensions,
   Easing,
@@ -16,6 +17,10 @@ import {
   Text,
   View,
 } from 'react-native';
+import { useSessionFilters } from '@/hooks/useSessionFilters';
+import { SessionFilterSheet } from './SessionFilterSheet';
+import { SessionsGroupedList } from './SessionsGroupedList';
+import { useViewMode } from '@/hooks/useViewMode';
 
 interface SessionsSidebarProps {
   visible: boolean;
@@ -58,10 +63,19 @@ export function SessionsSidebar({
   const bridges = useBridges();
   const byBridge = useAggregator((s) => s.byBridge);
   const refresh = useAggregator((s) => s.refresh);
+  const { viewMode, setViewMode, load: loadViewMode } = useViewMode();
   const slide = useRef(new Animated.Value(0)).current;
   const scrim = useRef(new Animated.Value(0)).current;
   // null = "All machines"; otherwise scope to one. Opens on the current machine.
   const [scope, setScope] = useState<string | null>(currentBridgeId);
+  const [filterSheetVisible, setFilterSheetVisible] = useState(false);
+  const { filters, addFilter, removeFilter, clearFilters, applyFilters, load: loadFilters } = useSessionFilters();
+
+  // Hydrate persisted state once on mount.
+  useEffect(() => {
+    void loadFilters();
+    void loadViewMode();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!visible) return;
@@ -106,8 +120,9 @@ export function SessionsSidebar({
 
   const rows = useMemo(() => {
     const list = scope ? (byBridge[scope] ?? []) : Object.values(byBridge).flat();
-    return [...list].sort((a, b) => b.lastModified - a.lastModified);
-  }, [byBridge, scope]);
+    const sorted = [...list].sort((a, b) => b.lastModified - a.lastModified);
+    return applyFilters(sorted);
+  }, [byBridge, scope, applyFilters, filters]);
 
   const showChips = machines.length > 1;
 
@@ -135,6 +150,7 @@ export function SessionsSidebar({
   };
 
   return (
+    <>
     <Modal visible={visible} transparent animationType="none" onRequestClose={close} statusBarTranslucent>
       <View style={StyleSheet.absoluteFill}>
         <Animated.View
@@ -156,14 +172,60 @@ export function SessionsSidebar({
           ]}>
           <View style={[styles.header, { borderBottomColor: t.border.subtle }]}>
             <Text style={[styles.headerTitle, { color: t.text.primary }]}>Sessions</Text>
-            <Pressable
-              onPress={() => {
-                close();
-                setTimeout(() => router.replace('/'), 180);
-              }}
-              hitSlop={8}>
-              <Ionicons name="expand-outline" size={fontSize['2xl']} color={t.accent.primary} />
-            </Pressable>
+            <View style={styles.headerActions}>
+              <Pressable
+                onPress={() => setFilterSheetVisible(true)}
+                hitSlop={16}
+                style={[styles.filterButton, styles.iconBtn]}>
+                <Ionicons
+                  name={filters.length > 0 ? 'funnel' : 'funnel-outline'}
+                  size={fontSize['2xl']}
+                  color={filters.length > 0 ? t.accent.primary : t.text.secondary}
+                />
+                {filters.length > 0 && (
+                  <View style={[styles.filterBadge, { backgroundColor: t.accent.primary }]}>
+                    <Text style={[styles.filterBadgeText, { color: t.accent.fg }]}>
+                      {filters.length}
+                    </Text>
+                  </View>
+                )}
+              </Pressable>
+              <Pressable
+                onPress={() => {
+                  Alert.alert('Session view', 'Choose how to group sessions', [
+                    {
+                      text: `${viewMode === 'flat' ? '✓ ' : ''}Flat list`,
+                      onPress: () => setViewMode('flat'),
+                    },
+                    {
+                      text: `${viewMode === 'grouped-alpha' ? '✓ ' : ''}Group by repo (A-Z)`,
+                      onPress: () => setViewMode('grouped-alpha'),
+                    },
+                    {
+                      text: `${viewMode === 'grouped-recency' ? '✓ ' : ''}Recent repos first`,
+                      onPress: () => setViewMode('grouped-recency'),
+                    },
+                    { text: 'Cancel', style: 'cancel' },
+                  ]);
+                }}
+                hitSlop={16}
+                style={styles.iconBtn}>
+                <Ionicons
+                  name={viewMode === 'flat' ? 'list-outline' : 'albums-outline'}
+                  size={fontSize['2xl']}
+                  color={t.accent.primary}
+                />
+              </Pressable>
+              <Pressable
+                onPress={() => {
+                  close();
+                  setTimeout(() => router.replace('/'), 180);
+                }}
+                hitSlop={16}
+                style={styles.iconBtn}>
+                <Ionicons name="expand-outline" size={fontSize['2xl']} color={t.accent.primary} />
+              </Pressable>
+            </View>
           </View>
           {showChips ? (
             <ScrollView
@@ -178,7 +240,7 @@ export function SessionsSidebar({
             <View style={styles.centered}>
               <Text style={{ color: t.text.secondary }}>No sessions.</Text>
             </View>
-          ) : (
+          ) : viewMode === 'flat' ? (
             <FlatList
               data={rows}
               keyExtractor={(s) => `${s.bridgeId}:${s.agent}:${s.id}`}
@@ -243,10 +305,43 @@ export function SessionsSidebar({
                 );
               }}
             />
+          ) : (
+            <SessionsGroupedList
+              sessions={rows}
+              viewMode={viewMode}
+              currentAgent={currentAgent}
+              currentSessionId={currentSessionId}
+              currentBridgeId={currentBridgeId}
+              onSessionPress={(item) => {
+                const isCurrent =
+                  item.agent === currentAgent &&
+                  item.id === currentSessionId &&
+                  item.bridgeId === currentBridgeId;
+                if (isCurrent) {
+                  close();
+                  return;
+                }
+                close();
+                setTimeout(
+                  () => router.replace(`/sessions/${item.agent}/${item.id}?bridge=${item.bridgeId}`),
+                  180,
+                );
+              }}
+            />
           )}
         </Animated.View>
       </View>
     </Modal>
+    <SessionFilterSheet
+      visible={filterSheetVisible}
+      onClose={() => setFilterSheetVisible(false)}
+      filters={filters}
+      onAddFilter={addFilter}
+      onRemoveFilter={removeFilter}
+      onClearAll={clearFilters}
+      sessions={Object.values(byBridge).flat()}
+    />
+    </>
   );
 }
 
@@ -268,6 +363,21 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   headerTitle: { fontSize: fontSize.xl, fontWeight: '700' },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: space[1] },
+  iconBtn: { padding: space[2] },
+  filterButton: { position: 'relative' },
+  filterBadge: {
+    position: 'absolute',
+    top: -4,
+    right: -6,
+    minWidth: 16,
+    height: 16,
+    borderRadius: radius.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+  },
+  filterBadgeText: { fontSize: 10, fontWeight: '700' },
   chipStrip: {
     flexDirection: 'row',
     alignItems: 'center',

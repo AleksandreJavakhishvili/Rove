@@ -23,8 +23,8 @@
     "rove-bridge": "./bin/rove-bridge.mjs"
   },
   "scripts": {
-    "dev": "ulimit -n 8192 && tsx watch src/server.ts",
-    "start": "ulimit -n 8192 && tsx src/server.ts",
+    "dev": "ulimit -n 8192 && (set -a; . ./.env 2>/dev/null; set +a; tsx watch src/server.ts)",
+    "start": "ulimit -n 8192 && (set -a; . ./.env 2>/dev/null; set +a; tsx src/server.ts)",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
