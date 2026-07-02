@@ -634,7 +634,7 @@ export default function SessionsScreen() {
         onAddFilter={addFilter}
         onRemoveFilter={removeFilter}
         onClearAll={clearFilters}
-        sessions={Object.values(byBridge).flat()}
+        sessions={displaySessions}
       />
     </>
   );

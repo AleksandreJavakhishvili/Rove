@@ -17,7 +17,7 @@ const STORAGE_KEY = '@rove/session-filters';
 const OBSERVER_RE = /\bobserver\b/i;
 const SUBAGENT_RE = /\b(subagent|sub-agent|sub agent|\(sub\))\b/i;
 
-function sessionMatchesFilter(session: TaggedSession, filter: FilterSpec): boolean {
+export function sessionMatchesFilter(session: TaggedSession, filter: FilterSpec): boolean {
   const title = session.label ?? session.projectName;
   switch (filter.kind) {
     case 'status':

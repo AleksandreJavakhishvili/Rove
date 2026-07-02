@@ -12,7 +12,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import type { FilterSpec } from '@/hooks/useSessionFilters';
+import { sessionMatchesFilter, type FilterSpec } from '@/hooks/useSessionFilters';
 
 export interface SessionFilterSheetProps {
   visible: boolean;
@@ -60,13 +60,21 @@ export function SessionFilterSheet({
   const t = useTheme();
   const toggle = useToggle(filters, onAddFilter, onRemoveFilter);
 
-  // Distinct repo / machine / agent values from the current sessions list.
+  // Distinct repo / machine / agent values. Repos cascade: only show project
+  // names that survive all currently-active filters *other than* repo filters,
+  // so the list reflects what the user actually sees before repo-hiding.
   const { repos, machines, agents } = useMemo(() => {
+    const nonRepoFilters = filters.filter((f) => f.kind !== 'repo');
+    const repoSessions = nonRepoFilters.length === 0
+      ? sessions
+      : sessions.filter((s) => !nonRepoFilters.some((f) => sessionMatchesFilter(s, f)));
     const repoSet = new Set<string>();
     const machineSet = new Set<string>();
     const agentSet = new Set<AgentKind>();
-    for (const s of sessions) {
+    for (const s of repoSessions) {
       repoSet.add(s.projectName);
+    }
+    for (const s of sessions) {
       machineSet.add(s.bridgeId);
       agentSet.add(s.agent);
     }
@@ -75,7 +83,7 @@ export function SessionFilterSheet({
       machines: [...machineSet].sort(),
       agents: [...agentSet].sort(),
     };
-  }, [sessions]);
+  }, [sessions, filters]);
 
   // Name-filter draft text — committed on each keystroke.
   const [nameDraft, setNameDraft] = useState(() => {
@@ -222,7 +230,7 @@ export function SessionFilterSheet({
             {/* ── Repo / Project ──────────────────────── */}
             {repos.length > 0 && (
               <>
-                <Text style={[s.sectionHeader, { color: t.text.muted }]}>REPO / PROJECT</Text>
+                <Text style={[s.sectionHeader, { color: t.text.muted }]}>HIDE REPOS / PROJECTS</Text>
                 {repos.map((repo) => (
                   <ToggleRow
                     key={repo}
